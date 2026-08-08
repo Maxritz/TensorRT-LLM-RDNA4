@@ -18,6 +18,35 @@ TensorRT LLM
 ---
 <div align="left">
 
+## Fork Goal: Vulkan backend for RDNA GPUs
+
+This is a community fork of NVIDIA/TensorRT-LLM that adds a **Vulkan backend
+for AMD RDNA GPUs** (and other Vulkan devices). The compatibility layer lives in
+`cpp/tensorrt_llm/common/vulkan*` (context/runtime/memory/compiler/backend) and
+`cpp/tensorrt_llm/kernels/vulkanKernelRegistry.cpp`. The dispatch API mirrors the
+CUDA kernel-launch signatures, so the same call sites can target Vulkan on
+GPUs where CUDA is unavailable.
+
+**Goal:** port the kernels needed for LLM inference onto Vulkan, with each
+kernel backed by a host-verified trace test in `cpp/tests/vulkanTraceMain.cpp`
+(built from `cpp/trace_test/CMakeLists.txt`).
+
+**Port status** (compiled and numerically verified on AMD Radeon RX 9070 XT /
+RDNA2 via `vulkan_trace_test`):
+
+| Kernel | Dispatcher | Shader | Verified |
+|---|---|---|---|
+| `elementwise_add` | `dispatchElementwiseAdd` | `elementwise_add.comp` | yes |
+| `rms_norm` | `dispatchRmsNorm` | `rms_norm.comp` | yes |
+| `fp16_gemm` | `dispatchFp16Gemm` | `fp16_gemm.comp` | yes |
+| `q8_0_gemm` | `dispatchQ8_0Gemm` | `q8_0_gemm.comp` | yes |
+
+Build & run the trace test:
+
+    cmake -S cpp/trace_test -B cpp/build_trace
+    cmake --build cpp/build_trace --config Release --target vulkan_trace_test
+    ./cpp/build_trace/bin/Release/vulkan_trace_test.exe
+
 ## Tech Blogs
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
