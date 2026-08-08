@@ -28,11 +28,80 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
+#include <utility>
 #include <cstring>
 #include <random>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
+
+// Real-valued DeepSeek MLA test-data loader (see scripts/mla_real_data.py).
+// Binary layout: magic('MLA1'), then uint32 dims, then raw float Q bytes,
+// then raw float KV bytes. Returns false if the file is absent or malformed,
+// leaving the caller to fall back to the synthetic RNG stream.
+bool loadRealMlaData(std::string const& path,
+                     std::vector<float>& hostQ,
+                     std::vector<float>& hostKv)
+{
+    // Resolve the real-weights asset relative to this source file first (so the test
+    // passes from any working directory), then fall back to the literal path (CWD).
+    std::vector<std::string> candidates;
+    std::string sd(__FILE__);
+    auto pos = sd.find_last_of("\\/");
+    if (pos != std::string::npos)
+    {
+        std::string base = sd.substr(0, pos);
+        candidates.push_back(base + "/" + path);
+        candidates.push_back(base + "/tests/" + path);
+    }
+    candidates.push_back(path);
+
+    FILE* f = nullptr;
+    for (auto const& c : candidates)
+    {
+#if defined(_WIN32)
+        fopen_s(&f, c.c_str(), "rb");
+#else
+        f = std::fopen(c.c_str(), "rb");
+#endif
+        if (f) break;
+    }
+    if (!f) return false;
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MLA1", 4) != 0)
+    {
+        fclose(f);
+        return false;
+    }
+    uint32_t batchSize = 0, maxPages = 0, seqQLen = 0, numHeads = 0, pageSize = 0, D = 0;
+    if (fread(&batchSize, sizeof(uint32_t), 1, f) != 1 ||
+        fread(&maxPages,  sizeof(uint32_t), 1, f) != 1 ||
+        fread(&seqQLen,   sizeof(uint32_t), 1, f) != 1 ||
+        fread(&numHeads,  sizeof(uint32_t), 1, f) != 1 ||
+        fread(&pageSize,  sizeof(uint32_t), 1, f) != 1 ||
+        fread(&D,         sizeof(uint32_t), 1, f) != 1)
+    {
+        fclose(f);
+        return false;
+    }
+    uint32_t qCount  = batchSize * seqQLen * numHeads * D;
+    uint32_t kvCount = maxPages * pageSize * D;
+    if (qCount != hostQ.size() || kvCount != hostKv.size())
+    {
+        fclose(f);
+        return false;
+    }
+    if (fread(hostQ.data(),  sizeof(float), qCount,  f) != qCount  ||
+        fread(hostKv.data(), sizeof(float), kvCount, f) != kvCount)
+    {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    return true;
+}
 
 // Simple assertion macros for test reporting
 #define TRACE_TEST(name) std::cout << "[TRACE] " << #name << "... "; std::cout.flush()
@@ -971,6 +1040,507 @@ bool test_attention()
     return allCorrect;
 }
 
+// ==================== Top-K (sparse token selection) ====================
+// Per-(batch, kv-head) top-k of attention scores. Mirrors topk_kernel in
+// tensorrt-llm/_torch/attention_backend/sparse/kernel.py (triton_topk).
+bool test_topk()
+{
+    TRACE_TEST("Top-K Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t batchSize      = 2;
+    const uint32_t numHeads      = 3;
+    const uint32_t topk          = 4;
+    const uint32_t totalTokens   = 16;
+    // b0: tokens [0,6)  len 6 ; b1: tokens [6,16) len 10
+    const uint32_t inputOffsets[3]  = {0, 6, 16};
+    // output per row = min(input_len, topk) => 4, 4 => 8 per head row
+    const uint32_t outputOffsets[3] = {0, 4, 8};
+    const uint32_t totalOutputTokens = 8;
+
+    const size_t scoresBytes = static_cast<size_t>(numHeads) * totalTokens * sizeof(float);
+    const size_t offBytes    = static_cast<size_t>(batchSize + 1) * sizeof(uint32_t);
+    const size_t idxBytes    = static_cast<size_t>(numHeads) * totalOutputTokens * sizeof(int32_t);
+
+    void* scoresDev      = VulkanBackend::malloc(scoresBytes);
+    void* inOffDev       = VulkanBackend::malloc(offBytes);
+    void* outOffDev      = VulkanBackend::malloc(offBytes);
+    void* topkIdxDev     = VulkanBackend::malloc(idxBytes);
+    if (!scoresDev || !inOffDev || !outOffDev || !topkIdxDev)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        if (scoresDev) VulkanBackend::free(scoresDev);
+        if (inOffDev)  VulkanBackend::free(inOffDev);
+        if (outOffDev) VulkanBackend::free(outOffDev);
+        if (topkIdxDev) VulkanBackend::free(topkIdxDev);
+        return false;
+    }
+
+    std::minstd_rand rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> hostScores(scoresBytes / sizeof(float));
+    for (auto& val : hostScores)
+    {
+        val = dist(rng);
+    }
+    std::vector<uint32_t> hostInOff(inputOffsets, inputOffsets + batchSize + 1);
+    std::vector<uint32_t> hostOutOff(outputOffsets, outputOffsets + batchSize + 1);
+    std::vector<int32_t> result(idxBytes / sizeof(int32_t), -123);
+
+    if (!VulkanBackend::memcpyHostToDevice(scoresDev, hostScores.data(), scoresBytes) ||
+        !VulkanBackend::memcpyHostToDevice(inOffDev,  hostInOff.data(),  offBytes) ||
+        !VulkanBackend::memcpyHostToDevice(outOffDev, hostOutOff.data(), offBytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(scoresDev);
+        VulkanBackend::free(inOffDev);
+        VulkanBackend::free(outOffDev);
+        VulkanBackend::free(topkIdxDev);
+        return false;
+    }
+
+    if (!VulkanBackend::launchTopk(scoresDev, inOffDev, outOffDev, topkIdxDev,
+                                   topk, numHeads, batchSize, totalTokens,
+                                   totalOutputTokens))
+    {
+        TRACE_FAIL(std::string("Top-K launch failed: ") + backend->getLastError());
+        VulkanBackend::free(scoresDev);
+        VulkanBackend::free(inOffDev);
+        VulkanBackend::free(outOffDev);
+        VulkanBackend::free(topkIdxDev);
+        return false;
+    }
+
+    VulkanBackend::memcpyDeviceToHost(result.data(), topkIdxDev, idxBytes);
+
+    bool allCorrect = true;
+
+    // CPU reference: per (batch,head) row, top-k indices by score desc, first-max ties.
+    for (uint32_t b = 0; b < batchSize && allCorrect; ++b)
+    {
+        uint32_t inStart  = inputOffsets[b];
+        uint32_t inEnd    = inputOffsets[b + 1];
+        uint32_t outStart = outputOffsets[b];
+        uint32_t outEnd   = outputOffsets[b + 1];
+        uint32_t inputLen  = inEnd - inStart;
+        uint32_t outputLen = outEnd - outStart;
+        uint32_t picks     = std::min(outputLen, topk);
+
+        for (uint32_t h = 0; h < numHeads && allCorrect; ++h)
+        {
+            uint32_t rowBase = h * totalTokens + inStart;
+
+            // Gather (value, localIndex) candidates, sort desc with first-max tie-break.
+            std::vector<std::pair<float, uint32_t>> cand;
+            cand.reserve(inputLen);
+            for (uint32_t i = 0; i < inputLen; ++i)
+            {
+                cand.emplace_back(hostScores[rowBase + i], i);
+            }
+            std::sort(cand.begin(), cand.end(),
+                      [](std::pair<float, uint32_t> const& a, std::pair<float, uint32_t> const& b) {
+                          if (a.first != b.first)
+                          {
+                              return a.first > b.first;
+                          }
+                          return a.second < b.second;
+                      });
+
+            uint32_t outBase = h * totalOutputTokens + outStart;
+            for (uint32_t s = 0; s < picks; ++s)
+            {
+                int32_t got = result[outBase + s];
+                int32_t ref = static_cast<int32_t>(cand[s].second);
+                if (got != ref)
+                {
+                    allCorrect = false;
+                    std::cout << "      mismatch b=" << b << " h=" << h << " s=" << s
+                              << " got=" << got << " ref=" << ref << std::endl;
+                }
+            }
+            // Any slots beyond picks must be left untouched (-123 sentinel); the kernel
+            // only writes `picks` entries, so the rest stays as host init.
+        }
+    }
+
+    VulkanBackend::free(scoresDev);
+    VulkanBackend::free(inOffDev);
+    VulkanBackend::free(outOffDev);
+    VulkanBackend::free(topkIdxDev);
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect top-k results");
+    }
+    else
+    {
+        std::cout << "      Result verified: top-k matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+
+    return allCorrect;
+}
+
+// ==================== MLA FMHA (decode) ====================
+// Vulkan port of the CuTe-DSL Blackwell MLA decode kernel. One thread per query
+// token; paged KV gather via pageTable, split q_nope/q_rope key, value = latent.
+// Validated against a CPU MLA reference with synthetic fp32 tensors.
+bool test_mla_fmha()
+{
+    TRACE_TEST("MLA FMHA Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t batchSize  = 2;
+    const uint32_t numHeads  = 16;  // DeepSeek-V2-Lite MLA dims: num_attention_heads
+    const uint32_t seqQLen   = 1;
+    const uint32_t dLatent   = 128; // qk_nope_head_dim
+    const uint32_t dRope     = 64;  // qk_rope_head_dim
+    const uint32_t D         = dLatent + dRope; // 192
+    const uint32_t pageSize  = 64;  // DeepSeek page size
+    const uint32_t maxPages  = 2;
+    const uint32_t numPages  = 2; // one page per request
+    float softmaxScale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    std::vector<int32_t> hostPageTable = {0, -1, 1, -1};  // b0->page0, b1->page1
+    std::vector<int32_t> hostCacheSeqs = {50, 60};         // near-full pages (<= pageSize)
+
+    const size_t qBytes     = static_cast<size_t>(batchSize) * seqQLen * numHeads * D * sizeof(float);
+    const size_t kvBytes    = static_cast<size_t>(numPages) * pageSize * D * sizeof(float);
+    const size_t pagBytes   = static_cast<size_t>(batchSize) * maxPages * sizeof(int32_t);
+    const size_t seqBytes   = static_cast<size_t>(batchSize) * sizeof(int32_t);
+    const size_t outBytes   = static_cast<size_t>(batchSize) * seqQLen * numHeads * dLatent * sizeof(float);
+
+    void* qDev      = VulkanBackend::malloc(qBytes);
+    void* kvDev     = VulkanBackend::malloc(kvBytes);
+    void* ptDev     = VulkanBackend::malloc(pagBytes);
+    void* csDev     = VulkanBackend::malloc(seqBytes);
+    void* outDev    = VulkanBackend::malloc(outBytes);
+    if (!qDev || !kvDev || !ptDev || !csDev || !outDev)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        if (qDev)  VulkanBackend::free(qDev);
+        if (kvDev) VulkanBackend::free(kvDev);
+        if (ptDev) VulkanBackend::free(ptDev);
+        if (csDev) VulkanBackend::free(csDev);
+        if (outDev) VulkanBackend::free(outDev);
+        return false;
+    }
+
+    std::vector<float> hostQ(qBytes / sizeof(float));
+    std::vector<float> hostKv(kvBytes / sizeof(float));
+    std::vector<float> hostOut(outBytes / sizeof(float), 0.0f);
+
+    // Real-valued Q/KV derived from DeepSeek-Coder-V2-Lite weights (dequantized from GGUF).
+    // If the generated asset 'mla_real.bin' is present, load it (real DeepSeek MLA data);
+    // otherwise fall back to the original synthetic RNG stream so the test stays green in
+    // environments without the model. The kernel-vs-CPU-reference validity check is
+    // identical either way (both consume the same host bytes).
+    std::string const realPath = "mla_real.bin";
+    bool loadedReal = loadRealMlaData(realPath, hostQ, hostKv);
+    if (!loadedReal)
+    {
+        std::cout << "      [warn] mla_real.bin not found; using synthetic RNG (fallback)."
+                  << std::endl;
+        std::minstd_rand rng(13);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto& val : hostQ)  { val = dist(rng); }
+        for (auto& val : hostKv) { val = dist(rng); }
+    }
+
+    if (!VulkanBackend::memcpyHostToDevice(qDev,  hostQ.data(),  qBytes) ||
+        !VulkanBackend::memcpyHostToDevice(kvDev, hostKv.data(), kvBytes) ||
+        !VulkanBackend::memcpyHostToDevice(ptDev, hostPageTable.data(), pagBytes) ||
+        !VulkanBackend::memcpyHostToDevice(csDev, hostCacheSeqs.data(), seqBytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(qDev);
+        VulkanBackend::free(kvDev);
+        VulkanBackend::free(ptDev);
+        VulkanBackend::free(csDev);
+        VulkanBackend::free(outDev);
+        return false;
+    }
+
+    if (!VulkanBackend::launchMlaFmha(qDev, kvDev, ptDev, csDev, outDev,
+                                     numHeads, seqQLen, batchSize, dLatent, dRope,
+                                     pageSize, maxPages, softmaxScale))
+    {
+        TRACE_FAIL(std::string("MLA FMHA launch failed: ") + backend->getLastError());
+        VulkanBackend::free(qDev);
+        VulkanBackend::free(kvDev);
+        VulkanBackend::free(ptDev);
+        VulkanBackend::free(csDev);
+        VulkanBackend::free(outDev);
+        return false;
+    }
+
+    VulkanBackend::memcpyDeviceToHost(hostOut.data(), outDev, outBytes);
+
+    bool allCorrect = true;
+
+    // CPU reference matching mla_fmha.comp exactly.
+    for (uint32_t b = 0; b < batchSize && allCorrect; ++b)
+    {
+        int32_t kvLen = hostCacheSeqs[b];
+        int32_t page0 = hostPageTable[b * maxPages]; // single page per request
+        if (kvLen > static_cast<int32_t>(pageSize))
+        {
+            kvLen = pageSize;
+        }
+        for (uint32_t h = 0; h < numHeads && allCorrect; ++h)
+        {
+            uint32_t qOff  = (b * seqQLen * numHeads + h) * D;
+            uint32_t oOff  = (b * seqQLen * numHeads + h) * dLatent;
+
+            // gather scores over kvLen tokens
+            float maxScore = -1.0e30f;
+            std::vector<float> scores(kvLen, 0.0f);
+            for (int32_t p = 0; p < kvLen; ++p)
+            {
+                uint32_t kvBase = (uint32_t(page0) * pageSize + uint32_t(p)) * D;
+                float dn = 0.0f, dr = 0.0f;
+                for (uint32_t d = 0; d < dLatent; ++d)
+                {
+                    dn += hostQ[qOff + d] * hostKv[kvBase + d];
+                }
+                for (uint32_t d = 0; d < dRope; ++d)
+                {
+                    dr += hostQ[qOff + dLatent + d] * hostKv[kvBase + dLatent + d];
+                }
+                scores[p] = softmaxScale * (dn + dr);
+                if (scores[p] > maxScore)
+                {
+                    maxScore = scores[p];
+                }
+            }
+
+            float sum = 0.0f;
+            for (int32_t p = 0; p < kvLen; ++p)
+            {
+                sum += std::exp(scores[p] - maxScore);
+            }
+            float invSum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+
+            for (uint32_t d = 0; d < dLatent; ++d)
+            {
+                float acc = 0.0f;
+                for (int32_t p = 0; p < kvLen; ++p)
+                {
+                    uint32_t kvBase = (uint32_t(page0) * pageSize + uint32_t(p)) * D;
+                    float w = std::exp(scores[p] - maxScore) * invSum;
+                    acc += w * hostKv[kvBase + d];
+                }
+                float got = hostOut[oOff + d];
+                if (std::abs(got - acc) > 1e-3f)
+                {
+                    allCorrect = false;
+                    std::cout << "      mismatch b=" << b << " h=" << h << " d=" << d
+                              << " got=" << got << " ref=" << acc << std::endl;
+                }
+            }
+        }
+    }
+
+    VulkanBackend::free(qDev);
+    VulkanBackend::free(kvDev);
+    VulkanBackend::free(ptDev);
+    VulkanBackend::free(csDev);
+    VulkanBackend::free(outDev);
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect MLA FMHA results");
+    }
+    else
+    {
+        std::cout << "      Result verified: MLA FMHA matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+
+    return allCorrect;
+}
+
+// ==================== MLA FMHA (prefill, causal) ====================
+// Context-phase MLA FMHA: S_q>1 query tokens, causal (q[s] attends
+// cacheSeqs[b] + s+1 tokens). Mirrors mla_fmha_prefill.comp: one workgroup
+// per (b,h,s), paged KV gather, q_nope/q_rope split, value = latent.
+bool test_mla_fmha_prefill()
+{
+    TRACE_TEST("MLA FMHA Prefill Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t batchSize  = 2;
+    const uint32_t numHeads  = 16;  // DeepSeek-V2-Lite MLA dims: num_attention_heads
+    const uint32_t seqQLen   = 16;  // context tokens for this prefill chunk
+    const uint32_t dLatent   = 128; // qk_nope_head_dim
+    const uint32_t dRope     = 64;  // qk_rope_head_dim
+    const uint32_t D         = dLatent + dRope; // 192
+    const uint32_t pageSize  = 64;  // DeepSeek page size
+    const uint32_t maxPages  = 4;   // b1 now spans page1+page2 (cross-page gather)
+    const uint32_t numPages  = 4;   // 4-page pool
+    float softmaxScale = 1.0f / std::sqrt(static_cast<float>(D));
+    const bool   causal    = true;
+
+    std::vector<int32_t> hostPageTable = {0, -1, -1, -1, 1, 2, -1, -1};  // b0->page0; b1->page1,page2
+    std::vector<int32_t> hostCacheSeqs = {0, 80};                        // b0: cold; b1: 80 prior tokens (2 pages)
+
+    const size_t qBytes   = static_cast<size_t>(batchSize) * seqQLen * numHeads * D * sizeof(float);
+    const size_t kvBytes  = static_cast<size_t>(numPages) * pageSize * D * sizeof(float);
+    const size_t pagBytes = static_cast<size_t>(batchSize) * maxPages * sizeof(int32_t);
+    const size_t seqBytes = static_cast<size_t>(batchSize) * sizeof(int32_t);
+    const size_t outBytes = static_cast<size_t>(batchSize) * seqQLen * numHeads * dLatent * sizeof(float);
+
+    void* qDev   = VulkanBackend::malloc(qBytes);
+    void* kvDev  = VulkanBackend::malloc(kvBytes);
+    void* ptDev  = VulkanBackend::malloc(pagBytes);
+    void* csDev  = VulkanBackend::malloc(seqBytes);
+    void* outDev = VulkanBackend::malloc(outBytes);
+    if (!qDev || !kvDev || !ptDev || !csDev || !outDev)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        if (qDev)  VulkanBackend::free(qDev);
+        if (kvDev) VulkanBackend::free(kvDev);
+        if (ptDev) VulkanBackend::free(ptDev);
+        if (csDev) VulkanBackend::free(csDev);
+        if (outDev) VulkanBackend::free(outDev);
+        return false;
+    }
+
+    std::vector<float> hostQ(qBytes / sizeof(float));
+    std::vector<float> hostKv(kvBytes / sizeof(float));
+    std::vector<float> hostOut(outBytes / sizeof(float), 0.0f);
+
+    // Real-valued Q/KV derived from DeepSeek-Coder-V2-Lite weights (dequantized from GGUF).
+    std::string const realPath = "mla_real_prefill.bin";
+    bool loadedReal = loadRealMlaData(realPath, hostQ, hostKv);
+    if (!loadedReal)
+    {
+        std::cout << "      [warn] mla_real_prefill.bin not found; using synthetic RNG (fallback)."
+                  << std::endl;
+        std::minstd_rand        rngF(7);
+        std::uniform_real_distribution<float> distF(-1.0f, 1.0f);
+        for (auto& val : hostQ)  { val = distF(rngF); }
+        for (auto& val : hostKv) { val = distF(rngF); }
+    }
+
+    if (!VulkanBackend::memcpyHostToDevice(qDev,  hostQ.data(),  qBytes) ||
+        !VulkanBackend::memcpyHostToDevice(kvDev, hostKv.data(), kvBytes) ||
+        !VulkanBackend::memcpyHostToDevice(ptDev, hostPageTable.data(), pagBytes) ||
+        !VulkanBackend::memcpyHostToDevice(csDev, hostCacheSeqs.data(), seqBytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(qDev); VulkanBackend::free(kvDev);
+        VulkanBackend::free(ptDev); VulkanBackend::free(csDev);
+        VulkanBackend::free(outDev);
+        return false;
+    }
+
+    if (!VulkanBackend::launchMlaFmhaPrefill(qDev, kvDev, ptDev, csDev, outDev,
+                                             numHeads, seqQLen, batchSize, dLatent, dRope,
+                                             pageSize, maxPages, causal, softmaxScale))
+    {
+        TRACE_FAIL(std::string("MLA FMHA prefill launch failed: ") + backend->getLastError());
+        VulkanBackend::free(qDev); VulkanBackend::free(kvDev);
+        VulkanBackend::free(ptDev); VulkanBackend::free(csDev);
+        VulkanBackend::free(outDev);
+        return false;
+    }
+
+    VulkanBackend::memcpyDeviceToHost(hostOut.data(), outDev, outBytes);
+
+    bool allCorrect = true;
+
+    // CPU reference matching mla_fmha_prefill.comp exactly.
+    for (uint32_t b = 0; b < batchSize && allCorrect; ++b)
+    {
+        int32_t baseKv = hostCacheSeqs[b];
+        for (uint32_t s = 0; s < seqQLen && allCorrect; ++s)
+        {
+            int32_t kvLen = baseKv + static_cast<int32_t>(s) + 1; // causal window
+            for (uint32_t h = 0; h < numHeads && allCorrect; ++h)
+            {
+                uint32_t qOff = (b * seqQLen * numHeads + s * numHeads + h) * D;
+                uint32_t oOff = (b * seqQLen * numHeads + s * numHeads + h) * dLatent;
+
+                float maxScore = -1.0e30f;
+                std::vector<float> scores(kvLen, 0.0f);
+                for (int32_t t = 0; t < kvLen; ++t)
+                {
+                    uint32_t page    = static_cast<uint32_t>(hostPageTable[b * maxPages + t / pageSize]);
+                    uint32_t slot    = static_cast<uint32_t>(t % pageSize);
+                    uint32_t kvBase  = (page * pageSize + slot) * D;
+                    float dn = 0.0f, dr = 0.0f;
+                    for (uint32_t d = 0; d < dLatent; ++d) { dn += hostQ[qOff + d] * hostKv[kvBase + d]; }
+                    for (uint32_t d = 0; d < dRope; ++d)  { dr += hostQ[qOff + dLatent + d] * hostKv[kvBase + dLatent + d]; }
+                    scores[t] = softmaxScale * (dn + dr);
+                    if (scores[t] > maxScore) { maxScore = scores[t]; }
+                }
+
+                float sum = 0.0f;
+                for (int32_t t = 0; t < kvLen; ++t) { sum += std::exp(scores[t] - maxScore); }
+                float invSum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+
+                for (uint32_t d = 0; d < dLatent; ++d)
+                {
+                    float acc = 0.0f;
+                    for (int32_t t = 0; t < kvLen; ++t)
+                    {
+                        uint32_t page    = static_cast<uint32_t>(hostPageTable[b * maxPages + t / pageSize]);
+                        uint32_t slot    = static_cast<uint32_t>(t % pageSize);
+                        uint32_t kvBase  = (page * pageSize + slot) * D;
+                        float w = std::exp(scores[t] - maxScore) * invSum;
+                        acc += w * hostKv[kvBase + d];
+                    }
+                    float got = hostOut[oOff + d];
+                    if (std::abs(got - acc) > 1e-3f)
+                    {
+                        allCorrect = false;
+                        std::cout << "      mismatch b=" << b << " s=" << s << " h=" << h << " d=" << d
+                                  << " got=" << got << " ref=" << acc << std::endl;
+                    }
+                }
+            }
+        }
+    }
+
+    VulkanBackend::free(qDev);
+    VulkanBackend::free(kvDev);
+    VulkanBackend::free(ptDev);
+    VulkanBackend::free(csDev);
+    VulkanBackend::free(outDev);
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect MLA FMHA prefill results");
+    }
+    else
+    {
+        std::cout << "      Result verified: MLA FMHA prefill matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+
+    return allCorrect;
+}
+
 int main()
 {
     std::cout << "========================================" << std::endl;
@@ -1007,6 +1577,9 @@ int main()
     runTest(test_q8_0_gemm, "Q8_0 GEMM Kernel");
     runTest(test_softmax, "Softmax Kernel");
     runTest(test_attention, "Attention Kernel");
+    runTest(test_topk, "Top-K Kernel");
+    runTest(test_mla_fmha, "MLA FMHA Kernel");
+    runTest(test_mla_fmha_prefill, "MLA FMHA Prefill Kernel");
     runTest(test_resource_leak_prevention, "Resource Leak Prevention");
     runTest(test_utilization_tracking, "GPU Utilization Tracking");
 

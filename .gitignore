@@ -103,6 +103,9 @@ CLAUDE.local.md
 CMakeUserPresets.json
 compile_commands.json
 *.bin
+# Exception: committed Vulkan MLA test fixtures (TEST 12/13 real-weight vectors)
+!cpp/tests/mla_real.bin
+!cpp/tests/mla_real_prefill.bin
 .dir-locals.el
 .devcontainer/devcontainer.env.user
 .devcontainer/docker-compose.override.yml

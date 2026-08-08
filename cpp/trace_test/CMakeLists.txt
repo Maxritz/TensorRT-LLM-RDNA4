@@ -52,3 +52,20 @@ target_compile_definitions(vulkan_trace_test PUBLIC ENABLE_VULKAN=1)
 set_target_properties(vulkan_trace_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+# Copy real-valued DeepSeek MLA test-data assets (TEST 12/13) next to the test
+# executable so the real-weights path resolves from the exe directory too, not only
+# when run from cpp/ or via the source-anchored fallback in loadRealMlaData.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_real.bin)
+    add_custom_command(TARGET vulkan_trace_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_real.bin
+            ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/mla_real.bin)
+endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_real_prefill.bin)
+    add_custom_command(TARGET vulkan_trace_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_real_prefill.bin
+            ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/mla_real_prefill.bin)
+endif()
+
