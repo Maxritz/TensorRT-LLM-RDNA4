@@ -26,6 +26,10 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <random>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
@@ -462,6 +466,234 @@ bool test_rms_norm()
     return allCorrect;
 }
 
+// ==================== fp16 GEMM (naive) ====================
+// C[M,N] = A[M,K] * B[K,N], fp32 accumulation. Verified against a CPU reference.
+bool test_fp16_gemm()
+{
+    TRACE_TEST("FP16 GEMM Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t M = 16;
+    const uint32_t N = 16;
+    const uint32_t K = 16;
+    const size_t aBytes = static_cast<size_t>(M) * K * sizeof(float);
+    const size_t bBytes = static_cast<size_t>(K) * N * sizeof(float);
+    const size_t oBytes = static_cast<size_t>(M) * N * sizeof(float);
+
+    void* a = VulkanBackend::malloc(aBytes);
+    void* b = VulkanBackend::malloc(bBytes);
+    void* output = VulkanBackend::malloc(oBytes);
+    if (!a || !b || !output)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        if (a) VulkanBackend::free(a);
+        if (b) VulkanBackend::free(b);
+        if (output) VulkanBackend::free(output);
+        return false;
+    }
+
+    std::minstd_rand rng(12345);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> hostA(M * K), hostB(K * N), result(M * N, 0.0f);
+    for (auto& v : hostA)
+    {
+        v = dist(rng);
+    }
+    for (auto& v : hostB)
+    {
+        v = dist(rng);
+    }
+
+    if (!VulkanBackend::memcpyHostToDevice(a, hostA.data(), aBytes) ||
+        !VulkanBackend::memcpyHostToDevice(b, hostB.data(), bBytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(a);
+        VulkanBackend::free(b);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    if (!VulkanBackend::launchFp16Gemm(a, b, output, M, N, K))
+    {
+        TRACE_FAIL(std::string("FP16 GEMM launch failed: ") + backend->getLastError());
+        VulkanBackend::free(a);
+        VulkanBackend::free(b);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    VulkanBackend::memcpyDeviceToHost(result.data(), output, oBytes);
+
+    bool allCorrect = true;
+    for (uint32_t r = 0; r < M && allCorrect; ++r)
+    {
+        for (uint32_t c = 0; c < N; ++c)
+        {
+            float ref = 0.0f;
+            for (uint32_t k = 0; k < K; ++k)
+            {
+                ref += hostA[r * K + k] * hostB[k * N + c];
+            }
+            if (std::abs(result[r * N + c] - ref) > 1e-3f)
+            {
+                allCorrect = false;
+                std::cout << "      mismatch r=" << r << " c=" << c << " got=" << result[r * N + c]
+                          << " ref=" << ref << std::endl;
+                break;
+            }
+        }
+    }
+
+    VulkanBackend::free(a);
+    VulkanBackend::free(b);
+    VulkanBackend::free(output);
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect fp16 GEMM results");
+    }
+    else
+    {
+        std::cout << "      Result verified: fp16 GEMM matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+
+    return allCorrect;
+}
+
+// ==================== Q8_0 GEMM (dequantized) ====================
+// C[M,N] = A[M,K] * W_dequant[N,K]^T  with Q8_0 blocks (1 fp32 scale + 32 int8).
+bool test_q8_0_gemm()
+{
+    TRACE_TEST("Q8_0 GEMM Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t M = 8;
+    const uint32_t N = 12;
+    const uint32_t K = 64; // must be a multiple of 32
+    const uint32_t blocksPerRow = K / 32u;
+    const size_t weightBytes = static_cast<size_t>(N) * blocksPerRow * 36u;
+    const size_t aBytes = static_cast<size_t>(M) * K * sizeof(float);
+    const size_t oBytes = static_cast<size_t>(M) * N * sizeof(float);
+
+    void* weight = VulkanBackend::malloc(weightBytes);
+    void* activation = VulkanBackend::malloc(aBytes);
+    void* output = VulkanBackend::malloc(oBytes);
+    if (!weight || !activation || !output)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        if (weight) VulkanBackend::free(weight);
+        if (activation) VulkanBackend::free(activation);
+        if (output) VulkanBackend::free(output);
+        return false;
+    }
+
+    std::minstd_rand rng(98765);
+    std::uniform_real_distribution<float> dAct(0.0f, 1.0f);
+    std::uniform_int_distribution<int> dInt(-4, 4);
+
+    std::vector<uint8_t> hostW(weightBytes);
+    std::vector<float> hostA(M * K), hostWdeq(N * K, 0.0f), result(M * N, 0.0f);
+    for (uint32_t n = 0; n < N; ++n)
+    {
+        for (uint32_t blk = 0; blk < blocksPerRow; ++blk)
+        {
+            uint32_t base = (n * blocksPerRow + blk) * 36u;
+            float scale = 1.0f;
+            uint32_t bits;
+            std::memcpy(&bits, &scale, sizeof(bits));
+            hostW[base + 0] = static_cast<uint8_t>(bits & 0xFFu);
+            hostW[base + 1] = static_cast<uint8_t>((bits >> 8) & 0xFFu);
+            hostW[base + 2] = static_cast<uint8_t>((bits >> 16) & 0xFFu);
+            hostW[base + 3] = static_cast<uint8_t>((bits >> 24) & 0xFFu);
+            for (int w = 0; w < 32; ++w)
+            {
+                int8_t iv = static_cast<int8_t>(dInt(rng));
+                hostW[base + 4 + static_cast<uint32_t>(w)] = static_cast<uint8_t>(iv);
+                uint32_t k = blk * 32u + static_cast<uint32_t>(w);
+                if (k < K)
+                {
+                    hostWdeq[n * K + k] = scale * static_cast<float>(iv);
+                }
+            }
+        }
+    }
+    for (auto& v : hostA)
+    {
+        v = dAct(rng);
+    }
+
+    if (!VulkanBackend::memcpyHostToDevice(weight, hostW.data(), weightBytes) ||
+        !VulkanBackend::memcpyHostToDevice(activation, hostA.data(), aBytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(weight);
+        VulkanBackend::free(activation);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    if (!VulkanBackend::launchQ8_0Gemm(weight, activation, output, M, N, K, blocksPerRow))
+    {
+        TRACE_FAIL(std::string("Q8_0 GEMM launch failed: ") + backend->getLastError());
+        VulkanBackend::free(weight);
+        VulkanBackend::free(activation);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    VulkanBackend::memcpyDeviceToHost(result.data(), output, oBytes);
+
+    bool allCorrect = true;
+    for (uint32_t m = 0; m < M && allCorrect; ++m)
+    {
+        for (uint32_t n = 0; n < N; ++n)
+        {
+            float ref = 0.0f;
+            for (uint32_t k = 0; k < K; ++k)
+            {
+                ref += hostA[m * K + k] * hostWdeq[n * K + k];
+            }
+            if (std::abs(result[m * N + n] - ref) > 1e-2f)
+            {
+                allCorrect = false;
+                std::cout << "      mismatch m=" << m << " n=" << n << " got=" << result[m * N + n]
+                          << " ref=" << ref << std::endl;
+                break;
+            }
+        }
+    }
+
+    VulkanBackend::free(weight);
+    VulkanBackend::free(activation);
+    VulkanBackend::free(output);
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect Q8_0 GEMM results");
+    }
+    else
+    {
+        std::cout << "      Result verified: Q8_0 GEMM matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+
+    return allCorrect;
+}
+
 int main()
 {
     std::cout << "========================================" << std::endl;
@@ -494,6 +726,8 @@ int main()
     runTest(test_kernel_registry, "Kernel Registry");
     runTest(test_elementwise_kernel, "Elementwise Add Kernel");
     runTest(test_rms_norm, "RMS Norm Kernel");
+    runTest(test_fp16_gemm, "FP16 GEMM Kernel");
+    runTest(test_q8_0_gemm, "Q8_0 GEMM Kernel");
     runTest(test_resource_leak_prevention, "Resource Leak Prevention");
     runTest(test_utilization_tracking, "GPU Utilization Tracking");
 

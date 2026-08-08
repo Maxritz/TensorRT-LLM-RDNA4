@@ -28,7 +28,7 @@ file(GLOB_RECURSE VULKAN_SRCS
 )
 
 # Add definitions to avoid CUDA header dependencies
-add_definitions(-DENABLE_VK_EXT)
+add_definitions(-DENABLE_VK_EXT -DNOMINMAX)
 
 # Main executable
 add_executable(vulkan_trace_test
