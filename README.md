@@ -31,21 +31,32 @@ GPUs where CUDA is unavailable.
 kernel backed by a host-verified trace test in `cpp/tests/vulkanTraceMain.cpp`
 (built from `cpp/trace_test/CMakeLists.txt`).
 
-**Port status** (compiled and numerically verified on AMD Radeon RX 9070 XT /
-RDNA2 via `vulkan_trace_test`):
+ **Port status** (compiled and numerically verified on AMD Radeon RX 9070 XT /
+ RDNA2 via `vulkan_trace_test`, 21/21 tests passing):
 
-| Kernel | Dispatcher | Shader | Verified |
-|---|---|---|---|
-| `elementwise_add` | `dispatchElementwiseAdd` | `elementwise_add.comp` | yes |
-| `rms_norm` | `dispatchRmsNorm` | `rms_norm.comp` | yes |
-| `fp16_gemm` | `dispatchFp16Gemm` | `fp16_gemm.comp` | yes |
-| `q8_0_gemm` | `dispatchQ8_0Gemm` | `q8_0_gemm.comp` | yes |
+ | Kernel | Dispatcher | Shader | Verified |
+ |---|---|---|---|
+ | `elementwise_add` | `dispatchElementwiseAdd` | `elementwise_add.comp` | yes |
+ | `rms_norm` | `dispatchRmsNorm` | `rms_norm.comp` | yes |
+ | `fp16_gemm` | `dispatchFp16Gemm` | `fp16_gemm.comp` | yes |
+ | `q8_0_gemm` | `dispatchQ8_0Gemm` | `q8_0_gemm.comp` | yes |
+ | `softmax` | `dispatchSoftmax` | `softmax.comp` | yes |
+ | `attention` | `dispatchAttention` | `attention.comp` | yes |
+ | `topk` | `dispatchTopK` | `topk.comp` | yes |
+ | `spec_accept` | `dispatchSpecAccept` | `spec_accept.comp` | yes |
+ | `tree_spec_build` | `dispatchTreeSpecBuild`, `dispatchTreeSpecGreedyVerify` | `tree_spec_build.comp`, `tree_spec_greedy_verify.comp` | yes |
+ | `tree_spec_rejection` | `dispatchTreeSpecRejection` | `tree_spec_rejection.comp` | yes |
+ | `kv_cache_update_2d` | `dispatchKVCacheUpdate2D` | `kv_cache_update_2d.comp` | yes |
 
-Build & run the trace test:
+ Build & run the trace test:
 
-    cmake -S cpp/trace_test -B cpp/build_trace
-    cmake --build cpp/build_trace --config Release --target vulkan_trace_test
-    ./cpp/build_trace/bin/Release/vulkan_trace_test.exe
+     cmake -S cpp/trace_test -B build_vulkan -DCMAKE_BUILD_TYPE=Release
+     cmake --build build_vulkan --config Release --target vulkan_trace_test
+     ./build_vulkan/bin/vulkan_trace_test.exe
+
+ Shader sources live in `cpp/tensorrt_llm/kernels/vulkan/shaders/`. Each `.comp`
+ file is compiled to SPIR-V by the Vulkan SDK's `glslangValidator` (auto-invoked
+ by CMake via the `VulkanBackend::compileShader` helper).
 
 ## Tech Blogs
 
