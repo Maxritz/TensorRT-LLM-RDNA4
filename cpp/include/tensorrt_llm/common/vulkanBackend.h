@@ -90,10 +90,34 @@ public:
                               void* stream = nullptr);
 
     static bool launchAttention(void* q, void* k, void* v, void* output,
-                                uint32_t batchSize, uint32_t numHeads,
-                                uint32_t seqLenQ, uint32_t seqLenK, uint32_t headDim,
-                                bool causal,
-                                void* stream = nullptr);
+                                 uint32_t batchSize, uint32_t numHeads,
+                                 uint32_t seqLenQ, uint32_t seqLenK, uint32_t headDim,
+                                 bool causal,
+                                 void* stream = nullptr);
+
+    static bool launchTopk(void* scores, void* inputOffsets, void* outputOffsets,
+                           void* topkIndices,
+                           uint32_t topk, uint32_t numHeads, uint32_t batchSize,
+                           uint32_t totalTokens, uint32_t totalOutputTokens,
+                           void* stream = nullptr);
+
+    static bool launchMlaFmha(void* q, void* kv, void* pageTable, void* cacheSeqs,
+                              void* output,
+                              uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
+                              uint32_t dLatent, uint32_t dRope, uint32_t pageSize,
+                              uint32_t maxPages, float softmaxScale,
+                              uint32_t slidingWindow = 0, uint32_t storageType = 0,
+                              float kvScale = 1.0f,
+                              void* stream = nullptr);
+
+    static bool launchMlaFmhaPrefill(void* q, void* kv, void* pageTable, void* cacheSeqs,
+                                     void* output,
+                                     uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
+                                     uint32_t dLatent, uint32_t dRope, uint32_t pageSize,
+                                     uint32_t maxPages, bool causal, float softmaxScale,
+                                     uint32_t slidingWindow = 0, uint32_t storageType = 0,
+                                     float kvScale = 1.0f,
+                                     void* stream = nullptr);
 
     // ==================== Synchronization ====================
     static void streamSynchronize(void* stream = nullptr);

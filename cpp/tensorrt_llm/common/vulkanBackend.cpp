@@ -339,6 +339,90 @@ bool VulkanBackend::launchAttention(void* q, void* k, void* v, void* output,
     return true;
 }
 
+bool VulkanBackend::launchTopk(void* scores, void* inputOffsets, void* outputOffsets,
+                               void* topkIndices,
+                               uint32_t topk, uint32_t numHeads, uint32_t batchSize,
+                               uint32_t totalTokens, uint32_t totalOutputTokens,
+                               void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchTopk(
+        scores, inputOffsets, outputOffsets, topkIndices,
+        topk, numHeads, batchSize, totalTokens, totalOutputTokens);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("Topk launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchMlaFmha(void* q, void* kv, void* pageTable, void* cacheSeqs,
+                                  void* output,
+                                  uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
+                                  uint32_t dLatent, uint32_t dRope, uint32_t pageSize,
+                                  uint32_t maxPages, float softmaxScale,
+                                  uint32_t slidingWindow, uint32_t storageType,
+                                  float kvScale, void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchMlaFmha(
+        q, kv, pageTable, cacheSeqs, output,
+        numHeads, seqQLen, batchSize, dLatent, dRope, pageSize, maxPages, softmaxScale,
+        slidingWindow, storageType, kvScale);
+    (void)slidingWindow; (void)storageType; (void)kvScale;
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("MLA FMHA launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchMlaFmhaPrefill(void* q, void* kv, void* pageTable, void* cacheSeqs,
+                                         void* output,
+                                         uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
+                                         uint32_t dLatent, uint32_t dRope, uint32_t pageSize,
+                                         uint32_t maxPages, bool causal, float softmaxScale,
+                                         uint32_t slidingWindow, uint32_t storageType,
+                                         float kvScale, void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchMlaFmhaPrefill(
+        q, kv, pageTable, cacheSeqs, output,
+        numHeads, seqQLen, batchSize, dLatent, dRope, pageSize, maxPages, causal,
+        softmaxScale, slidingWindow, storageType, kvScale);
+    (void)slidingWindow; (void)storageType; (void)kvScale;
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("MLA FMHA prefill launch failed: ") +
+                              VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
 // ==================== Synchronization ====================
 
 void VulkanBackend::streamSynchronize(void* stream)

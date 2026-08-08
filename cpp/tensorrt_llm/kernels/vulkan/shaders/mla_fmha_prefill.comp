@@ -1,0 +1,257 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+
+// Multi-Head Latent Attention (MLA) forward, CONTEXT/PREFILL phase (causal).
+// Vulkan port of the CaTe-DSL Blackwell MLA prefill compute contract
+// (cute_dsl_mla.py / mla_decode_* generalised to the context phase).
+//
+// One thread per query token (b, h, s). For query s the attended KV length is
+//   kvLen = cacheSeqs[b] + (causal ? s + 1 : seqQLen)
+// i.e. the s-th context token attends the prior cache plus itself (causal).
+// Scores use the MLA key split: q_nope . c_latent + q_rope . c_rope (scaled),
+// value = c_latent (compressed latent); softmax over the KV tokens.
+//
+// Layout:
+//   q        [B, S, H, D]            (D = dLatent + dRope)
+//   kv       [numPages, pageSize, D] paged KV cache (latent-key + rope-key, latent-value)
+//   pageTable[B, maxPages] int32     page indices per request (-1 = empty slot)
+//   cacheSeqs[B] int32               prior KV tokens already in cache (before this prefill)
+//   out      [B, S, H, dLatent]      compressed-latent attention output
+// Correctness-first (like attention.comp); tile for long KV in a follow-up.
+//
+// Push constants match VulkanKernelDispatcher::dispatchMlaFmhaPrefill.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint numHeads;
+    uint seqQLen;
+    uint batchSize;
+    uint dLatent;
+    uint dRope;
+    uint pageSize;
+    uint maxPages;
+    float softmaxScale;
+    uint causal;
+    uint slidingWindow;  // 0 = full KV; >0 = attend to last W tokens (inclusive)
+    uint storageType;    // 0=fp32,1=fp16,2=fp8_e4m3,3=bf16
+    float kvScale;       // fp8 dequant multiplier (1.0 for non-fp8)
+} pc;
+
+layout(std430, binding = 0) restrict readonly  buffer BufQ    { float q32[];  };
+layout(std430, binding = 0) restrict readonly  buffer BufQ16   { uint  q16[];  };
+layout(std430, binding = 1) restrict readonly  buffer BufKV   { float kv32[]; };
+layout(std430, binding = 1) restrict readonly  buffer BufKV16  { uint  kv16[]; };
+layout(std430, binding = 2) restrict readonly  buffer BufPage { int   pageTable[]; };
+layout(std430, binding = 3) restrict readonly  buffer BufSeq  { int   cacheSeqs[]; };
+layout(std430, binding = 4) coherent       buffer BufOut32 { float out32[]; };
+layout(std430, binding = 4) coherent       buffer BufOut16  { uint  out16[]; };
+
+float fp16ToFp32(uint bits)
+{
+    uint sign = (bits >> 15u) & 0x1u;
+    uint exp  = (bits >> 10u) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    uint f;
+    if (exp == 0u) f = 0u;
+    else f = ((sign << 31u) | (((exp + 112u) & 0xFFu) << 23u) | (mant << 13u));
+    return uintBitsToFloat(f);
+}
+uint fp32ToFp16(float v)
+{
+    uint bits = floatBitsToUint(v);
+    uint sign = (bits >> 31u) & 0x1u;
+    int  exp  = int((bits >> 23u) & 0xFFu) - 127;
+    uint mant = bits & 0x7FFFFFu;
+    uint e = uint(exp + 15);
+    if (exp + 15 <= 0) return sign << 15u;
+    if (exp + 15 >= 31) return (sign << 15u) | 0x7C00u;
+    uint m = (mant >> 13u) & 0x3FFu;
+    m += (mant >> 12u) & 0x1u;
+    if (m > 0x3FFu) { m = 0u; e += 1u; }
+    if (e >= 31u) e = 31u;
+    return (sign << 15u) | (e << 10u) | m;
+}
+float bf16ToFp32(uint bits) { return uintBitsToFloat((bits & 0xFFFFu) << 16u); }
+uint fp32ToBf16(float v)
+{
+    uint bits = floatBitsToUint(v);
+    uint bf16 = (bits + 0x8000u) >> 16u;
+    return bf16 & 0xFFFFu;
+}
+float fp8ToFp32(uint bits)
+{
+    uint sign = (bits >> 7u) & 0x1u;
+    uint exp  = (bits >> 2u) & 0x1Fu;
+    uint mant = bits & 0x3u;
+    uint f;
+    if (exp == 0u) f = 0u;
+    else f = ((sign << 31u) | (((exp + 120u) & 0xFFu) << 23u) | (mant << 21u));
+    return uintBitsToFloat(f);
+}
+float loadQ(uint i)
+{
+    if (pc.storageType == 0u) return q32[i];
+    uint word = q16[i >> 1u];
+    uint lane  = (i & 1u) == 0u ? (word & 0xFFFFu) : (word >> 16u);
+    if (pc.storageType == 1u) return fp16ToFp32(lane);
+    if (pc.storageType == 2u) return fp8ToFp32(lane & 0xFFu) * pc.kvScale;
+    return bf16ToFp32(lane);
+}
+float loadKV(uint i)
+{
+    if (pc.storageType == 0u) return kv32[i];
+    uint word = kv16[i >> 1u];
+    uint lane  = (i & 1u) == 0u ? (word & 0xFFFFu) : (word >> 16u);
+    if (pc.storageType == 1u) return fp16ToFp32(lane);
+    if (pc.storageType == 2u) return fp8ToFp32(lane & 0xFFu) * pc.kvScale;
+    return bf16ToFp32(lane);
+}
+void storeOut(uint i, float val)
+{
+    if (pc.storageType == 0u) { out32[i] = val; return; }
+    uint converted = (pc.storageType == 3u) ? fp32ToBf16(val) : fp32ToFp16(val);
+    uint w = out16[i >> 1u];
+    if ((i & 1u) == 0u) out16[i >> 1u] = (w & 0xFFFF0000u) | (converted & 0xFFFFu);
+    else              out16[i >> 1u] = (converted << 16u) | (w & 0xFFFFu);
+}
+
+void main()
+{
+    uint b = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint s = gl_WorkGroupID.z;
+    if (b >= pc.batchSize || h >= pc.numHeads || s >= pc.seqQLen)
+    {
+        return;
+    }
+
+    uint D = pc.dLatent + pc.dRope;
+    int  baseKv = cacheSeqs[b];
+    int  kvLen  = baseKv + (pc.causal != 0u ? int(s) + 1 : int(pc.seqQLen));
+    if (kvLen <= 0)
+    {
+        return;
+    }
+    uint kvLenU = uint(kvLen);
+
+    // ---- Sliding-window clamp (inclusive window of last W tokens) ----
+    uint winStart = 0u;
+    if (pc.slidingWindow != 0u && kvLenU > pc.slidingWindow)
+    {
+        winStart = kvLenU - pc.slidingWindow;
+    }
+
+    uint qOff = ((b * pc.seqQLen + s) * pc.numHeads + h) * D;
+    uint oOff = ((b * pc.seqQLen + s) * pc.numHeads + h) * pc.dLatent;
+
+    // ---- Pass 1: max score over the KV tokens (paged gather) ----
+    float maxScore = -1.0e30;
+    uint t = 0u;
+    for (uint pgi = 0u; pgi < pc.maxPages; ++pgi)
+    {
+        int page = pageTable[b * pc.maxPages + pgi];
+        if (page < 0)
+        {
+            break;
+        }
+        for (uint p = 0u; p < pc.pageSize && t < kvLenU; ++p)
+        {
+            if (t < winStart) { ++t; continue; }
+            uint kvBase = (uint(page) * pc.pageSize + p) * D;
+            float dn = 0.0;
+            float dr = 0.0;
+            for (uint d = 0u; d < pc.dLatent; ++d) dn += loadQ(qOff + d) * loadKV(kvBase + d);
+            for (uint d = 0u; d < pc.dRope; ++d)  dr += loadQ(qOff + pc.dLatent + d) * loadKV(kvBase + pc.dLatent + d);
+            float sc = pc.softmaxScale * (dn + dr);
+            if (sc > maxScore)
+            {
+                maxScore = sc;
+            }
+            ++t;
+        }
+        if (t >= kvLenU)
+        {
+            break;
+        }
+    }
+
+    // ---- Pass 2: sum of exponentials (numerically stable) ----
+    float sum = 0.0;
+    t = 0u;
+    for (uint pgi = 0u; pgi < pc.maxPages; ++pgi)
+    {
+        int page = pageTable[b * pc.maxPages + pgi];
+        if (page < 0)
+        {
+            break;
+        }
+        for (uint p = 0u; p < pc.pageSize && t < kvLenU; ++p)
+        {
+            if (t < winStart) { ++t; continue; }
+            uint kvBase = (uint(page) * pc.pageSize + p) * D;
+            float dn = 0.0;
+            float dr = 0.0;
+            for (uint d = 0u; d < pc.dLatent; ++d) dn += loadQ(qOff + d) * loadKV(kvBase + d);
+            for (uint d = 0u; d < pc.dRope; ++d)  dr += loadQ(qOff + pc.dLatent + d) * loadKV(kvBase + pc.dLatent + d);
+            float sc = pc.softmaxScale * (dn + dr);
+            sum += exp(sc - maxScore);
+            ++t;
+        }
+        if (t >= kvLenU)
+        {
+            break;
+        }
+    }
+    float invSum = (sum > 0.0) ? (1.0 / sum) : 0.0;
+
+    // ---- Pass 3: weighted reduction of the latent value ----
+    for (uint d = 0u; d < pc.dLatent; ++d)
+    {
+        float acc = 0.0;
+        t = 0u;
+        for (uint pgi = 0u; pgi < pc.maxPages; ++pgi)
+        {
+            int page = pageTable[b * pc.maxPages + pgi];
+            if (page < 0)
+            {
+                break;
+            }
+            for (uint p = 0u; p < pc.pageSize && t < kvLenU; ++p)
+            {
+                if (t < winStart) { ++t; continue; }
+                uint kvBase = (uint(page) * pc.pageSize + p) * D;
+                float dn = 0.0;
+                float dr = 0.0;
+                for (uint dd = 0u; dd < pc.dLatent; ++dd) dn += loadQ(qOff + dd) * loadKV(kvBase + dd);
+                for (uint dd = 0u; dd < pc.dRope; ++dd)  dr += loadQ(qOff + pc.dLatent + dd) * loadKV(kvBase + pc.dLatent + dd);
+                float sc = pc.softmaxScale * (dn + dr);
+                acc += exp(sc - maxScore) * invSum * loadKV(kvBase + d);
+                ++t;
+            }
+            if (t >= kvLenU)
+            {
+                break;
+            }
+        }
+        storeOut(oOff + d, acc);
+    }
+}

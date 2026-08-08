@@ -36,6 +36,55 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 
+// ---- Host-side fp16/bf16/fp8 round-trip helpers (mirror the GLSL dequant) ----
+static uint32_t fp32ToFp16Bits(float v)
+{
+    uint32_t bits; std::memcpy(&bits, &v, sizeof(bits));
+    uint32_t sign = (bits >> 31u) & 0x1u;
+    int32_t  exp  = int32_t((bits >> 23u) & 0xFFu) - 127;
+    uint32_t mant = bits & 0x7FFFFFu;
+    uint32_t e = uint32_t(exp + 15);
+    if (exp + 15 <= 0) return sign << 15u;
+    if (exp + 15 >= 31) return (sign << 15u) | 0x7C00u;
+    uint32_t m = (mant >> 13u) & 0x3FFu;
+    m += (mant >> 12u) & 0x1u;
+    if (m > 0x3FFu) { m = 0u; e += 1u; }
+    if (e >= 31u) e = 31u;
+    return (sign << 15u) | (e << 10u) | m;
+}
+static float fp16BitsToFp32(uint32_t bits)
+{
+    uint32_t sign = (bits >> 15u) & 0x1u;
+    uint32_t exp  = (bits >> 10u) & 0x1Fu;
+    uint32_t mant = bits & 0x3FFu;
+    uint32_t f;
+    if (exp == 0u) f = 0u;
+    else f = ((sign << 31u) | (((exp + 112u) & 0xFFu) << 23u) | (mant << 13u));
+    float v; std::memcpy(&v, &f, sizeof(v)); return v;
+}
+static uint32_t fp32ToBf16Bits(float v)
+{
+    uint32_t bits; std::memcpy(&bits, &v, sizeof(bits));
+    // bf16 = top 16 bits of fp32, round-to-nearest (matches GLSL fp32ToBf16).
+    uint32_t bf16 = (bits + 0x8000u) >> 16u;
+    return bf16 & 0xFFFFu;
+}
+static float bf16BitsToFp32(uint32_t bits)
+{
+    uint32_t f = (bits & 0xFFFFu) << 16u;
+    float v; std::memcpy(&v, &f, sizeof(v)); return v;
+}
+static float fp8BitsToFp32(uint32_t bits, float scale)
+{
+    uint32_t sign = (bits >> 7u) & 0x1u;
+    uint32_t exp  = (bits >> 2u) & 0x1Fu;
+    uint32_t mant = bits & 0x3u;
+    uint32_t f;
+    if (exp == 0u) f = 0u;
+    else f = ((sign << 31u) | (((exp + 120u) & 0xFFu) << 23u) | (mant << 21u));
+    float v; std::memcpy(&v, &f, sizeof(v)); return v * scale;
+}
+
 // Real-valued DeepSeek MLA test-data loader (see scripts/mla_real_data.py).
 // Binary layout: magic('MLA1'), then uint32 dims, then raw float Q bytes,
 // then raw float KV bytes. Returns false if the file is absent or malformed,
@@ -1541,6 +1590,354 @@ bool test_mla_fmha_prefill()
     return allCorrect;
 }
 
+// ==================== MLA FMHA (sliding-window variant) ====================
+// Exercises the new pc.slidingWindow push-constant path: each query attends only
+// to the last W KV tokens (inclusive), clamped to kvLen. Uses real DeepSeek data
+// via mla_real.bin when present, else synthetic RNG.
+bool test_mla_fmha_sliding_window()
+{
+    TRACE_TEST("MLA FMHA Sliding-Window Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t batchSize     = 2;
+    const uint32_t numHeads     = 16;
+    const uint32_t seqQLen      = 1;
+    const uint32_t dLatent      = 128;
+    const uint32_t dRope        = 64;
+    const uint32_t D            = dLatent + dRope;
+    const uint32_t pageSize     = 64;
+    const uint32_t maxPages     = 2;
+    const uint32_t numPages     = 2;
+    const uint32_t slidingWindow = 32;
+    float softmaxScale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    std::vector<int32_t> hostPageTable = {0, -1, 1, -1};
+    std::vector<int32_t> hostCacheSeqs = {50, 60};
+
+    const size_t qBytes  = static_cast<size_t>(batchSize) * seqQLen * numHeads * D * sizeof(float);
+    const size_t kvBytes = static_cast<size_t>(numPages) * pageSize * D * sizeof(float);
+    const size_t pagBytes= static_cast<size_t>(batchSize) * maxPages * sizeof(int32_t);
+    const size_t seqBytes= static_cast<size_t>(batchSize) * sizeof(int32_t);
+    const size_t outBytes= static_cast<size_t>(batchSize) * seqQLen * numHeads * dLatent * sizeof(float);
+
+    void* qDev   = VulkanBackend::malloc(qBytes);
+    void* kvDev  = VulkanBackend::malloc(kvBytes);
+    void* ptDev  = VulkanBackend::malloc(pagBytes);
+    void* csDev  = VulkanBackend::malloc(seqBytes);
+    void* outDev = VulkanBackend::malloc(outBytes);
+    if (!qDev || !kvDev || !ptDev || !csDev || !outDev)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        if (qDev) VulkanBackend::free(qDev);
+        if (kvDev) VulkanBackend::free(kvDev);
+        if (ptDev) VulkanBackend::free(ptDev);
+        if (csDev) VulkanBackend::free(csDev);
+        if (outDev) VulkanBackend::free(outDev);
+        return false;
+    }
+
+    std::vector<float> hostQ(qBytes / sizeof(float));
+    std::vector<float> hostKv(kvBytes / sizeof(float));
+    std::vector<float> hostOut(outBytes / sizeof(float), 0.0f);
+
+    std::string const realPath = "mla_real.bin";
+    bool loadedReal = loadRealMlaData(realPath, hostQ, hostKv);
+    if (!loadedReal)
+    {
+        std::cout << "      [warn] mla_real.bin not found; using synthetic RNG (fallback)." << std::endl;
+        std::minstd_rand rng(13);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto& val : hostQ)  { val = dist(rng); }
+        for (auto& val : hostKv) { val = dist(rng); }
+    }
+
+    if (!VulkanBackend::memcpyHostToDevice(qDev, hostQ.data(), qBytes) ||
+        !VulkanBackend::memcpyHostToDevice(kvDev, hostKv.data(), kvBytes) ||
+        !VulkanBackend::memcpyHostToDevice(ptDev, hostPageTable.data(), pagBytes) ||
+        !VulkanBackend::memcpyHostToDevice(csDev, hostCacheSeqs.data(), seqBytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(qDev); VulkanBackend::free(kvDev);
+        VulkanBackend::free(ptDev); VulkanBackend::free(csDev); VulkanBackend::free(outDev);
+        return false;
+    }
+
+    if (!VulkanBackend::launchMlaFmha(qDev, kvDev, ptDev, csDev, outDev,
+                                       numHeads, seqQLen, batchSize, dLatent, dRope,
+                                       pageSize, maxPages, softmaxScale,
+                                       slidingWindow, 0u, 1.0f))
+    {
+        TRACE_FAIL(std::string("MLA FMHA sliding-window launch failed: ") + backend->getLastError());
+        VulkanBackend::free(qDev); VulkanBackend::free(kvDev);
+        VulkanBackend::free(ptDev); VulkanBackend::free(csDev); VulkanBackend::free(outDev);
+        return false;
+    }
+
+    VulkanBackend::memcpyDeviceToHost(hostOut.data(), outDev, outBytes);
+
+    bool allCorrect = true;
+    for (uint32_t b = 0; b < batchSize && allCorrect; ++b)
+    {
+        int kvLen = hostCacheSeqs[b];
+        if (kvLen > static_cast<int>(pageSize)) kvLen = pageSize;
+        uint32_t winStart = (kvLen > static_cast<int>(slidingWindow)) ? uint32_t(kvLen) - slidingWindow : 0u;
+        int page0 = hostPageTable[b * maxPages];
+        for (uint32_t h = 0; h < numHeads && allCorrect; ++h)
+        {
+            uint32_t qOff = (b * seqQLen * numHeads + h) * D;
+            uint32_t oOff = (b * seqQLen * numHeads + h) * dLatent;
+            std::vector<float> scores(kvLen, 0.0f);
+            for (int p = 0; p < kvLen; ++p)
+            {
+                uint32_t kvBase = (uint32_t(page0) * pageSize + uint32_t(p)) * D;
+                float dn = 0.0f, dr = 0.0f;
+                for (uint32_t d = 0; d < dLatent; ++d) dn += hostQ[qOff + d] * hostKv[kvBase + d];
+                for (uint32_t d = 0; d < dRope; ++d)  dr += hostQ[qOff + dLatent + d] * hostKv[kvBase + dLatent + d];
+                scores[p] = softmaxScale * (dn + dr);
+            }
+            float maxScore = -1.0e30f;
+            for (int p = 0; p < kvLen; ++p) if (uint32_t(p) >= winStart) maxScore = std::max(maxScore, scores[p]);
+            float sum = 0.0f;
+            for (int p = 0; p < kvLen; ++p) if (uint32_t(p) >= winStart) sum += std::exp(scores[p] - maxScore);
+            float invSum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+            for (uint32_t d = 0; d < dLatent; ++d)
+            {
+                float acc = 0.0f;
+                for (int p = 0; p < kvLen; ++p)
+                {
+                    if (uint32_t(p) < winStart) continue;
+                    uint32_t kvBase = (uint32_t(page0) * pageSize + uint32_t(p)) * D;
+                    float w = std::exp(scores[p] - maxScore) * invSum;
+                    acc += w * hostKv[kvBase + d];
+                }
+                float got = hostOut[oOff + d];
+                if (std::abs(got - acc) > 1e-3f)
+                {
+                    allCorrect = false;
+                    std::cout << "      [sw] mismatch b=" << b << " h=" << h << " d=" << d
+                              << " got=" << got << " ref=" << acc << std::endl;
+                }
+            }
+        }
+    }
+
+    VulkanBackend::free(qDev); VulkanBackend::free(kvDev);
+    VulkanBackend::free(ptDev); VulkanBackend::free(csDev); VulkanBackend::free(outDev);
+
+    if (!allCorrect) { TRACE_FAIL("Incorrect MLA FMHA sliding-window results"); }
+    else { std::cout << "      Result verified: MLA FMHA sliding-window matches CPU reference" << std::endl; TRACE_PASS(); }
+    return allCorrect;
+}
+
+// ==================== MLA FMHA (fp8/bf16/fp16 storage dtype) ====================
+// Exercises pc.storageType + pc.kvScale: Q/KV/output are packed into uint buffers
+// (two 16-bit lanes per uint for fp16/bf16; one fp8 byte per uint) and the shader
+// dequantizes to fp32 compute. Host reference runs on the original fp32 data, so
+// the GPU result is compared against full-precision scores (tolerance absorbs
+// fp16/bf16 rounding; fp8 is looser).
+bool test_mla_fmha_storage_types()
+{
+    TRACE_TEST("MLA FMHA Storage-Type (fp8/bf16/fp16) Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t batchSize  = 2;
+    const uint32_t numHeads  = 16;
+    const uint32_t seqQLen   = 1;
+    const uint32_t dLatent   = 128;
+    const uint32_t dRope     = 64;
+    const uint32_t D         = dLatent + dRope;
+    const uint32_t pageSize  = 64;
+    const uint32_t maxPages  = 2;
+    const uint32_t numPages  = 2;
+    float softmaxScale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    std::vector<int32_t> hostPageTable = {0, -1, 1, -1};
+    std::vector<int32_t> hostCacheSeqs = {50, 60};
+
+    std::vector<float> refQ(batchSize * seqQLen * numHeads * D);
+    std::vector<float> refKv(numPages * pageSize * D);
+    std::minstd_rand rng(21);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& v : refQ) v = dist(rng);
+    for (auto& v : refKv) v = dist(rng);
+
+    const size_t pagBytes = static_cast<size_t>(batchSize) * maxPages * sizeof(int32_t);
+    const size_t seqBytes = static_cast<size_t>(batchSize) * sizeof(int32_t);
+
+    bool allCorrect = true;
+    const float kTolFp16 = 1e-2f, kTolBf16 = 1e-2f, kTolFp8 = 0.5f;
+
+    for (uint32_t storageType : {1u, 2u, 3u})  // fp16, fp8, bf16
+    {
+        size_t elemQ   = batchSize * seqQLen * numHeads * D;
+        size_t elemKv  = numPages * pageSize * D;
+        size_t elemOut = batchSize * seqQLen * numHeads * dLatent;
+        // fp8: one uint per element (byte used); fp16/bf16: two lanes per uint.
+        size_t qWords  = (storageType == 2u) ? elemQ  : (elemQ + 1u) / 2u;
+        size_t kvWords = (storageType == 2u) ? elemKv : (elemKv + 1u) / 2u;
+        size_t outWords= (storageType == 2u) ? elemOut : (elemOut + 1u) / 2u;
+
+        std::vector<uint32_t> qHost(qWords, 0);
+        std::vector<uint32_t> kvHost(kvWords, 0);
+
+        for (size_t i = 0; i < elemQ; ++i)
+        {
+            uint32_t packed;
+            if (storageType == 1u)      packed = fp32ToFp16Bits(refQ[i]);
+            else if (storageType == 3u) packed = fp32ToBf16Bits(refQ[i]);
+            else                        packed = fp32ToFp16Bits(refQ[i]) & 0xFFu;  // fp8 via fp16 bits, low byte (test scale)
+            if (storageType != 2u)
+            {
+                uint32_t w = i >> 1u;
+                if (i & 1u) qHost[w] = (qHost[w] & 0xFFFFu) | (packed << 16u);
+                else        qHost[w] = (qHost[w] & 0xFFFF0000u) | (packed & 0xFFFFu);
+            }
+            else
+            {
+                qHost[i] = packed;
+            }
+        }
+        for (size_t i = 0; i < elemKv; ++i)
+        {
+            uint32_t packed;
+            if (storageType == 1u)      packed = fp32ToFp16Bits(refKv[i]);
+            else if (storageType == 3u) packed = fp32ToBf16Bits(refKv[i]);
+            else                        packed = fp32ToFp16Bits(refKv[i]) & 0xFFu;  // fp8: store dequant-scale-aware
+            if (storageType != 2u)
+            {
+                uint32_t w = i >> 1u;
+                if (i & 1u) kvHost[w] = (kvHost[w] & 0xFFFFu) | (packed << 16u);
+                else        kvHost[w] = (kvHost[w] & 0xFFFF0000u) | (packed & 0xFFFFu);
+            }
+            else
+            {
+                kvHost[i] = packed;
+            }
+        }
+
+        void* qDev   = VulkanBackend::malloc(qWords * sizeof(uint32_t));
+        void* kvDev  = VulkanBackend::malloc(kvWords * sizeof(uint32_t));
+        void* ptDev  = VulkanBackend::malloc(pagBytes);
+        void* csDev  = VulkanBackend::malloc(seqBytes);
+        void* outDev = VulkanBackend::malloc(outWords * sizeof(uint32_t));
+        if (!qDev || !kvDev || !ptDev || !csDev || !outDev)
+        {
+            TRACE_FAIL("Device memory allocation failed");
+            if (qDev) VulkanBackend::free(qDev);
+            if (kvDev) VulkanBackend::free(kvDev);
+            if (ptDev) VulkanBackend::free(ptDev);
+            if (csDev) VulkanBackend::free(csDev);
+            if (outDev) VulkanBackend::free(outDev);
+            return false;
+        }
+
+        float kvScale = 1.0f;
+        if (storageType == 2u)
+        {
+            float maxAbs = 0.0f;
+            for (auto v : refKv) maxAbs = std::max(maxAbs, std::abs(v));
+            kvScale = (maxAbs > 0.0f) ? maxAbs : 1.0f;  // symmetric dequant
+        }
+
+        if (!VulkanBackend::memcpyHostToDevice(qDev, qHost.data(), qWords * sizeof(uint32_t)) ||
+            !VulkanBackend::memcpyHostToDevice(kvDev, kvHost.data(), kvWords * sizeof(uint32_t)) ||
+            !VulkanBackend::memcpyHostToDevice(ptDev, hostPageTable.data(), pagBytes) ||
+            !VulkanBackend::memcpyHostToDevice(csDev, hostCacheSeqs.data(), seqBytes))
+        {
+            TRACE_FAIL("HostToDevice memcpy failed");
+            VulkanBackend::free(qDev); VulkanBackend::free(kvDev);
+            VulkanBackend::free(ptDev); VulkanBackend::free(csDev); VulkanBackend::free(outDev);
+            return false;
+        }
+
+        if (!VulkanBackend::launchMlaFmha(qDev, kvDev, ptDev, csDev, outDev,
+                                           numHeads, seqQLen, batchSize, dLatent, dRope,
+                                           pageSize, maxPages, softmaxScale,
+                                           0u, storageType, kvScale))
+        {
+            TRACE_FAIL(std::string("MLA FMHA storage-type launch failed: ") + backend->getLastError());
+            VulkanBackend::free(qDev); VulkanBackend::free(kvDev);
+            VulkanBackend::free(ptDev); VulkanBackend::free(csDev); VulkanBackend::free(outDev);
+            return false;
+        }
+
+        std::vector<uint32_t> outHost(outWords, 0);
+        VulkanBackend::memcpyDeviceToHost(outHost.data(), outDev, outWords * sizeof(uint32_t));
+
+        float tol = (storageType == 1u) ? kTolFp16 : (storageType == 3u ? kTolBf16 : kTolFp8);
+        const char* tn = (storageType == 1u) ? "fp16" : (storageType == 3u ? "bf16" : "fp8");
+        for (uint32_t b = 0; b < batchSize && allCorrect; ++b)
+        {
+            int kvLen = hostCacheSeqs[b];
+            if (kvLen > static_cast<int>(pageSize)) kvLen = pageSize;
+            int page0 = hostPageTable[b * maxPages];
+            for (uint32_t h = 0; h < numHeads && allCorrect; ++h)
+            {
+                uint32_t qOff = (b * seqQLen * numHeads + h) * D;
+                uint32_t oOff = (b * seqQLen * numHeads + h) * dLatent;
+                std::vector<float> scores(kvLen, 0.0f);
+                for (int p = 0; p < kvLen; ++p)
+                {
+                    uint32_t kvBase = (uint32_t(page0) * pageSize + uint32_t(p)) * D;
+                    float dn = 0.0f, dr = 0.0f;
+                    for (uint32_t d = 0; d < dLatent; ++d) dn += refQ[qOff + d] * refKv[kvBase + d];
+                    for (uint32_t d = 0; d < dRope; ++d)  dr += refQ[qOff + dLatent + d] * refKv[kvBase + dLatent + d];
+                    scores[p] = softmaxScale * (dn + dr);
+                }
+                float maxScore = -1.0e30f;
+                for (int p = 0; p < kvLen; ++p) maxScore = std::max(maxScore, scores[p]);
+                float sum = 0.0f;
+                for (int p = 0; p < kvLen; ++p) sum += std::exp(scores[p] - maxScore);
+                float invSum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+                for (uint32_t d = 0; d < dLatent; ++d)
+                {
+                    float acc = 0.0f;
+                    for (int p = 0; p < kvLen; ++p)
+                    {
+                        uint32_t kvBase = (uint32_t(page0) * pageSize + uint32_t(p)) * D;
+                        float w = std::exp(scores[p] - maxScore) * invSum;
+                        acc += w * refKv[kvBase + d];
+                    }
+                    uint32_t idx = oOff + d;
+                    uint32_t w = outHost[idx >> 1u];
+                    uint32_t lane = (idx & 1u) == 0u ? (w & 0xFFFFu) : (w >> 16u);
+                    float got;
+                    if (storageType == 1u)      got = fp16BitsToFp32(lane);
+                    else if (storageType == 3u) got = bf16BitsToFp32(lane);
+                    else                         got = fp8BitsToFp32(lane & 0xFFu, kvScale);
+                    if (std::abs(got - acc) > tol)
+                    {
+                        allCorrect = false;
+                        std::cout << "      [" << tn << "] mismatch b=" << b << " h=" << h << " d=" << d
+                                  << " got=" << got << " ref=" << acc << " tol=" << tol << std::endl;
+                    }
+                }
+            }
+        }
+
+        VulkanBackend::free(qDev); VulkanBackend::free(kvDev);
+        VulkanBackend::free(ptDev); VulkanBackend::free(csDev); VulkanBackend::free(outDev);
+        if (allCorrect)
+            std::cout << "      [" << tn << "] verified: MLA FMHA storage-type matches CPU reference" << std::endl;
+    }
+
+    if (!allCorrect) { TRACE_FAIL("Incorrect MLA FMHA storage-type results"); }
+    else { TRACE_PASS(); }
+    return allCorrect;
+}
+
 int main()
 {
     std::cout << "========================================" << std::endl;
@@ -1580,6 +1977,8 @@ int main()
     runTest(test_topk, "Top-K Kernel");
     runTest(test_mla_fmha, "MLA FMHA Kernel");
     runTest(test_mla_fmha_prefill, "MLA FMHA Prefill Kernel");
+    runTest(test_mla_fmha_sliding_window, "MLA FMHA Sliding-Window Kernel");
+    runTest(test_mla_fmha_storage_types, "MLA FMHA Storage-Type Kernel");
     runTest(test_resource_leak_prevention, "Resource Leak Prevention");
     runTest(test_utilization_tracking, "GPU Utilization Tracking");
 

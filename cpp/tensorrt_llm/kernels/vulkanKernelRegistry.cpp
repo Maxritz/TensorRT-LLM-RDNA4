@@ -179,6 +179,48 @@ bool VulkanKernelRegistry::initialize()
         registerKernel(desc);
     }
 
+    {
+        KernelDescriptor desc;
+        desc.name = "topk";
+        desc.shaderPath = "topk.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 1;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false; // operates on f32 scores, f32/f16-agnostic
+        desc.bindingCount = 4;     // scores, input_offsets, output_offsets, topk_indices
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "mla_fmha";
+        desc.shaderPath = "mla_fmha.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 1;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false; // fp32 compute; fp16 I/O is a storage detail
+        desc.bindingCount = 5;     // q, kv, pageTable, cacheSeqs, out
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "mla_fmha_prefill";
+        desc.shaderPath = "mla_fmha_prefill.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 1;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 5;     // q, kv, pageTable, cacheSeqs, out
+        registerKernel(desc);
+    }
+
     return true;
 }
 
@@ -1199,6 +1241,348 @@ VulkanResult VulkanKernelDispatcher::dispatchAttention(
     (void)blockSize;
     uint32_t workGroupsX = numQueries;
     vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchTopk(
+    void* scores, void* inputOffsets, void* outputOffsets, void* topkIndices,
+    uint32_t topk, uint32_t numHeads, uint32_t batchSize,
+    uint32_t totalTokens, uint32_t totalOutputTokens,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+    {
+        return VulkanResult::INITIALIZATION_FAILED;
+    }
+
+    // topk must fit the shader's fixed-size register scratch (see topk.comp).
+    constexpr uint32_t MAX_TOPK = 32;
+    if (topk == 0 || topk > MAX_TOPK || numHeads == 0 || batchSize == 0 ||
+        totalTokens == 0 || totalOutputTokens == 0)
+    {
+        TLLM_LOG_WARNING(
+            "Vulkan topk: invalid dims (topk=%u heads=%u batch=%u tokens=%u out=%u, topk<=%u)",
+            topk, numHeads, batchSize, totalTokens, totalOutputTokens, MAX_TOPK);
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    auto variant = mKernelRegistry->getBestVariant("topk");
+    if (!variant || !variant->isValid())
+    {
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+    {
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(scores),
+                          reinterpret_cast<VkBuffer>(inputOffsets),
+                          reinterpret_cast<VkBuffer>(outputOffsets),
+                          reinterpret_cast<VkBuffer>(topkIndices)};
+
+    VkDeviceSize scoresBytes = static_cast<VkDeviceSize>(numHeads) * totalTokens * sizeof(float);
+    VkDeviceSize offBytes    = static_cast<VkDeviceSize>(batchSize + 1) * sizeof(uint32_t);
+    VkDeviceSize idxBytes    = static_cast<VkDeviceSize>(numHeads) * totalOutputTokens * sizeof(int32_t);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[4]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].offset = 0; bufInfos[0].range = scoresBytes;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].offset = 0; bufInfos[1].range = offBytes;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].offset = 0; bufInfos[2].range = offBytes;
+    bufInfos[3].buffer = buffers[3]; bufInfos[3].offset = 0; bufInfos[3].range = idxBytes;
+
+    VkWriteDescriptorSet writes[4]{};
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 4, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t topk;
+        uint32_t numHeads;
+        uint32_t batchSize;
+        uint32_t totalTokens;
+        uint32_t totalOutputTokens;
+    } pc{};
+    pc.topk = topk;
+    pc.numHeads = numHeads;
+    pc.batchSize = batchSize;
+    pc.totalTokens = totalTokens;
+    pc.totalOutputTokens = totalOutputTokens;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    // One workgroup per (batch, head) row.
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, batchSize, numHeads, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchMlaFmha(
+    void* q, void* kv, void* pageTable, void* cacheSeqs, void* output,
+    uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
+    uint32_t dLatent, uint32_t dRope, uint32_t pageSize, uint32_t maxPages,
+    float softmaxScale, uint32_t slidingWindow, uint32_t storageType,
+    float kvScale, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+    {
+        return VulkanResult::INITIALIZATION_FAILED;
+    }
+
+    if (numHeads == 0 || seqQLen == 0 || batchSize == 0 || dLatent == 0 ||
+        dRope == 0 || pageSize == 0 || maxPages == 0)
+    {
+        TLLM_LOG_WARNING("Vulkan mla_fmha: zero-dimension input (H=%u S=%u B=%u L=%u R=%u ps=%u pg=%u)",
+                         numHeads, seqQLen, batchSize, dLatent, dRope, pageSize, maxPages);
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+    if (storageType > 3u)
+    {
+        TLLM_LOG_WARNING("Vulkan mla_fmha: unsupported storageType=%u (0=fp32,1=fp16,2=fp8,3=bf16)", storageType);
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    auto variant = mKernelRegistry->getBestVariant("mla_fmha");
+    if (!variant || !variant->isValid())
+    {
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+    {
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    uint32_t D = dLatent + dRope;
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(q), reinterpret_cast<VkBuffer>(kv),
+                          reinterpret_cast<VkBuffer>(pageTable), reinterpret_cast<VkBuffer>(cacheSeqs),
+                          reinterpret_cast<VkBuffer>(output)};
+
+    // 16-bit-packed dtypes occupy half a 32-bit word per element; fp32 one word.
+    uint32_t qStride = (storageType == 0u) ? D : (D + 1u) / 2u;
+    uint32_t kvStride = (storageType == 0u) ? D : (D + 1u) / 2u;
+    uint32_t outStride = (storageType == 0u) ? dLatent : (dLatent + 1u) / 2u;
+    VkDeviceSize qBytes     = static_cast<VkDeviceSize>(batchSize) * seqQLen * numHeads * qStride * sizeof(uint32_t);
+    VkDeviceSize kvBytes    = static_cast<VkDeviceSize>(maxPages) * pageSize * kvStride * sizeof(uint32_t);
+    VkDeviceSize pagBytes   = static_cast<VkDeviceSize>(batchSize) * maxPages * sizeof(int32_t);
+    VkDeviceSize seqBytes   = static_cast<VkDeviceSize>(batchSize) * sizeof(int32_t);
+    VkDeviceSize outBytes   = static_cast<VkDeviceSize>(batchSize) * seqQLen * numHeads * outStride * sizeof(uint32_t);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[5]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].offset = 0; bufInfos[0].range = qBytes;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].offset = 0; bufInfos[1].range = kvBytes;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].offset = 0; bufInfos[2].range = pagBytes;
+    bufInfos[3].buffer = buffers[3]; bufInfos[3].offset = 0; bufInfos[3].range = seqBytes;
+    bufInfos[4].buffer = buffers[4]; bufInfos[4].offset = 0; bufInfos[4].range = outBytes;
+
+    VkWriteDescriptorSet writes[5]{};
+    for (uint32_t i = 0; i < 5; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 5, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t numHeads;
+        uint32_t seqQLen;
+        uint32_t batchSize;
+        uint32_t dLatent;
+        uint32_t dRope;
+        uint32_t pageSize;
+        uint32_t maxPages;
+        float    softmaxScale;
+        uint32_t slidingWindow;
+        uint32_t storageType;
+        float    kvScale;
+    } pc{};
+    pc.numHeads      = numHeads;
+    pc.seqQLen       = seqQLen;
+    pc.batchSize     = batchSize;
+    pc.dLatent       = dLatent;
+    pc.dRope         = dRope;
+    pc.pageSize      = pageSize;
+    pc.maxPages      = maxPages;
+    pc.softmaxScale  = softmaxScale;
+    pc.slidingWindow = slidingWindow;
+    pc.storageType   = storageType;
+    pc.kvScale       = kvScale;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    // One workgroup per query token.
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, batchSize, numHeads * seqQLen, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchMlaFmhaPrefill(
+    void* q, void* kv, void* pageTable, void* cacheSeqs, void* output,
+    uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
+    uint32_t dLatent, uint32_t dRope, uint32_t pageSize, uint32_t maxPages,
+    bool causal, float softmaxScale, uint32_t slidingWindow, uint32_t storageType,
+    float kvScale, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+    {
+        return VulkanResult::INITIALIZATION_FAILED;
+    }
+
+    if (numHeads == 0 || seqQLen == 0 || batchSize == 0 || dLatent == 0 ||
+        dRope == 0 || pageSize == 0 || maxPages == 0)
+    {
+        TLLM_LOG_WARNING("Vulkan mla_fmha_prefill: zero-dimension input (H=%u S=%u B=%u L=%u R=%u ps=%u pg=%u)",
+                         numHeads, seqQLen, batchSize, dLatent, dRope, pageSize, maxPages);
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+    if (storageType > 3u)
+    {
+        TLLM_LOG_WARNING("Vulkan mla_fmha_prefill: unsupported storageType=%u (0=fp32,1=fp16,2=fp8,3=bf16)", storageType);
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    auto variant = mKernelRegistry->getBestVariant("mla_fmha_prefill");
+    if (!variant || !variant->isValid())
+    {
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+    {
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    uint32_t D = dLatent + dRope;
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(q), reinterpret_cast<VkBuffer>(kv),
+                          reinterpret_cast<VkBuffer>(pageTable), reinterpret_cast<VkBuffer>(cacheSeqs),
+                          reinterpret_cast<VkBuffer>(output)};
+
+    uint32_t qStride = (storageType == 0u) ? D : (D + 1u) / 2u;
+    uint32_t kvStride = (storageType == 0u) ? D : (D + 1u) / 2u;
+    uint32_t outStride = (storageType == 0u) ? dLatent : (dLatent + 1u) / 2u;
+    VkDeviceSize qBytes     = static_cast<VkDeviceSize>(batchSize) * seqQLen * numHeads * qStride * sizeof(uint32_t);
+    VkDeviceSize kvBytes    = static_cast<VkDeviceSize>(maxPages) * pageSize * kvStride * sizeof(uint32_t);
+    VkDeviceSize pagBytes   = static_cast<VkDeviceSize>(batchSize) * maxPages * sizeof(int32_t);
+    VkDeviceSize seqBytes   = static_cast<VkDeviceSize>(batchSize) * sizeof(int32_t);
+    VkDeviceSize outBytes   = static_cast<VkDeviceSize>(batchSize) * seqQLen * numHeads * outStride * sizeof(uint32_t);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[5]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].offset = 0; bufInfos[0].range = qBytes;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].offset = 0; bufInfos[1].range = kvBytes;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].offset = 0; bufInfos[2].range = pagBytes;
+    bufInfos[3].buffer = buffers[3]; bufInfos[3].offset = 0; bufInfos[3].range = seqBytes;
+    bufInfos[4].buffer = buffers[4]; bufInfos[4].offset = 0; bufInfos[4].range = outBytes;
+
+    VkWriteDescriptorSet writes[5]{};
+    for (uint32_t i = 0; i < 5; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 5, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t numHeads;
+        uint32_t seqQLen;
+        uint32_t batchSize;
+        uint32_t dLatent;
+        uint32_t dRope;
+        uint32_t pageSize;
+        uint32_t maxPages;
+        float    softmaxScale;
+        uint32_t causal;
+        uint32_t slidingWindow;
+        uint32_t storageType;
+        float    kvScale;
+    } pc{};
+    pc.numHeads      = numHeads;
+    pc.seqQLen       = seqQLen;
+    pc.batchSize     = batchSize;
+    pc.dLatent       = dLatent;
+    pc.dRope         = dRope;
+    pc.pageSize      = pageSize;
+    pc.maxPages      = maxPages;
+    pc.softmaxScale  = softmaxScale;
+    pc.causal        = causal ? 1u : 0u;
+    pc.slidingWindow = slidingWindow;
+    pc.storageType   = storageType;
+    pc.kvScale       = kvScale;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    // One workgroup per query token (b, h, s).
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, batchSize, numHeads, seqQLen);
 
     submitAndFree(cmdBuf);
     freeDescriptorSet(set);

@@ -180,6 +180,39 @@ public:
         bool causal,
         uint32_t blockSize = 256);
 
+    // ==================== Sparse Operations ====================
+    // Mirrors CUDA sparse top-k (histogram) kernels, e.g. topk_kernel in
+    // tensorrt-llm/_torch/attention_backend/sparse/kernel.py (triton_topk).
+    // scores:       [numHeads * totalTokens]            (float)
+    // inputOffsets: [batchSize + 1]                     (uint)
+    // outputOffsets:[batchSize + 1]                     (uint)
+    // topkIndices:  [numHeads * totalOutputTokens]      (int32, row-local offsets)
+    common::VulkanResult dispatchTopk(
+        void* scores, void* inputOffsets, void* outputOffsets, void* topkIndices,
+        uint32_t topk, uint32_t numHeads, uint32_t batchSize,
+        uint32_t totalTokens, uint32_t totalOutputTokens,
+        uint32_t blockSize = 64);
+
+    // ==================== MLA Operations ====================
+    // Vulkan port of the CuTe-DSL Blackwell MLA decode FMHA
+    // (cute_dsl_mla.py::_run_mla_decode). q:[B,S,H,D], kv:[numPages,pageSize,D],
+    // pageTable:[B,maxPages], cacheSeqs:[B], out:[B,S,H,dLatent] (D=dLatent+dRope).
+    common::VulkanResult dispatchMlaFmha(
+        void* q, void* kv, void* pageTable, void* cacheSeqs, void* output,
+        uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
+        uint32_t dLatent, uint32_t dRope, uint32_t pageSize, uint32_t maxPages,
+        float softmaxScale, uint32_t slidingWindow, uint32_t storageType,
+        float kvScale, uint32_t blockSize = 64);
+
+    // Context/prefill phase of the same FMHA: one workgroup per query token (b,h,s),
+    // causal mask applied (query s attends cacheSeqs[b] + s+1 tokens). Same IO + a `causal` flag.
+    common::VulkanResult dispatchMlaFmhaPrefill(
+        void* q, void* kv, void* pageTable, void* cacheSeqs, void* output,
+        uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
+        uint32_t dLatent, uint32_t dRope, uint32_t pageSize, uint32_t maxPages,
+        bool causal, float softmaxScale, uint32_t slidingWindow, uint32_t storageType,
+        float kvScale, uint32_t blockSize = 64);
+
     // ==================== Utility Operations ====================
     common::VulkanResult dispatchFill(
         void* output, float value, size_t elementCount,
