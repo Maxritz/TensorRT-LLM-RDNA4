@@ -315,6 +315,30 @@ bool VulkanBackend::launchSoftmax(void* input, void* output,
     return true;
 }
 
+bool VulkanBackend::launchAttention(void* q, void* k, void* v, void* output,
+                                    uint32_t batchSize, uint32_t numHeads,
+                                    uint32_t seqLenQ, uint32_t seqLenK, uint32_t headDim,
+                                    bool causal,
+                                    void* stream)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchAttention(
+        q, k, v, output, batchSize, numHeads, seqLenQ, seqLenK, headDim, causal);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("Attention launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
 // ==================== Synchronization ====================
 
 void VulkanBackend::streamSynchronize(void* stream)

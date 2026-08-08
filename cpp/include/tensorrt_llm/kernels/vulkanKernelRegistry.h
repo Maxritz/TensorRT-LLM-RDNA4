@@ -173,6 +173,13 @@ public:
         uint32_t batchSize, uint32_t numHeads, uint32_t seqLen,
         uint32_t blockSize = 256);
 
+    common::VulkanResult dispatchAttention(
+        void* q, void* k, void* v, void* output,
+        uint32_t batchSize, uint32_t numHeads,
+        uint32_t seqLenQ, uint32_t seqLenK, uint32_t headDim,
+        bool causal,
+        uint32_t blockSize = 256);
+
     // ==================== Utility Operations ====================
     common::VulkanResult dispatchFill(
         void* output, float value, size_t elementCount,

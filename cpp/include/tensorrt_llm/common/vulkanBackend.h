@@ -89,6 +89,12 @@ public:
                               uint32_t batchSize, uint32_t numHeads, uint32_t seqLen,
                               void* stream = nullptr);
 
+    static bool launchAttention(void* q, void* k, void* v, void* output,
+                                uint32_t batchSize, uint32_t numHeads,
+                                uint32_t seqLenQ, uint32_t seqLenK, uint32_t headDim,
+                                bool causal,
+                                void* stream = nullptr);
+
     // ==================== Synchronization ====================
     static void streamSynchronize(void* stream = nullptr);
     static void deviceSynchronize();

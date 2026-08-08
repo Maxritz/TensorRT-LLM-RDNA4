@@ -811,6 +811,166 @@ bool test_softmax()
     return allCorrect;
 }
 
+// ==================== Attention (naive causal SDPA) ====================
+// out[b,h,i,t] = sum_j softmax_causal((Q[i] . K[j]) / sqrt(headDim)) * V[j,t]
+bool test_attention()
+{
+    TRACE_TEST("Attention Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t batchSize = 1;
+    const uint32_t numHeads = 2;
+    const uint32_t seqLenQ = 3;
+    const uint32_t seqLenK = 4;
+    const uint32_t headDim = 4;
+    const bool causal = true;
+    const size_t qBytes  = static_cast<size_t>(batchSize) * numHeads * seqLenQ * headDim * sizeof(float);
+    const size_t kvBytes = static_cast<size_t>(batchSize) * numHeads * seqLenK * headDim * sizeof(float);
+    const size_t oBytes  = qBytes;
+
+    void* q = VulkanBackend::malloc(qBytes);
+    void* k = VulkanBackend::malloc(kvBytes);
+    void* v = VulkanBackend::malloc(kvBytes);
+    void* output = VulkanBackend::malloc(oBytes);
+    if (!q || !k || !v || !output)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        if (q) VulkanBackend::free(q);
+        if (k) VulkanBackend::free(k);
+        if (v) VulkanBackend::free(v);
+        if (output) VulkanBackend::free(output);
+        return false;
+    }
+
+    std::minstd_rand rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> hostQ(qBytes / sizeof(float)), hostK(kvBytes / sizeof(float)),
+        hostV(kvBytes / sizeof(float)), result(oBytes / sizeof(float), 0.0f);
+    for (auto& val : hostQ)
+    {
+        val = dist(rng);
+    }
+    for (auto& val : hostK)
+    {
+        val = dist(rng);
+    }
+    for (auto& val : hostV)
+    {
+        val = dist(rng);
+    }
+
+    if (!VulkanBackend::memcpyHostToDevice(q, hostQ.data(), qBytes) ||
+        !VulkanBackend::memcpyHostToDevice(k, hostK.data(), kvBytes) ||
+        !VulkanBackend::memcpyHostToDevice(v, hostV.data(), kvBytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(q);
+        VulkanBackend::free(k);
+        VulkanBackend::free(v);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    if (!VulkanBackend::launchAttention(q, k, v, output, batchSize, numHeads, seqLenQ, seqLenK,
+                                         headDim, causal))
+    {
+        TRACE_FAIL(std::string("Attention launch failed: ") + backend->getLastError());
+        VulkanBackend::free(q);
+        VulkanBackend::free(k);
+        VulkanBackend::free(v);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    VulkanBackend::memcpyDeviceToHost(result.data(), output, oBytes);
+
+    auto qIdx = [&](uint32_t b, uint32_t h, uint32_t i, uint32_t d) {
+        return ((b * numHeads + h) * seqLenQ + i) * headDim + d;
+    };
+    auto kIdx = [&](uint32_t b, uint32_t h, uint32_t j, uint32_t d) {
+        return ((b * numHeads + h) * seqLenK + j) * headDim + d;
+    };
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(headDim));
+    bool allCorrect = true;
+
+    for (uint32_t b = 0; b < batchSize && allCorrect; ++b)
+    {
+        for (uint32_t h = 0; h < numHeads && allCorrect; ++h)
+        {
+            for (uint32_t i = 0; i < seqLenQ && allCorrect; ++i)
+            {
+                auto score = [&](uint32_t j) -> float {
+                    if (causal && j > i)
+                    {
+                        return -1.0e30f;
+                    }
+                    float s = 0.0f;
+                    for (uint32_t d = 0; d < headDim; ++d)
+                    {
+                        s += hostQ[qIdx(b, h, i, d)] * hostK[kIdx(b, h, j, d)];
+                    }
+                    return scale * s;
+                };
+
+                float maxVal = -1.0e30f;
+                for (uint32_t j = 0; j < seqLenK; ++j)
+                {
+                    float s = score(j);
+                    if (s > maxVal) maxVal = s;
+                }
+
+                float sum = 0.0f;
+                for (uint32_t j = 0; j < seqLenK; ++j)
+                {
+                    sum += std::exp(score(j) - maxVal);
+                }
+                float inv = 1.0f / sum;
+
+                for (uint32_t t = 0; t < headDim && allCorrect; ++t)
+                {
+                    float acc = 0.0f;
+                    for (uint32_t j = 0; j < seqLenK; ++j)
+                    {
+                        float s = score(j);
+                        acc += std::exp(s - maxVal) * inv * hostV[kIdx(b, h, j, t)];
+                    }
+                    uint32_t oi = qIdx(b, h, i, t);
+                    if (std::abs(result[oi] - acc) > 1e-4f)
+                    {
+                        allCorrect = false;
+                        std::cout << "      mismatch b=" << b << " h=" << h << " i=" << i
+                                  << " t=" << t << " got=" << result[oi] << " ref=" << acc << std::endl;
+                    }
+                }
+            }
+        }
+    }
+
+    VulkanBackend::free(q);
+    VulkanBackend::free(k);
+    VulkanBackend::free(v);
+    VulkanBackend::free(output);
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect attention results");
+    }
+    else
+    {
+        std::cout << "      Result verified: attention matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+
+    return allCorrect;
+}
+
 int main()
 {
     std::cout << "========================================" << std::endl;
@@ -846,6 +1006,7 @@ int main()
     runTest(test_fp16_gemm, "FP16 GEMM Kernel");
     runTest(test_q8_0_gemm, "Q8_0 GEMM Kernel");
     runTest(test_softmax, "Softmax Kernel");
+    runTest(test_attention, "Attention Kernel");
     runTest(test_resource_leak_prevention, "Resource Leak Prevention");
     runTest(test_utilization_tracking, "GPU Utilization Tracking");
 

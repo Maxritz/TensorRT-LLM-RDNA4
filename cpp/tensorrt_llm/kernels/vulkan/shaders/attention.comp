@@ -1,0 +1,129 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+
+// Naive scaled dot-product attention, one thread per (batch, head, query):
+//   score[b,h,i,j] = (1/sqrt(headDim)) * sum_d Q[b,h,i,d] * K[b,h,j,d]
+//   p[b,h,i,j]     = exp(score - max_j score) / sum_j exp(score - max)
+//   out[b,h,i,t]   = sum_j p[b,h,i,j] * V[b,h,j,t]
+//
+// With `causal`, keys j > i are masked (score = -inf) so they contribute 0.
+// Each query thread recomputes the j-dot-products across the three passes (max,
+// sum, output) with identical loop order so the result matches a sequential CPU
+// reference. No shared/scratch memory is used.
+//
+// Push constants: matches VulkanKernelDispatcher::dispatchAttention.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint batchSize;
+    uint numHeads;
+    uint seqLenQ;
+    uint seqLenK;
+    uint headDim;
+    uint causal;
+} pc;
+
+// binding 0: Q [batchSize*numHeads*seqLenQ*headDim]
+// binding 1: K [batchSize*numHeads*seqLenK*headDim]
+// binding 2: V [batchSize*numHeads*seqLenK*headDim]
+// binding 3: O [batchSize*numHeads*seqLenQ*headDim]
+layout(std430, binding = 0) restrict readonly  buffer BufQ { float q[]; };
+layout(std430, binding = 1) restrict readonly  buffer BufK { float k[]; };
+layout(std430, binding = 2) restrict readonly  buffer BufV { float v[]; };
+layout(std430, binding = 3) restrict writeonly buffer BufO { float o[]; };
+
+// Scalar used for masked (causal j > i) entries: exp(-inf - max) underflows to 0.
+#define SCORE_NEG 1.0e30
+
+void main() {
+    uint queryIdx = gl_WorkGroupID.x;
+    uint numQueries = pc.batchSize * pc.numHeads * pc.seqLenQ;
+    if (queryIdx >= numQueries) {
+        return;
+    }
+
+    uint hHeadQ = pc.numHeads * pc.seqLenQ;
+    uint b = queryIdx / hHeadQ;
+    uint rem = queryIdx % hHeadQ;
+    uint h = rem / pc.seqLenQ;
+    uint i = rem % pc.seqLenQ;
+
+    uint qRowBase = (b * pc.numHeads * pc.seqLenQ + h * pc.seqLenQ + i) * pc.headDim;
+    uint kHeadBase = (b * pc.numHeads * pc.seqLenK + h * pc.seqLenK) * pc.headDim;
+    uint vHeadBase = kHeadBase;
+    uint oBase = qRowBase;
+
+    float scale = 1.0 / sqrt(float(pc.headDim));
+    uint masked = pc.causal;
+
+    // Pass 1: max attention score over keys.
+    float maxVal = -SCORE_NEG;
+    for (uint j = 0u; j < pc.seqLenK; ++j) {
+        bool mask = masked != 0u && (j > i);
+        float s = 0.0;
+        if (!mask) {
+            for (uint d = 0u; d < pc.headDim; ++d) {
+                s += q[qRowBase + d] * k[kHeadBase + j * pc.headDim + d];
+            }
+            s *= scale;
+        } else {
+            s = -SCORE_NEG;
+        }
+        if (s > maxVal) {
+            maxVal = s;
+        }
+    }
+
+    // Pass 2: sum of exp(score - max) over keys.
+    float sum = 0.0;
+    for (uint j = 0u; j < pc.seqLenK; ++j) {
+        bool mask = masked != 0u && (j > i);
+        float s = 0.0;
+        if (!mask) {
+            for (uint d = 0u; d < pc.headDim; ++d) {
+                s += q[qRowBase + d] * k[kHeadBase + j * pc.headDim + d];
+            }
+            s *= scale;
+        } else {
+            s = -SCORE_NEG;
+        }
+        sum += exp(s - maxVal);
+    }
+
+    // Pass 3: weighted sum of values.
+    float inv = 1.0 / sum;
+    for (uint d = 0u; d < pc.headDim; ++d) {
+        float acc = 0.0;
+        for (uint j = 0u; j < pc.seqLenK; ++j) {
+            bool mask = masked != 0u && (j > i);
+            float s = 0.0;
+            if (!mask) {
+                for (uint dd = 0u; dd < pc.headDim; ++dd) {
+                    s += q[qRowBase + dd] * k[kHeadBase + j * pc.headDim + dd];
+                }
+                s *= scale;
+            } else {
+                s = -SCORE_NEG;
+            }
+            acc += exp(s - maxVal) * inv * v[vHeadBase + j * pc.headDim + d];
+        }
+        o[oBase + d] = acc;
+    }
+}

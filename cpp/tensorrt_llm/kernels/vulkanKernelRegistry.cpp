@@ -165,6 +165,20 @@ bool VulkanKernelRegistry::initialize()
         registerKernel(desc);
     }
 
+    {
+        KernelDescriptor desc;
+        desc.name = "attention";
+        desc.shaderPath = "attention.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 1;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 4; // q, k, v, output
+        registerKernel(desc);
+    }
+
     return true;
 }
 
@@ -1089,6 +1103,102 @@ VulkanResult VulkanKernelDispatcher::dispatchSoftmax(
     // local_size_x = 1, one workgroup per (batch * head) row.
     (void)blockSize;
     vkCmdDispatch(cmdBuf, numRows, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchAttention(
+    void* q, void* k, void* v, void* output,
+    uint32_t batchSize, uint32_t numHeads,
+    uint32_t seqLenQ, uint32_t seqLenK, uint32_t headDim,
+    bool causal,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+    {
+        return VulkanResult::INITIALIZATION_FAILED;
+    }
+
+    if (batchSize == 0 || numHeads == 0 || seqLenQ == 0 || seqLenK == 0 || headDim == 0)
+    {
+        TLLM_LOG_WARNING("Vulkan attention: zero-dimension input");
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    auto variant = mKernelRegistry->getBestVariant("attention");
+    if (!variant || !variant->isValid())
+    {
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+    {
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    uint32_t numQueries = batchSize * numHeads * seqLenQ;
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(q), reinterpret_cast<VkBuffer>(k),
+                          reinterpret_cast<VkBuffer>(v), reinterpret_cast<VkBuffer>(output)};
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDeviceSize qBytes  = static_cast<VkDeviceSize>(batchSize) * numHeads * seqLenQ * headDim * sizeof(float);
+    VkDeviceSize kvBytes = static_cast<VkDeviceSize>(batchSize) * numHeads * seqLenK * headDim * sizeof(float);
+    VkDeviceSize oBytes  = static_cast<VkDeviceSize>(batchSize) * numHeads * seqLenQ * headDim * sizeof(float);
+    VkDescriptorBufferInfo bufInfos[4]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].range = qBytes;  bufInfos[0].offset = 0;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].range = kvBytes; bufInfos[1].offset = 0;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].range = kvBytes; bufInfos[2].offset = 0;
+    bufInfos[3].buffer = buffers[3]; bufInfos[3].range = oBytes;  bufInfos[3].offset = 0;
+
+    VkWriteDescriptorSet writes[4]{};
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 4, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t batchSize;
+        uint32_t numHeads;
+        uint32_t seqLenQ;
+        uint32_t seqLenK;
+        uint32_t headDim;
+        uint32_t causal;
+    } pc{};
+    pc.batchSize = batchSize;
+    pc.numHeads = numHeads;
+    pc.seqLenQ = seqLenQ;
+    pc.seqLenK = seqLenK;
+    pc.headDim = headDim;
+    pc.causal = causal ? 1u : 0u;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    // local_size_x = 1; one workgroup owns a single (batch, head, query) row.
+    (void)blockSize;
+    uint32_t workGroupsX = numQueries;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
 
     submitAndFree(cmdBuf);
     freeDescriptorSet(set);
