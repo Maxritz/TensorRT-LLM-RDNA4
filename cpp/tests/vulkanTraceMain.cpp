@@ -691,6 +691,123 @@ bool test_q8_0_gemm()
         TRACE_PASS();
     }
 
+    VulkanBackend::free(weight);
+    VulkanBackend::free(activation);
+    VulkanBackend::free(output);
+
+    return allCorrect;
+}
+
+// ==================== Softmax (per-row) ====================
+// out[b,h,s] = exp(in - max) / sum(exp(in - max)), computed per (batch, head) row.
+bool test_softmax()
+{
+    TRACE_TEST("Softmax Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t batchSize = 2;
+    const uint32_t numHeads = 2;
+    const uint32_t seqLen = 8;
+    const uint32_t rows = batchSize * numHeads;
+    const uint32_t total = rows * seqLen;
+    const size_t bytes = static_cast<size_t>(total) * sizeof(float);
+
+    void* input = VulkanBackend::malloc(bytes);
+    void* output = VulkanBackend::malloc(bytes);
+    if (!input || !output)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        if (input) VulkanBackend::free(input);
+        if (output) VulkanBackend::free(output);
+        return false;
+    }
+
+    std::minstd_rand rng(424242);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+    std::vector<float> hostIn(total), result(total, 0.0f);
+    for (auto& v : hostIn)
+    {
+        v = dist(rng);
+    }
+
+    if (!VulkanBackend::memcpyHostToDevice(input, hostIn.data(), bytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(input);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    if (!VulkanBackend::launchSoftmax(input, output, batchSize, numHeads, seqLen))
+    {
+        TRACE_FAIL(std::string("Softmax launch failed: ") + backend->getLastError());
+        VulkanBackend::free(input);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    VulkanBackend::memcpyDeviceToHost(result.data(), output, bytes);
+
+    bool allCorrect = true;
+    for (uint32_t r = 0; r < rows && allCorrect; ++r)
+    {
+        uint32_t base = r * seqLen;
+
+        float maxVal = hostIn[base];
+        for (uint32_t k = 1; k < seqLen; ++k)
+        {
+            if (hostIn[base + k] > maxVal) maxVal = hostIn[base + k];
+        }
+
+        float sum = 0.0f;
+        std::vector<float> ref(seqLen);
+        for (uint32_t k = 0; k < seqLen; ++k)
+        {
+            ref[k] = std::exp(hostIn[base + k] - maxVal);
+            sum += ref[k];
+        }
+        float inv = 1.0f / sum;
+
+        float rowSum = 0.0f;
+        for (uint32_t k = 0; k < seqLen; ++k)
+        {
+            ref[k] *= inv;
+            rowSum += result[base + k];
+            if (std::abs(result[base + k] - ref[k]) > 1e-4f)
+            {
+                allCorrect = false;
+                std::cout << "      mismatch r=" << r << " c=" << k << " got=" << result[base + k]
+                          << " ref=" << ref[k] << std::endl;
+                break;
+            }
+        }
+
+        if (allCorrect && std::abs(rowSum - 1.0f) > 1e-3f)
+        {
+            allCorrect = false;
+            std::cout << "      row sum " << rowSum << " != 1.0 for r=" << r << std::endl;
+        }
+    }
+
+    VulkanBackend::free(input);
+    VulkanBackend::free(output);
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect softmax results");
+    }
+    else
+    {
+        std::cout << "      Result verified: softmax matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+
     return allCorrect;
 }
 
@@ -728,6 +845,7 @@ int main()
     runTest(test_rms_norm, "RMS Norm Kernel");
     runTest(test_fp16_gemm, "FP16 GEMM Kernel");
     runTest(test_q8_0_gemm, "Q8_0 GEMM Kernel");
+    runTest(test_softmax, "Softmax Kernel");
     runTest(test_resource_leak_prevention, "Resource Leak Prevention");
     runTest(test_utilization_tracking, "GPU Utilization Tracking");
 

@@ -81,8 +81,12 @@ public:
                               void* stream = nullptr);
 
     static bool launchQ8_0Gemm(void* weight, void* activation, void* output,
-                              uint32_t M, uint32_t N, uint32_t K,
-                              uint32_t blocksPerRow = 0,
+                               uint32_t M, uint32_t N, uint32_t K,
+                               uint32_t blocksPerRow = 0,
+                               void* stream = nullptr);
+
+    static bool launchSoftmax(void* input, void* output,
+                              uint32_t batchSize, uint32_t numHeads, uint32_t seqLen,
                               void* stream = nullptr);
 
     // ==================== Synchronization ====================

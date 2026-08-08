@@ -1,0 +1,70 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+
+// Softmax over the last (sequence) dimension:
+//   out[b,h,s] = exp(in[b,h,s] - max_s) / sum_s(exp(in[b,h,s] - max_s))
+//
+// Each row (batchSize * numHeads rows) is reduced by a single thread so the
+// result matches a sequential CPU reference (max is associative for finite
+// values; the normalize sum is accumulated in the same order).
+//
+// Push constants: matches VulkanKernelDispatcher::dispatchSoftmax.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint batchSize;
+    uint numHeads;
+    uint seqLen;
+} pc;
+
+// binding 0: input  [batchSize * numHeads * seqLen]
+// binding 1: output [batchSize * numHeads * seqLen]
+layout(std430, binding = 0) restrict readonly  buffer BufIn  { float in_[]; };
+layout(std430, binding = 1) restrict writeonly buffer BufOut { float out_[]; };
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint numRows = pc.batchSize * pc.numHeads;
+    if (row >= numRows) {
+        return;
+    }
+    uint base = row * pc.seqLen;
+
+    // Pass 1: row max for numerical stability.
+    float maxVal = in_[base];
+    for (uint k = 1u; k < pc.seqLen; ++k) {
+        float v = in_[base + k];
+        if (v > maxVal) {
+            maxVal = v;
+        }
+    }
+
+    // Pass 2: sum of exponentials.
+    float sum = 0.0;
+    for (uint k = 0u; k < pc.seqLen; ++k) {
+        sum += exp(in_[base + k] - maxVal);
+    }
+    float inv = 1.0 / sum;
+
+    // Pass 3: normalized exponentials (write each output element once).
+    for (uint k = 0u; k < pc.seqLen; ++k) {
+        out_[base + k] = exp(in_[base + k] - maxVal) * inv;
+    }
+}

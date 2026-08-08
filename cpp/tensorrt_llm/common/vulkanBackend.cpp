@@ -293,6 +293,28 @@ bool VulkanBackend::launchQ8_0Gemm(void* weight, void* activation, void* output,
     return true;
 }
 
+bool VulkanBackend::launchSoftmax(void* input, void* output,
+                                  uint32_t batchSize, uint32_t numHeads, uint32_t seqLen,
+                                  void* stream)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchSoftmax(
+        input, output, batchSize, numHeads, seqLen);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("Softmax launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
 // ==================== Synchronization ====================
 
 void VulkanBackend::streamSynchronize(void* stream)
