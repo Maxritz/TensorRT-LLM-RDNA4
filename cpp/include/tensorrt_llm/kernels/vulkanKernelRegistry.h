@@ -193,6 +193,63 @@ public:
         uint32_t totalTokens, uint32_t totalOutputTokens,
         uint32_t blockSize = 64);
 
+    // ==================== Speculative Decoding ====================
+    // Vulkan port of externalDraftTokensKernels.cu spec-decode acceptance loop.
+    // targetLogits:[B,(draftLen+1)*V], draftLogits:[B,(draftLen+1)*V],
+    // uniform:[B*draftLen], draftTokens:[B*(draftLen+1)],
+    // acceptCount:[B], acceptedTokens:[B*(draftLen+1)], resampleProbs:[B*V].
+    common::VulkanResult dispatchSpecDecodeAccept(
+        void* targetLogits, void* draftLogits, void* uniformRng,
+        void* draftTokens, void* acceptCount, void* acceptedTokens,
+        void* resampleProbs,
+         uint32_t batchSize, uint32_t draftLen, uint32_t vocabSize,
+         float temperature, float acceptProbFloor, uint32_t blockSize = 1);
+
+    // ==================== Tree Spec-Decoding ====================
+    // Vulkan ports of buildDynamicTreeKernelPacked (line 157) and
+    // verifyDynamicTreeGreedyPackedKernel (line 284) in dynamicTreeKernels.cu.
+    // int64 host buffers (parentList, selectedIndex) are passed as uvec2-pairs:
+    // host packs each int64 as {lo,hi} uint32; shader reads .x (indices < 2^31).
+    common::VulkanResult dispatchTreeSpecBuild(
+        void* parentListUvec2, void* selectedIndexUvec2,
+        void* treeMask, void* positions, void* retrieveIndex,
+        void* retrieveNextToken, void* retrieveNextSibling,
+        uint32_t batchSize, uint32_t draftTokenNum, uint32_t topK,
+        uint32_t depth, uint32_t numInt32PerRow, uint32_t blockSize = 1);
+
+    common::VulkanResult dispatchTreeSpecGreedyVerify(
+        void* acceptIndex, void* acceptTokenNum, void* acceptToken,
+        void* candidates, void* retrievePacked, void* targetPredict,
+        void* treeValid, uint32_t batchSize, uint32_t numSpeculativeTokens,
+         uint32_t numDraftTokens, uint32_t blockSize = 1);
+
+    // Vulkan port of verifyDynamicTreeRejectionKernel (line 518).
+    // int64 acceptIndex/acceptToken are host-packed as uvec2 pairs.
+    // rngSamples [B] is host-injected uniform float (Philox-equivalent).
+    common::VulkanResult dispatchTreeSpecRejection(
+        void* acceptIndex, void* acceptTokenNum, void* acceptToken,
+        void* draftTokens, void* targetProbs, void* retrieveNextToken,
+        void* retrieveNextSibling, void* treeValid, void* rngSamples,
+        uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens,
+        uint32_t vocabSize,      uint32_t kMaxTriedPerLevel, uint32_t blockSize = 256);
+
+    // ==================== KV Cache Update ====================
+    // Vulkan port of updateKVCacheDraftTokenLocationBatchedKernel2D
+    // (kvCacheUpdateKernels.cu line 140). Compacts accepted draft tokens
+    // in the KV cache: copies K/V from scattered draft positions to
+    // contiguous positions starting at (pastKVLen - rewindDraftTokenCommonCount).
+    // kvCacheK/V layout: [layer, seq, head, pos, channel] (float).
+    // acceptedDraftTokens [seq, maxDraftLen] (int32, -1 padding).
+    // rewindSepAdj / seqSlotRemap pass -1 as sentinel when unused.
+    common::VulkanResult dispatchKVCacheUpdate2D(
+        void* kvCacheK, void* kvCacheV,
+        void* acceptedDraftTokensIndices2D, void* numAcceptedTokens,
+        void* pastKeyValueLengths, void* rewindDraftTokenSeparateAdjustments,
+        void* seqSlotRemapping,
+        uint32_t batchSize, uint32_t numKVHeads, uint32_t maxKVCacheLen,
+        uint32_t headDim, uint32_t maxDraftLen, int32_t rewindDraftTokenCommonCount,
+        uint32_t layerCount, uint32_t blockSize = 128);
+
     // ==================== MLA Operations ====================
     // Vulkan port of the CuTe-DSL Blackwell MLA decode FMHA
     // (cute_dsl_mla.py::_run_mla_decode). q:[B,S,H,D], kv:[numPages,pageSize,D],

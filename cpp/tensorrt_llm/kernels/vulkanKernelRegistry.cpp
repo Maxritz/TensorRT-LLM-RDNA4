@@ -221,6 +221,81 @@ bool VulkanKernelRegistry::initialize()
         registerKernel(desc);
     }
 
+    {
+        KernelDescriptor desc;
+        desc.name = "spec_accept";
+        desc.shaderPath = "spec_accept.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 1;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.requiresBF16 = false;
+        desc.bindingCount = 7;
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "tree_spec_build";
+        desc.shaderPath = "tree_spec_build.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 1;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.requiresBF16 = false;
+        desc.bindingCount = 7;
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "tree_spec_greedy_verify";
+        desc.shaderPath = "tree_spec_greedy_verify.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 1;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.requiresBF16 = false;
+        desc.bindingCount = 7;
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "tree_spec_rejection";
+        desc.shaderPath = "tree_spec_rejection.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 1;
+        desc.blockN = 256;   // local_size_x = 256
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.requiresBF16 = false;
+        desc.bindingCount = 9;
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "kv_cache_update_2d";
+        desc.shaderPath = "kv_cache_update_2d.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 1;
+        desc.blockN = 1;
+        desc.blockK = 128;   // local_size_x = 128
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.requiresBF16 = false;
+        desc.bindingCount = 7;
+        registerKernel(desc);
+    }
+
     return true;
 }
 
@@ -1347,6 +1422,254 @@ VulkanResult VulkanKernelDispatcher::dispatchTopk(
     return VulkanResult::SUCCESS;
 }
 
+VulkanResult VulkanKernelDispatcher::dispatchTreeSpecBuild(
+    void* parentListUvec2, void* selectedIndexUvec2, void* treeMask,
+    void* positions, void* retrieveIndex, void* retrieveNextToken,
+    void* retrieveNextSibling,
+    uint32_t batchSize, uint32_t draftTokenNum, uint32_t topK,
+    uint32_t depth, uint32_t numInt32PerRow, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (batchSize == 0 || draftTokenNum == 0 || topK == 0 || depth == 0 || numInt32PerRow == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("tree_spec_build");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    // parentList Uvec2 count = B * (topK * (depth-1) + 1); selectedIndex Uvec2 count = B*(dT-1).
+    // treeMask uint count = B * dT * numInt32PerRow. Remaining buffers: B * dT int32.
+    uint32_t parentElems  = batchSize * (topK * (depth - 1u) + 1u);
+    uint32_t selElems     = batchSize * (draftTokenNum - 1u);
+    uint32_t treeElems    = batchSize * draftTokenNum * numInt32PerRow;
+    uint32_t arrElems     = batchSize * draftTokenNum;
+    VkDeviceSize parentBytes  = VkDeviceSize(parentElems)  * 2u * sizeof(uint32_t); // uvec2
+    VkDeviceSize selBytes     = VkDeviceSize(selElems)   * 2u * sizeof(uint32_t);
+    VkDeviceSize treeBytes    = VkDeviceSize(treeElems)  * sizeof(uint32_t);
+    VkDeviceSize arrBytes     = VkDeviceSize(arrElems)   * sizeof(int32_t);
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(parentListUvec2),   reinterpret_cast<VkBuffer>(selectedIndexUvec2),
+        reinterpret_cast<VkBuffer>(treeMask),          reinterpret_cast<VkBuffer>(positions),
+        reinterpret_cast<VkBuffer>(retrieveIndex),      reinterpret_cast<VkBuffer>(retrieveNextToken),
+        reinterpret_cast<VkBuffer>(retrieveNextSibling)};
+    VkDeviceSize ranges[] = {parentBytes, selBytes, treeBytes, arrBytes, arrBytes, arrBytes, arrBytes};
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[7]{};
+    VkWriteDescriptorSet writes[7]{};
+    for (uint32_t i = 0; i < 7; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].range = ranges[i];
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(mContext->getDevice(), 7, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t draftTokenNum;
+        uint32_t topK;
+        uint32_t depth;
+        uint32_t numInt32PerRow;
+    } pc{};
+    pc.draftTokenNum = draftTokenNum;
+    pc.topK = topK;
+    pc.depth = depth;
+    pc.numInt32PerRow = numInt32PerRow;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    // One workgroup per (batch, token) — 2D grid.
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, batchSize, draftTokenNum, 1);
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchTreeSpecGreedyVerify(
+    void* acceptIndex, void* acceptTokenNum, void* acceptToken,
+    void* candidates, void* retrievePacked, void* targetPredict,
+    void* treeValid,
+    uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (batchSize == 0 || numSpeculativeTokens == 0 || numDraftTokens == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("tree_spec_greedy_verify");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkDeviceSize idxBytes = VkDeviceSize(batchSize) * numSpeculativeTokens * sizeof(int32_t);
+    VkDeviceSize numBytes = VkDeviceSize(batchSize) * sizeof(uint32_t);
+    VkDeviceSize tokBytes = VkDeviceSize(batchSize) * numSpeculativeTokens * sizeof(int32_t);
+    VkDeviceSize candBytes = VkDeviceSize(batchSize) * numDraftTokens * sizeof(int32_t);
+    VkDeviceSize retBytes  = VkDeviceSize(batchSize) * numDraftTokens * 3u * sizeof(int32_t);
+    VkDeviceSize tgtBytes  = VkDeviceSize(batchSize) * numDraftTokens * sizeof(int32_t);
+    VkDeviceSize valBytes  = VkDeviceSize(batchSize) * sizeof(int32_t);
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(acceptIndex), reinterpret_cast<VkBuffer>(acceptTokenNum),
+        reinterpret_cast<VkBuffer>(acceptToken),   reinterpret_cast<VkBuffer>(candidates),
+        reinterpret_cast<VkBuffer>(retrievePacked), reinterpret_cast<VkBuffer>(targetPredict),
+        reinterpret_cast<VkBuffer>(treeValid)};
+    VkDeviceSize ranges[] = {idxBytes, numBytes, tokBytes, candBytes, retBytes, tgtBytes, valBytes};
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[7]{};
+    VkWriteDescriptorSet writes[7]{};
+    for (uint32_t i = 0; i < 7; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].range = ranges[i];
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(mContext->getDevice(), 7, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t numSpeculativeTokens;
+        uint32_t numDraftTokens;
+    } pc{};
+    pc.numSpeculativeTokens = numSpeculativeTokens;
+    pc.numDraftTokens = numDraftTokens;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, batchSize, 1, 1);   // one WG per batch row
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchTreeSpecRejection(
+    void* acceptIndex, void* acceptTokenNum, void* acceptToken, void* draftTokens,
+    void* targetProbs, void* retrieveNextToken, void* retrieveNextSibling,
+    void* treeValid, void* rngSamples,
+    uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens,
+    uint32_t vocabSize, uint32_t kMaxTriedPerLevel, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (batchSize == 0 || numSpeculativeTokens == 0 || numDraftTokens == 0 || vocabSize == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("tree_spec_rejection");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    // acceptIndex/acceptToken are int64-as-uvec2 (2x uint32 per element)
+    VkDeviceSize idxBytes = VkDeviceSize(batchSize) * numSpeculativeTokens * 2u * sizeof(uint32_t);
+    VkDeviceSize numBytes = VkDeviceSize(batchSize) * sizeof(uint32_t);
+    VkDeviceSize tokBytes = VkDeviceSize(batchSize) * numSpeculativeTokens * 2u * sizeof(uint32_t);
+    VkDeviceSize candBytes = VkDeviceSize(batchSize) * (numDraftTokens - 1u) * sizeof(int32_t);
+    VkDeviceSize tpBytes  = VkDeviceSize(batchSize) * numDraftTokens * vocabSize * sizeof(float);
+    VkDeviceSize rtBytes  = VkDeviceSize(batchSize) * numDraftTokens * sizeof(int32_t);
+    VkDeviceSize rsBytes  = rtBytes;
+    VkDeviceSize valBytes = VkDeviceSize(batchSize) * sizeof(int32_t);
+    VkDeviceSize rngBytes = VkDeviceSize(batchSize) * sizeof(float);
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(acceptIndex),     reinterpret_cast<VkBuffer>(acceptTokenNum),
+        reinterpret_cast<VkBuffer>(acceptToken),     reinterpret_cast<VkBuffer>(draftTokens),
+        reinterpret_cast<VkBuffer>(targetProbs),     reinterpret_cast<VkBuffer>(retrieveNextToken),
+        reinterpret_cast<VkBuffer>(retrieveNextSibling), reinterpret_cast<VkBuffer>(treeValid),
+        reinterpret_cast<VkBuffer>(rngSamples)};
+    VkDeviceSize ranges[] = {idxBytes, numBytes, tokBytes, candBytes, tpBytes,
+                             rtBytes, rsBytes, valBytes, rngBytes};
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[9]{};
+    VkWriteDescriptorSet writes[9]{};
+    for (uint32_t i = 0; i < 9; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].range = ranges[i];
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(mContext->getDevice(), 9, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t numSpeculativeTokens;
+        uint32_t numDraftTokens;
+        uint32_t vocabSize;
+        uint32_t kMaxTriedPerLevel;
+    } pc{};
+    pc.numSpeculativeTokens = numSpeculativeTokens;
+    pc.numDraftTokens = numDraftTokens;
+    pc.vocabSize = vocabSize;
+    pc.kMaxTriedPerLevel = kMaxTriedPerLevel;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, batchSize, 1, 1);   // one 256-thread WG per batch row
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+    return VulkanResult::SUCCESS;
+}
+
 VulkanResult VulkanKernelDispatcher::dispatchMlaFmha(
     void* q, void* kv, void* pageTable, void* cacheSeqs, void* output,
     uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
@@ -1461,6 +1784,107 @@ VulkanResult VulkanKernelDispatcher::dispatchMlaFmha(
     // One workgroup per query token.
     (void)blockSize;
     vkCmdDispatch(cmdBuf, batchSize, numHeads * seqQLen, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchSpecDecodeAccept(
+    void* targetLogits, void* draftLogits, void* uniformRng, void* draftTokens,
+    void* acceptCount, void* acceptedTokens, void* resampleProbs,
+    uint32_t batchSize, uint32_t draftLen, uint32_t vocabSize,
+    float temperature, float acceptProbFloor, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+    {
+        return VulkanResult::INITIALIZATION_FAILED;
+    }
+
+    if (batchSize == 0 || draftLen == 0 || vocabSize == 0)
+    {
+        TLLM_LOG_WARNING("Vulkan spec_decode_accept: zero-dimension input (B=%u D=%u V=%u)",
+                         batchSize, draftLen, vocabSize);
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    auto variant = mKernelRegistry->getBestVariant("spec_accept");
+    if (!variant || !variant->isValid())
+    {
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+    {
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    uint32_t posStride = vocabSize;
+    uint32_t posCount = draftLen + 1u; // includes bonus position
+
+    VkDeviceSize logitsBytes  = static_cast<VkDeviceSize>(batchSize) * posCount * posStride * sizeof(float);
+    VkDeviceSize uniformBytes = static_cast<VkDeviceSize>(batchSize) * draftLen * sizeof(float);
+    VkDeviceSize tokensBytes  = static_cast<VkDeviceSize>(batchSize) * posCount * sizeof(int32_t);
+    VkDeviceSize countBytes   = static_cast<VkDeviceSize>(batchSize) * sizeof(uint32_t);
+    VkDeviceSize acceptOutBytes = static_cast<VkDeviceSize>(batchSize) * posCount * sizeof(int32_t);
+    VkDeviceSize resampleBytes = static_cast<VkDeviceSize>(batchSize) * posStride * sizeof(float);
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(targetLogits), reinterpret_cast<VkBuffer>(draftLogits),
+        reinterpret_cast<VkBuffer>(uniformRng),   reinterpret_cast<VkBuffer>(draftTokens),
+        reinterpret_cast<VkBuffer>(acceptCount),  reinterpret_cast<VkBuffer>(acceptedTokens),
+        reinterpret_cast<VkBuffer>(resampleProbs)};
+
+    VkDeviceSize ranges[] = {logitsBytes, logitsBytes, uniformBytes, tokensBytes,
+                             countBytes, acceptOutBytes, resampleBytes};
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[7]{};
+    VkWriteDescriptorSet writes[7]{};
+    for (uint32_t i = 0; i < 7; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].offset = 0;
+        bufInfos[i].range = ranges[i];
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 7, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t draftLen;
+        uint32_t vocabSize;
+        float    temperature;
+        float    sqrtNegLogAccept;
+    } pc{};
+    pc.draftLen = draftLen;
+    pc.vocabSize = vocabSize;
+    pc.temperature = temperature;
+    pc.sqrtNegLogAccept = acceptProbFloor;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    // One workgroup per batch row.
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, batchSize, 1, 1);
 
     submitAndFree(cmdBuf);
     freeDescriptorSet(set);
@@ -1605,6 +2029,95 @@ VulkanResult VulkanKernelDispatcher::dispatchFill(
         *reinterpret_cast<uint32_t*>(&value));
 
     submitAndFree(cmdBuf);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchKVCacheUpdate2D(
+    void* kvCacheK, void* kvCacheV,
+    void* acceptedDraftTokensIndices2D, void* numAcceptedTokens,
+    void* pastKeyValueLengths, void* rewindDraftTokenSeparateAdjustments,
+    void* seqSlotRemapping,
+    uint32_t batchSize, uint32_t numKVHeads, uint32_t maxKVCacheLen,
+    uint32_t headDim, uint32_t maxDraftLen, int32_t rewindDraftTokenCommonCount,
+    uint32_t layerCount, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (batchSize == 0 || numKVHeads == 0 || maxKVCacheLen == 0 || headDim == 0 || maxDraftLen == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("kv_cache_update_2d");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkDeviceSize kvBytes    = static_cast<VkDeviceSize>(layerCount) * batchSize * numKVHeads * maxKVCacheLen * headDim * sizeof(float);
+    VkDeviceSize accBytes   = static_cast<VkDeviceSize>(batchSize) * maxDraftLen * sizeof(int32_t);
+    VkDeviceSize arrBytes   = static_cast<VkDeviceSize>(batchSize) * sizeof(int32_t);
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(kvCacheK),                   reinterpret_cast<VkBuffer>(kvCacheV),
+        reinterpret_cast<VkBuffer>(acceptedDraftTokensIndices2D), reinterpret_cast<VkBuffer>(numAcceptedTokens),
+        reinterpret_cast<VkBuffer>(pastKeyValueLengths),         reinterpret_cast<VkBuffer>(rewindDraftTokenSeparateAdjustments),
+        reinterpret_cast<VkBuffer>(seqSlotRemapping)};
+    VkDeviceSize ranges[] = {kvBytes, kvBytes, accBytes, arrBytes, arrBytes, arrBytes, arrBytes};
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[7]{};
+    VkWriteDescriptorSet writes[7]{};
+    for (uint32_t i = 0; i < 7; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].offset = 0;
+        bufInfos[i].range = ranges[i];
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(mContext->getDevice(), 7, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t maxDraftLen;
+        uint32_t numKVHeads;
+        uint32_t maxKVCacheLen;
+        uint32_t headDim;
+        int32_t  rewindDraftTokenCommonCount;
+        uint32_t layerCount;
+        uint32_t seqCount;
+    } pc{};
+    pc.maxDraftLen = maxDraftLen;
+    pc.numKVHeads = numKVHeads;
+    pc.maxKVCacheLen = maxKVCacheLen;
+    pc.headDim = headDim;
+    pc.rewindDraftTokenCommonCount = rewindDraftTokenCommonCount;
+    pc.layerCount = layerCount;
+    pc.seqCount = batchSize;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, batchSize, numKVHeads, layerCount);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
 
     return VulkanResult::SUCCESS;
 }

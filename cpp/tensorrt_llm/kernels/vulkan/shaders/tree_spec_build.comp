@@ -1,0 +1,152 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Speculative-decoding dynamic-tree construction (bit-packed treeMask).
+// Vulkan port of buildDynamicTreeKernelPacked in
+// cpp/tensorrt_llm/kernels/speculativeDecoding/dynamicTreeKernels.cu (line 157).
+//
+// One workgroup per batch row; gl_WorkGroupID.x = bid, gl_WorkGroupID.y = tid
+// (node index within row). tid==0 drives sibling-list construction (sequential
+// insertion order); tid>0 walks ancestors setting packed treeMask bits.
+//
+// int64 host buffers (parentList, selectedIndex) are packed as uvec2 {lo, hi}
+// so we avoid GL_EXT_64bit_storage (unsupported by this glslc). Tree indices
+// fit in 32 bits, so we read only the low dword (.x).
+//
+// Push constants: matches VulkanKernelDispatcher::dispatchTreeSpecBuild.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint draftTokenNum;   // total draft tokens per row (dT)
+    uint topK;            // top-K candidates per node
+    uint depth;           // tree depth
+    uint numInt32PerRow;  // treeMask row stride in uint32s (padded)
+} pc;
+
+// binding 0: parentList     [B, (topK*(depth-1)+1)]  int64-as-uvec2  (lo,hi)
+// binding 1: selectedIndex  [B, draftTokenNum-1]      int64-as-uvec2
+// binding 2: treeMask       [B, dT, numInt32PerRow]   uint  (bit-packed ancestor mask)
+// binding 3: positions      [B, dT]                   int   (depth per node)
+// binding 4: retrieveIndex  [B, dT]                   int   (0..dT-1 traversal order)
+// binding 5: retrieveNextToken  [B, dT]              int   (first child index; -1 none)
+// binding 6: retrieveNextSibling [B, dT]            int   (next sibling index; -1 none)
+layout(std430, binding = 0) restrict readonly  buffer BufParent   { uvec2 parentList[]; };
+layout(std430, binding = 1) restrict readonly  buffer BufSelIdx  { uvec2 selectedIndex[]; };
+layout(std430, binding = 2) restrict writeonly buffer BufTreeMask { uint treeMask[]; };
+layout(std430, binding = 3) buffer BufPos      { int  positions[]; };
+layout(std430, binding = 4) buffer BufRetIdx   { int  retrieveIndex[]; };
+layout(std430, binding = 5) buffer BufNextTok   { int  retrieveNextToken[]; };
+layout(std430, binding = 6) buffer BufNextSib   { int  retrieveNextSibling[]; };
+
+void main()
+{
+    uint bid = gl_WorkGroupID.x;
+    uint tid = gl_WorkGroupID.y;   // node index within row
+
+    if (tid >= pc.draftTokenNum) return;
+
+    uint dT = pc.draftTokenNum;
+    uint rowBaseSel  = bid * (dT - 1u);                 // selectedIndex element base
+    uint rowBaseTree = bid * dT * pc.numInt32PerRow;    // treeMask uint base
+    uint rowBaseArr  = bid * dT;                        // positions/retrieve array base
+
+    uint treeRowStrideElems = pc.topK * (pc.depth - 1u) + 1u; // parentList elems per batch
+    uint parentBase = bid * treeRowStrideElems;
+
+    if (tid == 0u)
+    {
+        // Self-diagonal bit (bit 0 = root node).
+        if (pc.numInt32PerRow > 0u)
+            treeMask[rowBaseTree] |= 1u;
+
+        positions[rowBaseArr] = 0;
+        retrieveIndex[rowBaseArr] = 0;
+
+        // Reverse iteration produces forward sibling order (CUDA line 179).
+        for (uint i = dT - 1u; i > 0u; --i)
+        {
+            retrieveIndex[rowBaseArr + i] = int(i);
+
+            uint selLo = selectedIndex[rowBaseSel + i - 1u].x;
+            uint parentTbIdx = selLo / pc.topK;
+            int parentPosition = 0;
+
+            if (parentTbIdx > 0u)
+            {
+                uint pTokenLo = parentList[parentBase + parentTbIdx].x;
+                uint up = 0u;
+                for (; up < dT; ++up)
+                {
+                    if (selectedIndex[rowBaseSel + up].x == pTokenLo)
+                    {
+                        ++up; // +1 because position 0 is root
+                        break;
+                    }
+                }
+                parentPosition = int(up);
+            }
+
+            if (parentPosition == int(dT))
+            {
+                continue;  // invalid tree: skip (CUDA emits a warning)
+            }
+
+            int childFirst = retrieveNextToken[rowBaseArr + uint(parentPosition)];
+            if (childFirst == -1)
+            {
+                retrieveNextToken[rowBaseArr + uint(parentPosition)] = int(i);
+            }
+            else
+            {
+                retrieveNextSibling[rowBaseArr + i] = childFirst;
+                retrieveNextToken[rowBaseArr + uint(parentPosition)] = int(i);
+            }
+        }
+    }
+    else
+    {
+        // tid>0: walk ancestors, setting packed treeMask bits (CUDA line 220).
+        uint curPosition = tid - 1u;
+        int position = 0;
+        while (uint(position) < pc.depth + 1u)
+        {
+            ++position;
+
+            uint bitPosition = curPosition + 1u;  // +1 because bit 0 = root
+            uint int32Idx = bitPosition / 32u;
+            uint bitIdx = bitPosition % 32u;
+            if (int32Idx < pc.numInt32PerRow)
+                treeMask[rowBaseTree + int32Idx] |= (1u << bitIdx);
+
+            uint selLo = selectedIndex[rowBaseSel + curPosition].x;
+            uint parentTbIdx = selLo / pc.topK;
+            if (parentTbIdx == 0u) break;
+
+            uint tokenIdx = parentList[parentBase + parentTbIdx].x;
+            curPosition = 0u;
+            for (; curPosition < dT; ++curPosition)
+            {
+                if (selectedIndex[rowBaseSel + curPosition].x == tokenIdx) break;
+            }
+            if (curPosition >= dT) break;
+        }
+        positions[rowBaseArr + tid] = position;
+    }
+}

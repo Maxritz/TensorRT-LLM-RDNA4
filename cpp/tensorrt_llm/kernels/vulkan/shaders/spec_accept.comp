@@ -1,0 +1,133 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Speculative-decoding token acceptance (draft token validation).
+// Vulkan port of the CUDA acceptance loop in
+// tensorrt-llm/cpp/tensorrt-llm/kernels/speculativeDecoding/externalDraftTokensKernels.cu
+// (SpecDecSampling). For each batch row we walk the draft tokens left-to-right:
+//   r = targetProb[tok] / draftProb[tok]      (importance ratio)
+//   if uniform < min(1.0, r):  ACCEPT (emit draft token)
+//   else:                      REJECT (stop; resample from target at this length)
+// If every draft token is accepted, a bonus token is resampled from the target
+// distribution at the bonus position (draftLen + 1 in the logits buffers).
+//
+// One workgroup per batch row (local_size_x = 1), deterministic, matches the
+// scalar CPU reference in vulkanTraceMain::test_spec_decode_acceptance.
+//
+// Push constants: matches VulkanKernelDispatcher::dispatchSpecDecodeAccept.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint draftLen;        // number of draft tokens per request (excluding bonus)
+    uint vocabSize;       // vocabulary size
+    float temperature;     // bonus-token sampling temperature (1.0 = raw logits)
+    float sqrtNegLogAccept; // sqrt of accepted-neg-log accept prob floor (1.0 = no floor)
+} pc;
+
+// binding 0: targetLogits [B, draftLen+1, V]  (float)
+// binding 1: draftLogits  [B, draftLen+1, V]  (float)
+// binding 2: rngSamples   [B, draftLen]        (float, RNG in [0,1))
+// binding 3: draftTokens  [B, draftLen+1]      (int32; last entry = bonus token)
+// binding 4: acceptCount  [B]                  (uint32 output)
+// binding 5: acceptedTokens [B, draftLen+1]  (int32 output, row-local accepted ids)
+// binding 6: resampleProbs [B, V]            (float output, bonus-token dist; 0 if no resample)
+layout(std430, binding = 0) restrict readonly  buffer BufTarget  { float targetLogits[]; };
+layout(std430, binding = 1) restrict readonly  buffer BufDraft   { float draftLogits[];  };
+layout(std430, binding = 2) restrict readonly  buffer BufRngSamp { float rngSamples[];   };
+layout(std430, binding = 3) restrict readonly  buffer BufDraftTok{ int   draftTokens[]; };
+layout(std430, binding = 4) restrict writeonly buffer BufAcceptCnt{ uint  acceptCount[]; };
+layout(std430, binding = 5) restrict writeonly buffer BufAcceptIdx{ int   acceptedTokens[]; };
+layout(std430, binding = 6) restrict writeonly buffer BufResample { float resampleProbs[]; };
+
+// ---- Numerically-stable log-softmax over one row of logits (inlined per call) ----
+
+void main()
+{
+    uint b = gl_WorkGroupID.x;
+
+    uint V = pc.vocabSize;
+    if (V == 0u) return;
+
+    float scale = 1.0 / pc.temperature;
+    uint posStride = V;
+    uint ONE_PLUS = pc.draftLen + 1u;
+
+    // ---- Accept/reject walk over draftLen positions ----
+    uint accepted = 0u;
+    bool rejected = false;
+    for (uint t = 0u; t < pc.draftLen; ++t)
+    {
+        if (rejected) break;
+
+        int tok = draftTokens[b * ONE_PLUS + t];
+        if (tok < 0) break;
+
+        uint tgtBase = b * ONE_PLUS * posStride + t * posStride;
+        uint drfBase = b * ONE_PLUS * posStride + t * posStride;
+
+        float mxT = -1.0e30;
+        for (uint i = 0u; i < V; ++i) if (targetLogits[tgtBase + i] > mxT) mxT = targetLogits[tgtBase + i];
+        float sT = 0.0;
+        for (uint i = 0u; i < V; ++i) sT += exp(targetLogits[tgtBase + i] - mxT);
+        float lpTgt = (targetLogits[tgtBase + tok] - mxT) - log(sT);
+
+        float mxD = -1.0e30;
+        for (uint i = 0u; i < V; ++i) if (draftLogits[drfBase + i] > mxD) mxD = draftLogits[drfBase + i];
+        float sD = 0.0;
+        for (uint i = 0u; i < V; ++i) sD += exp(draftLogits[drfBase + i] - mxD);
+        float lpDrf = (draftLogits[drfBase + tok] - mxD) - log(sD);
+
+        float logRatio = (lpTgt * scale) - (lpDrf * scale);
+        float r = exp(logRatio);
+        if (r > 1.0) r = 1.0;
+
+        if (rngSamples[b * pc.draftLen + t] < r)
+        {
+            acceptedTokens[b * ONE_PLUS + accepted] = tok;
+            ++accepted;
+        }
+        else
+        {
+            rejected = true;
+        }
+    }
+
+    // ---- Bonus-token handling ----
+    uint bonusIdx = accepted + b * ONE_PLUS;
+    if (rejected || accepted < pc.draftLen)
+    {
+        uint tgtBase = b * ONE_PLUS * posStride + accepted * posStride;
+        float mx = -1.0e30;
+        for (uint i = 0u; i < V; ++i) if (targetLogits[tgtBase + i] > mx) mx = targetLogits[tgtBase + i];
+        float sum = 0.0;
+        for (uint i = 0u; i < V; ++i) sum += exp((targetLogits[tgtBase + i] - mx) * scale);
+        float inv = (sum > 0.0) ? 1.0 / sum : 0.0;
+        for (uint i = 0u; i < V; ++i)
+            resampleProbs[b * V + i] = exp((targetLogits[tgtBase + i] - mx) * scale) * inv;
+        acceptedTokens[bonusIdx] = -1;
+    }
+    else
+    {
+        acceptedTokens[bonusIdx] = draftTokens[b * ONE_PLUS + pc.draftLen];
+        for (uint i = 0u; i < V; ++i) resampleProbs[b * V + i] = 0.0;
+    }
+
+    acceptCount[b] = accepted;
+}

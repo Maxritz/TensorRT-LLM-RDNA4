@@ -1,0 +1,115 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+
+// Top-K token selection per (batch, kv-head) attention row for sparse attention.
+// Vulkan port of tensorrt-llm/_torch/attention_backend/sparse/kernel.py:topk_kernel
+// (invoked via triton_topk). For each row we emit `topk` row-local token indices of
+// the largest scores in descending order, first-maximum wins ties (strict >) -- this
+// exactly matches the CPU reference in vulkanTraceMain::test_topk.
+//
+// One workgroup per row (local_size_x = 1); each row is reduced by a single thread so
+// the result is deterministic and matches the scalar CPU reference. This is the
+// correctness-first variant; a later pass can fan out within a row via shared memory
+// for very long sequences.
+//
+// Push constants: matches VulkanKernelDispatcher::dispatchTopk.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint topk;           // requested top-k per row
+    uint numHeads;       // number of kv-heads
+    uint batchSize;      // number of rows per head
+    uint totalTokens;    // tokens per head (row stride in scores)
+    uint totalOutputTokens; // output tokens per head (row stride in outIdx)
+} pc;
+
+// binding 0: scores       [numHeads * totalTokens]        (float)
+// binding 1: input_offsets [batchSize + 1]                (uint)
+// binding 2: output_offsets[batchSize + 1]                (uint)
+// binding 3: topk_indices [numHeads * totalOutputTokens] (int, row-local token offsets)
+layout(std430, binding = 0) restrict readonly  buffer BufScores  { float scores[]; };
+layout(std430, binding = 1) restrict readonly  buffer BufInOff   { uint  inOff[]; };
+layout(std430, binding = 2) restrict readonly  buffer BufOutOff  { uint  outOff[]; };
+layout(std430, binding = 3) restrict writeonly buffer BufOutIdx  { int   topkIdx[]; };
+
+void main()
+{
+    uint b = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    if (b >= pc.batchSize || h >= pc.numHeads)
+    {
+        return;
+    }
+
+    uint inStart  = inOff[b];
+    uint inEnd    = inOff[b + 1];
+    uint outStart = outOff[b];
+    uint outEnd   = outOff[b + 1];
+    uint inputLen  = inEnd - inStart;
+    uint outputLen = outEnd - outStart;
+    if (inputLen == 0u || outputLen == 0u)
+    {
+        return;
+    }
+
+    // The sparse output budget caps the number of picks.
+    uint picks = outputLen;
+    if (picks > pc.topk)
+    {
+        picks = pc.topk;
+    }
+
+    uint rowBase = h * pc.totalTokens + inStart;
+
+    // Repeated argmax over only not-yet-selected indices. `picks` is bounded by topk
+    // (see dispatchTopk), so a fixed-size register array is safe.
+    int picked[32];
+
+    for (uint s = 0u; s < picks; ++s)
+    {
+        float bestVal = -1.0e30;
+        uint  bestIdx = 0u;
+
+        for (uint i = 0u; i < inputLen; ++i)
+        {
+            bool taken = false;
+            for (uint s2 = 0u; s2 < s; ++s2)
+            {
+                if (picked[s2] == int(i))
+                {
+                    taken = true;
+                    break;
+                }
+            }
+            if (!taken)
+            {
+                float v = scores[rowBase + i];
+                if (v > bestVal)
+                {
+                    bestVal = v;
+                    bestIdx = i;
+                }
+            }
+        }
+
+        picked[s] = int(bestIdx);
+        topkIdx[h * pc.totalOutputTokens + outStart + s] = int(bestIdx);
+    }
+}

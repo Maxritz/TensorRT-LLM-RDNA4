@@ -364,6 +364,127 @@ bool VulkanBackend::launchTopk(void* scores, void* inputOffsets, void* outputOff
     return true;
 }
 
+bool VulkanBackend::launchSpecDecodeAccept(
+    void* targetLogits, void* draftLogits, void* uniformRng, void* draftTokens,
+    void* acceptCount, void* acceptedTokens, void* resampleProbs,
+    uint32_t batchSize, uint32_t draftLen, uint32_t vocabSize,
+    float temperature, float acceptProbFloor, void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchSpecDecodeAccept(
+        targetLogits, draftLogits, uniformRng, draftTokens,
+        acceptCount, acceptedTokens, resampleProbs,
+        batchSize, draftLen, vocabSize, temperature, acceptProbFloor);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("SpecDecodeAccept launch failed: ") +
+                              VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchTreeSpecBuild(
+    void* parentListUvec2, void* selectedIndexUvec2, void* treeMask,
+    void* positions, void* retrieveIndex, void* retrieveNextToken,
+    void* retrieveNextSibling,
+    uint32_t batchSize, uint32_t draftTokenNum, uint32_t topK,
+    uint32_t depth, uint32_t numInt32PerRow, void*)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher) return false;
+
+    VulkanResult r = backend->mDispatcher->dispatchTreeSpecBuild(
+        parentListUvec2, selectedIndexUvec2, treeMask, positions, retrieveIndex,
+        retrieveNextToken, retrieveNextSibling, batchSize, draftTokenNum, topK, depth,
+        numInt32PerRow);
+    if (r != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("TreeSpecBuild launch failed: ") +
+                              VulkanContext::getErrorString(r);
+        return false;
+    }
+    return true;
+}
+
+bool VulkanBackend::launchTreeSpecGreedyVerify(
+    void* acceptIndex, void* acceptTokenNum, void* acceptToken,
+    void* candidates, void* retrievePacked, void* targetPredict,
+    void* treeValid,
+    uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens, void*)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher) return false;
+
+    VulkanResult r = backend->mDispatcher->dispatchTreeSpecGreedyVerify(
+        acceptIndex, acceptTokenNum, acceptToken, candidates, retrievePacked,
+        targetPredict, treeValid, batchSize, numSpeculativeTokens, numDraftTokens);
+    if (r != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("TreeSpecGreedyVerify launch failed: ") +
+                              VulkanContext::getErrorString(r);
+        return false;
+    }
+    return true;
+}
+
+bool VulkanBackend::launchTreeSpecRejection(
+    void* acceptIndex, void* acceptTokenNum, void* acceptToken, void* draftTokens,
+    void* targetProbs, void* retrieveNextToken, void* retrieveNextSibling,
+    void* treeValid, void* rngSamples,
+    uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens,
+    uint32_t vocabSize, uint32_t kMaxTriedPerLevel, void*)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+        return false;
+
+    VulkanResult r = backend->mDispatcher->dispatchTreeSpecRejection(
+        acceptIndex, acceptTokenNum, acceptToken, draftTokens, targetProbs,
+        retrieveNextToken, retrieveNextSibling, treeValid, rngSamples,
+        batchSize, numSpeculativeTokens, numDraftTokens, vocabSize, kMaxTriedPerLevel);
+    if (r != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("TreeSpecRejection launch failed: ") +
+                              VulkanContext::getErrorString(r);
+        return false;
+    }
+    return true;
+}
+
+bool VulkanBackend::launchKVCacheUpdate2D(void* kvCacheK, void* kvCacheV,
+    void* acceptedDraftTokensIndices2D, void* numAcceptedTokens,
+    void* pastKeyValueLengths, void* rewindDraftTokenSeparateAdjustments,
+    void* seqSlotRemapping,
+    uint32_t batchSize, uint32_t numKVHeads, uint32_t maxKVCacheLen,
+    uint32_t headDim, uint32_t maxDraftLen, int32_t rewindDraftTokenCommonCount,
+    uint32_t layerCount, void*)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+        return false;
+
+    VulkanResult r = backend->mDispatcher->dispatchKVCacheUpdate2D(
+        kvCacheK, kvCacheV, acceptedDraftTokensIndices2D, numAcceptedTokens,
+        pastKeyValueLengths, rewindDraftTokenSeparateAdjustments, seqSlotRemapping,
+        batchSize, numKVHeads, maxKVCacheLen, headDim, maxDraftLen,
+        rewindDraftTokenCommonCount, layerCount);
+    if (r != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("KVCacheUpdate2D launch failed: ") +
+                              VulkanContext::getErrorString(r);
+        return false;
+    }
+    return true;
+}
+
 bool VulkanBackend::launchMlaFmha(void* q, void* kv, void* pageTable, void* cacheSeqs,
                                   void* output,
                                   uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,

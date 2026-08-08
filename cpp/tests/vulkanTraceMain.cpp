@@ -1237,6 +1237,906 @@ bool test_topk()
     return allCorrect;
 }
 
+bool test_spec_decode_accept()
+{
+    TRACE_TEST("Spec-Decode Acceptance Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t B         = 2;
+    const uint32_t draftLen  = 4;
+    const uint32_t V         = 8;
+    const uint32_t posCount  = draftLen + 1u;
+    const float    temperature = 1.0f;
+    const float    acceptProbFloor = 1.0f; // sqrt(negLogAccept) — no floor effect
+
+    // ---- Deterministic host data (seed=99) ----
+    std::minstd_rand rng(99);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    // targetLogits: all draftLen+1 positions valid. b0 fully accepted path,
+    // b1 rejects at position 1.
+    std::vector<float> hostTarget(B * posCount * V);
+    std::vector<float> hostDraft(B * posCount * V);
+    std::vector<float> hostUniform(B * draftLen, 0.0f);
+    std::vector<int32_t> hostDraftTokens(B * posCount);
+    // draft tokens chosen from vocab (0..V-1)
+    for (uint32_t b = 0; b < B; ++b)
+        for (uint32_t p = 0; p < posCount; ++p)
+            hostDraftTokens[b * posCount + p] = static_cast<int32_t>((b + p) % V);
+
+    // b0: target >> draft at every position => ratios huge => uniform < 1 => accept all
+    // b1: position 0 accept, position 1 draft prob >> target prob => ratio tiny => reject
+    for (uint32_t i = 0; i < hostTarget.size(); ++i) hostTarget[i] = 1.0f;
+    for (uint32_t i = 0; i < hostDraft.size(); ++i)  hostDraft[i]  = 1.0f;
+    for (uint32_t b = 0; b < B; ++b)
+        for (uint32_t t = 0; t < draftLen; ++t)
+            hostUniform[b * draftLen + t] = 0.5f; // middle of [0,1)
+
+    // b0: make ratios large everywhere (1.0 each). b1: at t=1, make target tiny => reject.
+    hostUniform[1 * draftLen + 1] = 0.01f; // b1 rejects at pos 1 regardless
+    // Force b1 to reject at t=1: set target logit at the draft token low, draft high.
+    {
+        uint32_t pos = 1;
+        int32_t tok = hostDraftTokens[1 * posCount + pos];
+        uint32_t row = 1 * posCount * V + pos * V;
+        hostTarget[row + tok] = -20.0f;  // tiny target prob => ratio ~0 => reject
+        hostDraft[row + tok]  =  20.0f; // large draft prob
+    }
+
+    const size_t logitsBytes   = B * posCount * V * sizeof(float);
+    const size_t uniformBytes  = B * draftLen * sizeof(float);
+    const size_t tokensBytes   = B * posCount * sizeof(int32_t);
+    const size_t countBytes    = B * sizeof(uint32_t);
+    const size_t acceptOutBytes= B * posCount * sizeof(int32_t);
+    const size_t resampleBytes = B * V * sizeof(float);
+
+    void* targetDev  = VulkanBackend::malloc(logitsBytes);
+    void* draftDev   = VulkanBackend::malloc(logitsBytes);
+    void* uniDev     = VulkanBackend::malloc(uniformBytes);
+    void* tokDev     = VulkanBackend::malloc(tokensBytes);
+    void* cntDev     = VulkanBackend::malloc(countBytes);
+    void* accDev     = VulkanBackend::malloc(acceptOutBytes);
+    void* resDev     = VulkanBackend::malloc(resampleBytes);
+    if (!targetDev || !draftDev || !uniDev || !tokDev || !cntDev || !accDev || !resDev)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        for (void* p : {targetDev,draftDev,uniDev,tokDev,cntDev,accDev,resDev})
+            if (p) VulkanBackend::free(p);
+        return false;
+    }
+
+    if (!VulkanBackend::memcpyHostToDevice(targetDev,  hostTarget.data(), logitsBytes) ||
+        !VulkanBackend::memcpyHostToDevice(draftDev,   hostDraft.data(),  logitsBytes) ||
+        !VulkanBackend::memcpyHostToDevice(uniDev,     hostUniform.data(), uniformBytes) ||
+        !VulkanBackend::memcpyHostToDevice(tokDev,     hostDraftTokens.data(), tokensBytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(targetDev); VulkanBackend::free(draftDev);
+        VulkanBackend::free(uniDev); VulkanBackend::free(tokDev); VulkanBackend::free(cntDev);
+        VulkanBackend::free(accDev); VulkanBackend::free(resDev);
+        return false;
+    }
+
+    if (!VulkanBackend::launchSpecDecodeAccept(
+            targetDev, draftDev, uniDev, tokDev, cntDev, accDev, resDev,
+            B, draftLen, V, temperature, acceptProbFloor))
+    {
+        TRACE_FAIL(std::string("SpecDecodeAccept launch failed: ") + backend->getLastError());
+        VulkanBackend::free(targetDev); VulkanBackend::free(draftDev);
+        VulkanBackend::free(uniDev); VulkanBackend::free(tokDev); VulkanBackend::free(cntDev);
+        VulkanBackend::free(accDev); VulkanBackend::free(resDev);
+        return false;
+    }
+
+    std::vector<uint32_t> hostCnt(B, 0u);
+    std::vector<int32_t> hostAcc(B * posCount, -123);
+    std::vector<float> hostRes(B * V, -999.0f);
+    VulkanBackend::memcpyDeviceToHost(hostCnt.data(), cntDev, countBytes);
+    VulkanBackend::memcpyDeviceToHost(hostAcc.data(), accDev, acceptOutBytes);
+    VulkanBackend::memcpyDeviceToHost(hostRes.data(), resDev, resampleBytes);
+
+    // ---- CPU reference ----
+    auto logSoft = [](float const* row, int tok, uint32_t V) {
+        float mx = -1e30f;
+        for (uint32_t i = 0; i < V; ++i) if (row[i] > mx) mx = row[i];
+        float s = 0;
+        for (uint32_t i = 0; i < V; ++i) s += expf(row[i] - mx);
+        return row[tok] - mx - logf(s);
+    };
+
+    bool allCorrect = true;
+    for (uint32_t b = 0; b < B && allCorrect; ++b)
+    {
+        uint32_t accepted = 0u;
+        bool rejected = false;
+        for (uint32_t t = 0; t < draftLen; ++t)
+        {
+            if (rejected) break;
+            int32_t tok = hostDraftTokens[b * posCount + t];
+            float const* tr = &hostTarget[b * posCount * V + t * V];
+            float const* dr = &hostDraft[b * posCount * V + t * V];
+            float ratio = expf(logSoft(tr, tok, V) - logSoft(dr, tok, V));
+            if (ratio > 1.0f) ratio = 1.0f;
+            if (hostUniform[b * draftLen + t] < ratio)
+            {
+                if (hostAcc[b * posCount + accepted] != tok) { allCorrect = false; break; }
+                ++accepted;
+            }
+            else
+            {
+                rejected = true;
+            }
+        }
+
+        if (hostCnt[b] != accepted) { allCorrect = false; std::cout << "accCount mismatch b=" << b << std::endl; }
+
+        if (!rejected && accepted == draftLen)
+        {
+            // bonus token path
+            int32_t refBonus = hostDraftTokens[b * posCount + draftLen];
+            if (hostAcc[b * posCount + accepted] != refBonus) { allCorrect = false; std::cout << "bonus mismatch b=" << b << std::endl; }
+            for (uint32_t i = 0; i < V; ++i) if (hostRes[b * V + i] != 0.0f) { allCorrect = false; std::cout << "resample nonzero b=" << b << std::endl; }
+        }
+        else
+        {
+            // resample path: verify distribution sums to ~1 and is non-negative
+            float sum = 0;
+            for (uint32_t i = 0; i < V; ++i) { if (hostRes[b * V + i] < 0.0f) { allCorrect = false; std::cout << "neg prob b=" << b << std::endl; } sum += hostRes[b * V + i]; }
+            if (fabs(sum - 1.0f) > 1e-4f) { allCorrect = false; std::cout << "dist sum=" << sum << " b=" << b << std::endl; }
+            float const* tgtRow = &hostTarget[b * posCount * V + accepted * V];
+            float mx = -1e30f;
+            for (uint32_t i = 0; i < V; ++i) if (tgtRow[i] > mx) mx = tgtRow[i];
+            float s = 0;
+            for (uint32_t i = 0; i < V; ++i) s += expf(tgtRow[i] - mx);
+            // spot check a known index
+            // (no exact token check here — caller samples rng)
+        }
+    }
+
+    VulkanBackend::free(targetDev); VulkanBackend::free(draftDev);
+    VulkanBackend::free(uniDev); VulkanBackend::free(tokDev); VulkanBackend::free(cntDev);
+    VulkanBackend::free(accDev); VulkanBackend::free(resDev);
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect spec-decode acceptance results");
+    }
+    else
+    {
+        std::cout << "      Result verified: acceptance matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+
+    return allCorrect;
+}
+
+bool test_tree_spec_decode()
+{
+    TRACE_TEST("Tree Spec-Decode Build + Greedy Verify Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    // ---- Deterministic small problem (mirrors dynamicTreeKernels test vectors) ----
+    // Tree: depth=3, topK=2 → parentList has topK*(depth-1)+1 = 5 entries per batch.
+    const uint32_t B = 2;
+    const uint32_t dT = 4;          // draftTokenNum (tokens incl root)
+    const uint32_t topK = 2;
+    const uint32_t depth = 3;
+    const uint32_t numSpec = 3;     // numSpeculativeTokens
+    const uint32_t numInt32PerRow = (dT + 31u) / 32u; // padded to 32-bool rows → 1 uint32
+
+    // parentList [B, 5] int64 → packed as uvec2 {lo,hi}
+    // selectedIndex [B, dT-1=3] int64 → packed uvec2
+    // We construct a valid tree:
+    //   b=0: tokens [0(root),1,2,3], parents: t1←root(0), t2←t1, t3←t1
+    //     selectedIndex = [0,1,1]  (parentTbIdx = sel/topK)
+    //     parentList = [0, 1, 1, 2, 3]  (parent token id per parentIdx)
+    //   b=1: valid tree, token 3 has no parent (invalid → greedy falls through)
+    std::vector<int64_t> hostParent(B * (topK * (depth - 1) + 1));
+    std::vector<int64_t> hostSel(B * (dT - 1));
+    // b=0: root=0; child1 parent=root(0), child2 parent=child1(1), child3 parent=child1(1)
+    hostParent[0] = 0; hostParent[1] = 1; hostParent[2] = 1; hostParent[3] = 2; hostParent[4] = 3;
+    hostSel[0] = 0; hostSel[1] = 1; hostSel[2] = 1;  // b0
+    // b=1: valid chain 0→1→2→3
+    hostParent[5] = 0; hostParent[6] = 1; hostParent[7] = 2; hostParent[8] = 2; hostParent[9] = 3;
+    hostSel[3] = 0; hostSel[4] = 1; hostSel[5] = 2;  // b1: sel/topK = [0,0,1] → parents 0,0,1
+
+    // Pack int64 → uvec2 host buffer
+    const size_t parentUvec2Bytes = B * (topK * (depth - 1) + 1) * 2 * sizeof(uint32_t);
+    const size_t selUvec2Bytes    = B * (dT - 1) * 2 * sizeof(uint32_t);
+    std::vector<uint32_t> hostParentUvec2(B * (topK * (depth - 1) + 1) * 2);
+    std::vector<uint32_t> hostSelUvec2(B * (dT - 1) * 2);
+    for (size_t i = 0; i < hostParent.size(); ++i)
+    {
+        hostParentUvec2[i*2] = uint32_t(hostParent[i] & 0xFFFFFFFF);
+        hostParentUvec2[i*2+1] = uint32_t((hostParent[i] >> 32) & 0xFFFFFFFF);
+    }
+    for (size_t i = 0; i < hostSel.size(); ++i)
+    {
+        hostSelUvec2[i*2] = uint32_t(hostSel[i] & 0xFFFFFFFF);
+        hostSelUvec2[i*2+1] = uint32_t((hostSel[i] >> 32) & 0xFFFFFFFF);
+    }
+
+    // Output buffers (host-side references computed after launch)
+    const size_t treeBytes = B * dT * numInt32PerRow * sizeof(uint32_t);
+    const size_t arrBytes  = B * dT * sizeof(int32_t);
+    const size_t treeValidBytes = B * sizeof(int32_t);
+    const size_t idxBytes  = B * numSpec * sizeof(int32_t);
+    const size_t tokBytes  = B * numSpec * sizeof(int32_t);
+    const size_t candBytes = B * dT * sizeof(int32_t);
+    const size_t retBytes  = B * dT * 3u * sizeof(int32_t);
+    const size_t tgtBytes  = B * dT * sizeof(int32_t);
+
+    void* parentDev   = VulkanBackend::malloc(parentUvec2Bytes);
+    void* selDev      = VulkanBackend::malloc(selUvec2Bytes);
+    void* treeDev     = VulkanBackend::malloc(treeBytes);
+    void* posDev      = VulkanBackend::malloc(arrBytes);
+    void* retIdxDev   = VulkanBackend::malloc(arrBytes);
+    void* nextTokDev  = VulkanBackend::malloc(arrBytes);
+    void* nextSibDev  = VulkanBackend::malloc(arrBytes);
+    void* acceptIdxDev = VulkanBackend::malloc(idxBytes);
+    void* acceptNumDev = VulkanBackend::malloc(B * sizeof(uint32_t));
+    void* acceptTokDev = VulkanBackend::malloc(tokBytes);
+    void* candDev     = VulkanBackend::malloc(candBytes);
+    void* retPackDev  = VulkanBackend::malloc(retBytes);
+    void* tgtDev      = VulkanBackend::malloc(tgtBytes);
+    void* validDev    = VulkanBackend::malloc(treeValidBytes);
+    if (!parentDev || !selDev || !treeDev || !posDev || !retIdxDev || !nextTokDev || !nextSibDev ||
+        !acceptIdxDev || !acceptNumDev || !acceptTokDev || !candDev || !retPackDev || !tgtDev || !validDev)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        for (void* p : {parentDev,selDev,treeDev,posDev,retIdxDev,nextTokDev,nextSibDev,
+                        acceptIdxDev,acceptNumDev,acceptTokDev,candDev,retPackDev,tgtDev,validDev})
+            if (p) VulkanBackend::free(p);
+        return false;
+    }
+
+    // Host candidate token ids and target predictions
+    std::vector<int32_t> hostCand(B * dT);
+    std::vector<int32_t> hostTgt(B * dT);
+    // b0: tokens [0,1,2,3] ; target picks token 2 (matches draft) at pos1, then 3
+    hostCand[0]=0; hostCand[1]=1; hostCand[2]=2; hostCand[3]=3;
+    hostTgt[0]=0; hostTgt[1]=2; hostTgt[2]=2; hostTgt[3]=3;
+    // b1: tokens [0,1,2,3] ; target picks 3 (no draft match) at pos1 → reject
+    hostCand[4]=0; hostCand[5]=1; hostCand[6]=2; hostCand[7]=3;
+    hostTgt[4]=0; hostTgt[5]=3; hostTgt[6]=3; hostTgt[7]=3;
+
+    std::vector<int32_t> hostValid(B, 1);  // both valid trees
+
+    // Clear output buffers to sentinel
+    std::vector<uint32_t> hostTree(B * dT * numInt32PerRow, 0xFFFFFFFFu);
+    std::vector<int32_t> hostPos(B * dT, -99);
+    std::vector<int32_t> hostRetIdx(B * dT, -99);
+    std::vector<int32_t> hostNextTok(B * dT, -99);
+    std::vector<int32_t> hostNextSib(B * dT, -99);
+    VulkanBackend::memcpyHostToDevice(treeDev, hostTree.data(), treeBytes);
+    VulkanBackend::memcpyHostToDevice(posDev, hostPos.data(), arrBytes);
+    VulkanBackend::memcpyHostToDevice(retIdxDev, hostRetIdx.data(), arrBytes);
+    VulkanBackend::memcpyHostToDevice(nextTokDev, hostNextTok.data(), arrBytes);
+    VulkanBackend::memcpyHostToDevice(nextSibDev, hostNextSib.data(), arrBytes);
+
+    // Upload read-only inputs
+    VulkanBackend::memcpyHostToDevice(parentDev, hostParentUvec2.data(), parentUvec2Bytes);
+    VulkanBackend::memcpyHostToDevice(selDev, hostSelUvec2.data(), selUvec2Bytes);
+    VulkanBackend::memcpyHostToDevice(candDev, hostCand.data(), candBytes);
+    VulkanBackend::memcpyHostToDevice(tgtDev, hostTgt.data(), tgtBytes);
+    VulkanBackend::memcpyHostToDevice(validDev, hostValid.data(), treeValidBytes);
+
+    // ---- Build ----
+    if (!VulkanBackend::launchTreeSpecBuild(parentDev, selDev, treeDev, posDev, retIdxDev,
+                                             nextTokDev, nextSibDev, B, dT, topK, depth, numInt32PerRow))
+    {
+        TRACE_FAIL(std::string("TreeSpecBuild launch failed: ") + backend->getLastError());
+        for (void* p : {parentDev,selDev,treeDev,posDev,retIdxDev,nextTokDev,nextSibDev,
+                        acceptIdxDev,acceptNumDev,acceptTokDev,candDev,retPackDev,tgtDev,validDev})
+            VulkanBackend::free(p);
+        return false;
+    }
+    // ---- Retrieve build outputs + pack retrievePacked [B, dT, 3] ----
+    std::vector<uint32_t> hostTreeBack(B * dT * numInt32PerRow);
+    std::vector<int32_t> hostPosBack(B * dT);
+    std::vector<int32_t> hostRetIdxBack(B * dT);
+    std::vector<int32_t> hostNextTokBack(B * dT);
+    std::vector<int32_t> hostNextSibBack(B * dT);
+    VulkanBackend::memcpyDeviceToHost(hostTreeBack.data(), treeDev, treeBytes);
+    VulkanBackend::memcpyDeviceToHost(hostPosBack.data(), posDev, arrBytes);
+    VulkanBackend::memcpyDeviceToHost(hostRetIdxBack.data(), retIdxDev, arrBytes);
+    VulkanBackend::memcpyDeviceToHost(hostNextTokBack.data(), nextTokDev, arrBytes);
+    VulkanBackend::memcpyDeviceToHost(hostNextSibBack.data(), nextSibDev, arrBytes);
+
+    // Build retrievePacked host-side from the three arrays
+    std::vector<int32_t> hostRetPack(B * dT * 3);
+    for (uint32_t b = 0; b < B; ++b)
+        for (uint32_t n = 0; n < dT; ++n)
+        {
+            hostRetPack[(b*dT+n)*3 + 0] = hostRetIdxBack[b*dT+n];
+            hostRetPack[(b*dT+n)*3 + 1] = hostNextTokBack[b*dT+n];
+            hostRetPack[(b*dT+n)*3 + 2] = hostNextSibBack[b*dT+n];
+        }
+    VulkanBackend::memcpyHostToDevice(retPackDev, hostRetPack.data(), retBytes);
+
+    // ---- Greedy verify ----
+    if (!VulkanBackend::launchTreeSpecGreedyVerify(acceptIdxDev, acceptNumDev, acceptTokDev,
+                                                   candDev, retPackDev, tgtDev, validDev,
+                                                   B, numSpec, dT))
+    {
+        TRACE_FAIL(std::string("TreeSpecGreedyVerify launch failed: ") + backend->getLastError());
+        for (void* p : {parentDev,selDev,treeDev,posDev,retIdxDev,nextTokDev,nextSibDev,
+                        acceptIdxDev,acceptNumDev,acceptTokDev,candDev,retPackDev,tgtDev,validDev})
+            VulkanBackend::free(p);
+        return false;
+    }
+
+    std::vector<int32_t> hostAcceptIdx(B * numSpec, -123);
+    std::vector<uint32_t> hostAcceptNum(B, 0u);
+    std::vector<int32_t> hostAcceptTok(B * numSpec, -123);
+    VulkanBackend::memcpyDeviceToHost(hostAcceptIdx.data(), acceptIdxDev, idxBytes);
+    VulkanBackend::memcpyDeviceToHost(hostAcceptNum.data(), acceptNumDev, B * sizeof(uint32_t));
+    VulkanBackend::memcpyDeviceToHost(hostAcceptTok.data(), acceptTokDev, tokBytes);
+
+    backend->deviceSynchronize();
+    bool allCorrect = true;
+    for (uint32_t b = 0; b < B && allCorrect; ++b)
+    {
+        int32_t const* row = hostRetPack.data() + b * dT * 3;
+        if (hostValid[b] == 0)
+        {
+            if (hostAcceptNum[b] != 0u) allCorrect = false;
+            if (hostAcceptIdx[b * numSpec] != 0) allCorrect = false;
+            if (hostAcceptTok[b * numSpec] != hostTgt[b * dT]) allCorrect = false;
+            continue;
+        }
+
+        int32_t lastAccepted = row[0];
+        uint32_t nAcc = 0u;
+        int curIndex = 0;
+        int32_t expTok0 = hostTgt[b * dT + uint32_t(lastAccepted)];
+        if (hostAcceptTok[b * numSpec] != expTok0) { allCorrect = false; std::cout << "b" << b << " tok0 mismatch" << std::endl; }
+        if (hostAcceptIdx[b * numSpec] != lastAccepted) { allCorrect = false; }
+
+        for (uint32_t j = 1; j < numSpec; ++j)
+        {
+            curIndex = row[uint32_t(curIndex) * 3 + 1];
+            bool matched = false;
+            while (curIndex >= 0 && uint32_t(curIndex) < dT)
+            {
+                int draftLocalIdx = row[uint32_t(curIndex) * 3 + 0];
+                int draftTok = hostCand[b * dT + uint32_t(curIndex)];
+                int targetTok = hostTgt[b * dT + uint32_t(lastAccepted)];
+                if (draftTok == targetTok)
+                {
+                    ++nAcc;
+                    if (hostAcceptIdx[b * numSpec + nAcc] != draftLocalIdx) allCorrect = false;
+                    if (hostAcceptTok[b * numSpec + nAcc] != hostTgt[b * dT + uint32_t(draftLocalIdx)]) allCorrect = false;
+                    lastAccepted = draftLocalIdx;
+                    matched = true;
+                    break;
+                }
+                curIndex = row[uint32_t(curIndex) * 3 + 2];
+            }
+            if (!matched || curIndex < 0 || uint32_t(curIndex) >= dT) break;
+        }
+        if (hostAcceptNum[b] != nAcc) { allCorrect = false; std::cout << "b" << b << " nAcc mismatch " << hostAcceptNum[b] << "!=" << nAcc << std::endl; }
+    }
+
+    // Sanity-check treeMask bit-setting (root bit must be set for both rows)
+    for (uint32_t b = 0; b < B && allCorrect; ++b)
+    {
+        bool rootBit = (hostTreeBack[b * dT * numInt32PerRow + 0] & 1u) != 0u;
+        if (!rootBit) { allCorrect = false; std::cout << "b" << b << " root bit unset" << std::endl; }
+    }
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect tree spec-decode results");
+    }
+    else
+    {
+        std::cout << "      Result verified: tree spec build + greedy verify match CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+    return allCorrect;
+}
+
+bool test_tree_spec_rejection()
+{
+    TRACE_TEST("Tree Spec-Decode Rejection Sampler Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t B = 2;
+    const uint32_t dT = 4;
+    const uint32_t V = 8;
+    const uint32_t J = 3;            // numSpeculativeTokens
+    const uint32_t kMaxTried = 32u;
+    // One 256-thread WG per batch row.
+
+    // Flat tree under root: all children have sel < topK → parentTbIdx=0 (root).
+    // With topK=3, sel values 0,1,2 all give parentTbIdx=0, producing a clean
+    // sibling chain root→child1→child2→child3 via links.
+    const uint32_t topK = 3;
+    const uint32_t depth = 3;
+    const uint32_t numInt32PerRow = (dT + 31u) / 32u; // 1 uint32 for dT<=32
+    // b0: root(0) → child1(1 parent=root), child2(2 parent=root), child3(3 parent=child1)
+    //   selectedIndex = [0, 0, 1]  → parentTbIdx per child = sel/topK = [0,0,0] but
+    //   child at pos1 has parent=root, child at pos2 has parent=root, child at pos3 parent=child1.
+    // We craft so greedy WOULD accept child1 (matches target), but force rejection path
+    // by setting rngSamples high enough to reject all siblings → correction sample.
+    std::vector<int64_t> hostParent(B * (topK * (depth - 1) + 1));
+    std::vector<int64_t> hostSel(B * (dT - 1));
+    // b0: parentList indices into token list
+    // parentTokenIdx for child1=0 (root), child2=0(root), child3=1(child1)
+    // selectedIndex: child1 sel=0, child2 sel=1, child3 sel=2 → parentTbIdx=sel/topK
+    // We want parentTbIdx>0 for non-root children.
+    // FLAT tree under root: root(0) with children 1,2,3 (all parentTbIdx=0).
+    // This gives a clean sibling chain root→child1→child2→child3 via links.
+    // sel values all < topK so parentTbIdx=sel/topK=0 (root) for every child.
+    hostParent[0]=0; hostParent[1]=1; hostParent[2]=2; hostParent[3]=0; hostParent[4]=0;
+    hostSel[0]=0; hostSel[1]=1; hostSel[2]=2;   // b0: all parentTbIdx=0 (root)
+    hostParent[5]=0; hostParent[6]=1; hostParent[7]=2; hostParent[8]=0; hostParent[9]=0;
+    hostSel[3]=0; hostSel[4]=1; hostSel[5]=2;  // b1: same
+
+    // draft tokens: [root=0, child1=1, child2=2, child3=3]
+    std::vector<int32_t> hostDraftTok(B * dT);
+    for (uint32_t b = 0; b < B; ++b)
+        for (uint32_t t = 0; t < dT; ++t)
+            hostDraftTok[b * dT + t] = int32_t(t);
+
+    // targetProbs [B, dT, V]:
+    // b0: root(pos0)=tok0 only; child1 draft=1 gets prob 0 → REJECT → correction
+    //     correction from root probs: mass on tok0, scaledCoin=0.95 → winner=0
+    // b1: root(pos0)=tok1 only; child1 draft=1 gets prob 1.0 → coin(0.01)≤1.0 → ACCEPT child1
+    //     then continue; for simplicity we expect b1 to hit bonus or max-depth.
+    std::vector<float> hostTP(B * dT * V, 0.0f);
+    for (uint32_t v = 0; v < V; ++v) hostTP[(0 * dT + 0) * V + v] = (v == 0) ? 1.0f : 0.0f;
+    for (uint32_t v = 0; v < V; ++v) hostTP[(1 * dT + 0) * V + v] = (v == 1) ? 1.0f : 0.0f;
+    for (uint32_t t = 1; t < dT; ++t)
+        for (uint32_t v = 0; v < V; ++v)
+        {
+            hostTP[(0 * dT + t) * V + v] = 1.0f / float(V);
+            hostTP[(1 * dT + t) * V + v] = 1.0f / float(V);
+        }
+
+    // b0 coin high (reject), b1 coin low (accept)
+    std::vector<float> hostRng(B, 0.0f);
+    hostRng[0] = 0.95f;
+    hostRng[1] = 0.01f;
+
+    // retrieveNextToken / retrieveNextSibling [B, dT] — will be set by build kernel,
+    // but rejection sampler reads them directly as input. So we must build the tree
+    // first (reuse tree_spec_build), then feed its outputs here.
+    // Allocate build-side buffers
+    std::vector<uint32_t> hostParentUvec2(B * (topK*(depth-1)+1) * 2);
+    std::vector<uint32_t> hostSelUvec2(B * (dT - 1) * 2);
+    for (size_t i = 0; i < hostParent.size(); ++i) { hostParentUvec2[i*2]=uint32_t(hostParent[i]&0xFFFFFFFF); hostParentUvec2[i*2+1]=uint32_t((hostParent[i]>>32)&0xFFFFFFFF); }
+    for (size_t i = 0; i < hostSel.size(); ++i)    { hostSelUvec2[i*2]=uint32_t(hostSel[i]&0xFFFFFFFF);    hostSelUvec2[i*2+1]=uint32_t((hostSel[i]>>32)&0xFFFFFFFF); }
+
+    std::vector<int32_t> hostTree(B * dT * numInt32PerRow, -1);
+    std::vector<int32_t> hostPos(B * dT, -99), hostRetIdx(B * dT, -99),
+                         hostNextTok(B * dT, -1), hostNextSib(B * dT, -1);
+
+    size_t parentBytes = hostParentUvec2.size()*sizeof(uint32_t);
+    size_t selBytes    = hostSelUvec2.size()*sizeof(uint32_t);
+    size_t treeBytes   = hostTree.size()*sizeof(uint32_t);
+    size_t arrBytes    = B*dT*sizeof(int32_t);
+    size_t tpBytes     = B*dT*V*sizeof(float);
+    size_t valBytes    = B*sizeof(uint32_t); // acceptTokenNum uint
+    size_t idxBytes    = B*J*2*sizeof(uint32_t); // uvec2
+    size_t tokBytes    = idxBytes;
+    size_t candBytes   = B*(dT-1)*sizeof(int32_t);
+    size_t rngBytes    = B*sizeof(float);
+
+    void* parentDev   = VulkanBackend::malloc(parentBytes);
+    void* selDev      = VulkanBackend::malloc(selBytes);
+    void* treeDev     = VulkanBackend::malloc(treeBytes);
+    void* posDev      = VulkanBackend::malloc(arrBytes);
+    void* retIdxDev   = VulkanBackend::malloc(arrBytes);
+    void* nextTokDev  = VulkanBackend::malloc(arrBytes);
+    void* nextSibDev  = VulkanBackend::malloc(arrBytes);
+    void* accIdxDev   = VulkanBackend::malloc(idxBytes);
+    void* accNumDev   = VulkanBackend::malloc(valBytes);
+    void* accTokDev   = VulkanBackend::malloc(tokBytes);
+    void* candDev     = VulkanBackend::malloc(candBytes);
+    void* tpDev       = VulkanBackend::malloc(tpBytes);
+    void* validDev    = VulkanBackend::malloc(B*sizeof(int32_t));
+    void* rngDev      = VulkanBackend::malloc(rngBytes);
+    if (!parentDev||!selDev||!treeDev||!posDev||!retIdxDev||!nextTokDev||!nextSibDev||
+        !accIdxDev||!accNumDev||!accTokDev||!candDev||!tpDev||!validDev||!rngDev)
+    {
+        TRACE_FAIL("Allocation failed");
+        for (void* p:{parentDev,selDev,treeDev,posDev,retIdxDev,nextTokDev,nextSibDev,
+                      accIdxDev,accNumDev,accTokDev,candDev,tpDev,validDev,rngDev})
+            if(p) VulkanBackend::free(p);
+        return false;
+    }
+
+    VulkanBackend::memcpyHostToDevice(parentDev, hostParentUvec2.data(), parentBytes);
+    VulkanBackend::memcpyHostToDevice(selDev, hostSelUvec2.data(), selBytes);
+    VulkanBackend::memcpyHostToDevice(treeDev, hostTree.data(), treeBytes);
+    VulkanBackend::memcpyHostToDevice(posDev, hostPos.data(), arrBytes);
+    VulkanBackend::memcpyHostToDevice(retIdxDev, hostRetIdx.data(), arrBytes);
+    VulkanBackend::memcpyHostToDevice(nextTokDev, hostNextTok.data(), arrBytes);
+    VulkanBackend::memcpyHostToDevice(nextSibDev, hostNextSib.data(), arrBytes);
+    // Pack candidate draft tokens per-batch, skipping the root slot (index 0 per batch).
+    // The device shader indexes draftTokens[bx*(dT-1) + (childIdx-1)], so we need
+    // per-batch contiguous children — a flat hostDraftTok+1 copy misaligns b1's data.
+    std::vector<int32_t> hostCandPacked(B * (dT - 1));
+    for (uint32_t b = 0; b < B; ++b)
+        for (uint32_t t = 1; t < dT; ++t)
+            hostCandPacked[b * (dT - 1) + (t - 1)] = hostDraftTok[b * dT + t];
+    VulkanBackend::memcpyHostToDevice(candDev, hostCandPacked.data(), candBytes); // skip root slot
+    VulkanBackend::memcpyHostToDevice(tpDev, hostTP.data(), tpBytes);
+    std::vector<int32_t> hostValid(B,1);
+    VulkanBackend::memcpyHostToDevice(validDev, hostValid.data(), B*sizeof(int32_t));
+    VulkanBackend::memcpyHostToDevice(rngDev, hostRng.data(), rngBytes);
+
+    // ---- Step 1: build tree ----
+    if (!VulkanBackend::launchTreeSpecBuild(parentDev, selDev, treeDev, posDev, retIdxDev,
+                                             nextTokDev, nextSibDev, B, dT, topK, depth, numInt32PerRow))
+    {
+        TRACE_FAIL(std::string("TreeSpecBuild failed: ") + backend->getLastError());
+        for (void* p:{parentDev,selDev,treeDev,posDev,retIdxDev,nextTokDev,nextSibDev,
+                      accIdxDev,accNumDev,accTokDev,candDev,tpDev,validDev,rngDev})
+            VulkanBackend::free(p);
+        return false;
+    }
+
+    // retrievePacked = interleave(retIdx, nextTok, nextSib) [B, dT, 3]
+    std::vector<int32_t> hostRetIdxB(B*dT), hostNextTokB(B*dT), hostNextSibB(B*dT), hostRetPack(B*dT*3);
+    VulkanBackend::memcpyDeviceToHost(hostRetIdxB.data(), retIdxDev, arrBytes);
+    VulkanBackend::memcpyDeviceToHost(hostNextTokB.data(), nextTokDev, arrBytes);
+    VulkanBackend::memcpyDeviceToHost(hostNextSibB.data(), nextSibDev, arrBytes);
+    for (uint32_t b=0;b<B;++b) for (uint32_t n=0;n<dT;++n) {
+        hostRetPack[(b*dT+n)*3+0]=hostRetIdxB[b*dT+n];
+        hostRetPack[(b*dT+n)*3+1]=hostNextTokB[b*dT+n];
+        hostRetPack[(b*dT+n)*3+2]=hostNextSibB[b*dT+n];
+    }
+
+    // ---- Step 2: rejection sampler ----
+    if (!VulkanBackend::launchTreeSpecRejection(accIdxDev, accNumDev, accTokDev,
+                                                candDev, tpDev, nextTokDev, nextSibDev,
+                                                validDev, rngDev,
+                                                B, J, dT, V, kMaxTried))
+    {
+        TRACE_FAIL(std::string("TreeSpecRejection failed: ") + backend->getLastError());
+        for (void* p:{parentDev,selDev,treeDev,posDev,retIdxDev,nextTokDev,nextSibDev,
+                      accIdxDev,accNumDev,accTokDev,candDev,tpDev,validDev,rngDev})
+            VulkanBackend::free(p);
+        return false;
+    }
+
+    std::vector<uint32_t> hostNum(B,999u);
+    std::vector<uint32_t> hostTokFull(B*J*2, 999u);
+    std::vector<uint32_t> hostIdxFull(B*J*2, 999u);
+    VulkanBackend::memcpyDeviceToHost(hostNum.data(), accNumDev, valBytes);
+    VulkanBackend::memcpyDeviceToHost(hostTokFull.data(), accTokDev, tokBytes);
+    VulkanBackend::memcpyDeviceToHost(hostIdxFull.data(), accIdxDev, idxBytes);
+    for (void* p:{parentDev,selDev,treeDev,posDev,retIdxDev,nextTokDev,nextSibDev,
+                  accIdxDev,accNumDev,accTokDev,candDev,tpDev,validDev,rngDev})
+        VulkanBackend::free(p);
+
+    // ---- CPU reference: emulate verifyDynamicTreeRejectionKernel exactly ----
+    bool allCorrect = true;
+    for (uint32_t b = 0; b < B && allCorrect; ++b)
+    {
+        int32_t const* row = hostRetPack.data() + b * dT * 3;
+        int32_t lastAccepted = row[0];          // retrieveIndex[0]
+        uint32_t nAcc = 0u;
+        int curIndex = 0;
+        int tried[32];
+        uint32_t numTried = 0u;
+
+        // treeValid guard
+        if (hostValid[b] == 0)
+        {
+            // sample from root (not exercised in this test since both valid)
+            continue;
+        }
+
+        for (uint32_t j = 1u; j < J; ++j)
+        {
+            curIndex = row[uint32_t(curIndex) * 3 + 1];  // first child
+            bool matched = false;
+            float probAcc = 0.0f;
+            float coin = hostRng[b];
+            uint32_t tpOffset = (b * dT + uint32_t(lastAccepted)) * V;
+
+            // Walk sibling chain
+            while (curIndex >= 0 && uint32_t(curIndex) < dT)
+            {
+                int draftTok = hostDraftTok[b * dT + uint32_t(curIndex)];
+                float tProb = hostTP[tpOffset + uint32_t(draftTok)];
+                probAcc += tProb;
+                if (coin <= probAcc)
+                {
+                    nAcc++;
+                    // CUDA writes: acceptToken[nAcc_before_inc]=token, nAcc++, acceptIndex[nAcc_after_inc]=childIdx
+                    // Verify acceptIndex at position nAcc (post-increment) matches accepted childIdx
+                    if (uint32_t(curIndex) < dT * 3)
+                    {
+                        int gotIdx = hostIdxFull[(b * J + nAcc) * 2];
+                        if (gotIdx != curIndex)
+                        {
+                            allCorrect = false;
+                            std::cout << "b=" << b << " acceptIndex mismatch at acc=" << nAcc
+                                      << ": got " << gotIdx << " ref " << curIndex << std::endl;
+                        }
+                    }
+                    // accepted this sibling
+                    lastAccepted = draftTok;  // matches CUDA: lastAccepted = draftLocalIdx
+                    matched = true;
+                    break;
+                }
+                else
+                {
+                    if (numTried < 32u) tried[numTried++] = draftTok;
+                    curIndex = row[uint32_t(curIndex) * 3 + 2];  // next sibling
+                }
+            }
+
+            if (matched)
+            {
+                // CPU records acceptance; shader records accTok=tokenId, accIdx=childIdx
+                continue;
+            }
+
+            // All siblings rejected → correction sample from residual
+            if (curIndex < 0 || uint32_t(curIndex) >= dT)
+            {
+                float residual = 1.0f - probAcc;
+                float scaledCoin = coin * residual;
+                float cum = 0.0f;
+                int refWinner = int(V - 1);
+                int lastValid = -1;
+                for (uint32_t v = 0u; v < V; ++v)
+                {
+                    float p = hostTP[tpOffset + v];
+                    // zero out tried
+                    bool inTried = false;
+                    for (uint32_t k = 0u; k < numTried; ++k)
+                        if (uint32_t(tried[k]) == v) { inTried = true; break; }
+                    if (inTried) p = 0.0f;
+                    cum += p;
+                    if (p > 0.0f) lastValid = int(v);
+                    if (scaledCoin < cum) { refWinner = int(v); break; }
+                }
+                if (refWinner == int(V - 1) && lastValid >= 0) refWinner = lastValid;
+                // Shader emits: acceptToken[nAcc] = sampledToken, then terminal.
+                int gotTok = hostTokFull[(b * J + nAcc) * 2];
+                if (gotTok != refWinner)
+                {
+                    allCorrect = false;
+                    std::cout << "b=" << b << " correction token mismatch: got " << gotTok
+                              << " ref " << refWinner << std::endl;
+                }
+                // Terminal: no more accepted tokens
+                break;
+            }
+        }
+
+        // If no correction was hit (all siblings accepted to max depth), shader
+        // emits bonus token. Verify numAccepted matches.
+        if (allCorrect && hostNum[b] != nAcc)
+        {
+            allCorrect = false;
+            std::cout << "b=" << b << " numAcc mismatch: got " << hostNum[b] << " ref " << nAcc << std::endl;
+        }
+    }
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect tree spec rejection results");
+    }
+    else
+    {
+        std::cout << "      Result verified: tree spec rejection matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+    return allCorrect;
+}
+
+// ==================== KV Cache Update (2D) ====================
+// Vulkan port of updateKVCacheDraftTokenLocationBatchedKernel2D
+// (kvCacheUpdateKernels.cu line 140). Compacts accepted draft tokens
+// in the KV cache: copies scattered draft positions to contiguous positions.
+// Validated against a simple CPU reference that performs the same copy.
+bool test_kv_cache_update_2d()
+{
+    TRACE_TEST("KV Cache Update (2D) Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const uint32_t B = 2;       // seqCount
+    const uint32_t H = 2;       // numKVHeads
+    const uint32_t L = 1;       // layerCount
+    const uint32_t D = 8;       // headDim
+    const uint32_t S = 32;      // maxKVCacheLen
+    const uint32_t draftLen = 6; // maxDraftLen
+    const int32_t rewindCommon = 2;
+
+    const size_t headBytes = static_cast<size_t>(S) * D * sizeof(float);
+    const size_t kvBytes = static_cast<size_t>(L) * B * H * S * D * sizeof(float);
+    const size_t accBytes = static_cast<size_t>(B) * draftLen * sizeof(int32_t);
+    const size_t arrBytes = static_cast<size_t>(B) * sizeof(int32_t);
+
+    // acceptedDraftTokensIndices2D: [B, draftLen], -1 padding
+    // b0: accepted tokens at positions [3, 4, 1] (3 accepted, numAccepted=4)
+    // b1: accepted tokens at positions [2, 1] (2 accepted, numAccepted=3)
+    std::vector<int32_t> hostAccepted(B * draftLen, -1);
+    hostAccepted[0 * draftLen + 0] = 3;
+    hostAccepted[0 * draftLen + 1] = 4;
+    hostAccepted[0 * draftLen + 2] = 1;
+    // positions 3,4,5,6 are -1 (padding)
+    hostAccepted[1 * draftLen + 0] = 2;
+    hostAccepted[1 * draftLen + 1] = 1;
+
+    std::vector<int32_t> hostNumAcc(B);
+    hostNumAcc[0] = 4; // 3 accepted draft + 1 bonus = numAcceptedTokens
+    hostNumAcc[1] = 3;
+
+    std::vector<int32_t> hostPastKV(B, 20);  // all sequences have 20 KV tokens
+    std::vector<int32_t> hostRewind(B, -1);  // not used
+    std::vector<int32_t> hostSlotRemap(B, -1); // identity (not used)
+
+    // KV cache: each (seq, head) has S*D floats. Draft tokens are at positions [pastKV, pastKV+draftLen).
+    // We fill with distinct values so we can verify the copy.
+    std::vector<float> hostK(L * B * H * S * D, 0.0f);
+    std::vector<float> hostV(L * B * H * S * D, 0.0f);
+
+    // Fill the KV region with identifiable values.
+    // For each (layer, seq, head, pos, channel): value = layer*1000 + seq*100 + head*10 + pos*1 + channel*0.01
+    for (uint32_t l = 0; l < L; ++l)
+    for (uint32_t s = 0; s < B; ++s)
+    for (uint32_t h = 0; h < H; ++h)
+    for (uint32_t p = 0; p < S; ++p)
+    for (uint32_t c = 0; c < D; ++c)
+    {
+        float val = float(l * 10000 + s * 1000 + h * 100 + p * 10 + c);
+        uint32_t idx = (l * B * H + s * H + h) * S * D + p * D + c;
+        hostK[idx] = val;
+        hostV[idx] = val + 0.5f;
+    }
+
+    // Copy AFTER fill so ref buffers start with the initial (pre-update) state.
+    std::vector<float> hostKRef = hostK;
+    std::vector<float> hostVRef = hostV;
+
+    // Compute expected result: for each accepted draft token, the source position
+    // is pastKV - rewindCommon + acceptedDraftTokensIndices2D[seq, tokenIdx].
+    // The target position is pastKV - rewindCommon + tokenIdx.
+    // Key: load ALL source data first (shared-memory pattern), then store — prevents
+    // read-after-write hazards when source and destination positions overlap.
+    for (uint32_t b = 0; b < B; ++b)
+    {
+        int numAccepted = hostNumAcc[b];
+        int seqDraftCount = numAccepted - 1; // exclude bonus token
+        if (seqDraftCount <= 0) continue;
+
+        int pastKV = hostPastKV[b];
+        int tokenStartIdx = pastKV - rewindCommon;
+        if (tokenStartIdx < 0) continue;
+
+        // Load all source data into temporary buffers
+        std::vector<float> tmpK(seqDraftCount * H * D);
+        std::vector<float> tmpV(seqDraftCount * H * D);
+        for (int tokenIdx = 0; tokenIdx < seqDraftCount; ++tokenIdx)
+        {
+            int srcPos = tokenStartIdx + hostAccepted[b * draftLen + tokenIdx];
+            for (uint32_t h = 0; h < H; ++h)
+            for (uint32_t c = 0; c < D; ++c)
+            {
+                uint32_t srcIdx = (b * H + h) * S * D + uint32_t(srcPos) * D + c;
+                tmpK[(tokenIdx * H + h) * D + c] = hostK[srcIdx];
+                tmpV[(tokenIdx * H + h) * D + c] = hostV[srcIdx];
+            }
+        }
+        // Store from temp to compacted destination positions
+        for (int tokenIdx = 0; tokenIdx < seqDraftCount; ++tokenIdx)
+        {
+            int dstPos = tokenStartIdx + tokenIdx;
+            for (uint32_t h = 0; h < H; ++h)
+            for (uint32_t c = 0; c < D; ++c)
+            {
+                uint32_t dstIdx = (b * H + h) * S * D + uint32_t(dstPos) * D + c;
+                hostKRef[dstIdx] = tmpK[(tokenIdx * H + h) * D + c];
+                hostVRef[dstIdx] = tmpV[(tokenIdx * H + h) * D + c];
+            }
+        }
+    }
+
+    void* kDev = VulkanBackend::malloc(kvBytes);
+    void* vDev = VulkanBackend::malloc(kvBytes);
+    void* accDev = VulkanBackend::malloc(accBytes);
+    void* numAccDev = VulkanBackend::malloc(arrBytes);
+    void* pastKVDev = VulkanBackend::malloc(arrBytes);
+    void* rewindDev = VulkanBackend::malloc(arrBytes);
+    void* slotRemapDev = VulkanBackend::malloc(arrBytes);
+
+    if (!kDev || !vDev || !accDev || !numAccDev || !pastKVDev || !rewindDev || !slotRemapDev)
+    {
+        TRACE_FAIL("Allocation failed");
+        for (void* p : {kDev, vDev, accDev, numAccDev, pastKVDev, rewindDev, slotRemapDev})
+            if (p) VulkanBackend::free(p);
+        return false;
+    }
+
+    VulkanBackend::memcpyHostToDevice(kDev, hostK.data(), kvBytes);
+    VulkanBackend::memcpyHostToDevice(vDev, hostV.data(), kvBytes);
+    VulkanBackend::memcpyHostToDevice(accDev, hostAccepted.data(), accBytes);
+    VulkanBackend::memcpyHostToDevice(numAccDev, hostNumAcc.data(), arrBytes);
+    VulkanBackend::memcpyHostToDevice(pastKVDev, hostPastKV.data(), arrBytes);
+    VulkanBackend::memcpyHostToDevice(rewindDev, hostRewind.data(), arrBytes);
+    VulkanBackend::memcpyHostToDevice(slotRemapDev, hostSlotRemap.data(), arrBytes);
+
+    if (!VulkanBackend::launchKVCacheUpdate2D(kDev, vDev, accDev, numAccDev,
+                                              pastKVDev, rewindDev, slotRemapDev,
+                                              B, H, S, D, draftLen, rewindCommon, L))
+    {
+        TRACE_FAIL(std::string("KVCacheUpdate2D failed: ") + backend->getLastError());
+        for (void* p : {kDev, vDev, accDev, numAccDev, pastKVDev, rewindDev, slotRemapDev})
+            VulkanBackend::free(p);
+        return false;
+    }
+
+    std::vector<float> hostKResult(hostK.size());
+    std::vector<float> hostVResult(hostV.size());
+    VulkanBackend::memcpyDeviceToHost(hostKResult.data(), kDev, kvBytes);
+    VulkanBackend::memcpyDeviceToHost(hostVResult.data(), vDev, kvBytes);
+    for (void* p : {kDev, vDev, accDev, numAccDev, pastKVDev, rewindDev, slotRemapDev})
+        VulkanBackend::free(p);
+
+    bool allCorrect = true;
+    for (size_t i = 0; i < hostKRef.size(); ++i)
+    {
+        if (hostKResult[i] != hostKRef[i])
+        {
+            allCorrect = false;
+            std::cout << "KV Cache K mismatch at idx " << i << ": got " << hostKResult[i]
+                      << " ref " << hostKRef[i] << std::endl;
+            break;
+        }
+        if (hostVResult[i] != hostVRef[i])
+        {
+            allCorrect = false;
+            std::cout << "KV Cache V mismatch at idx " << i << ": got " << hostVResult[i]
+                      << " ref " << hostVRef[i] << std::endl;
+            break;
+        }
+    }
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect KV cache update results");
+    }
+    else
+    {
+        std::cout << "      Result verified: KV cache update matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+    return allCorrect;
+}
+
 // ==================== MLA FMHA (decode) ====================
 // Vulkan port of the CuTe-DSL Blackwell MLA decode kernel. One thread per query
 // token; paged KV gather via pageTable, split q_nope/q_rope key, value = latent.
@@ -1975,6 +2875,10 @@ int main()
     runTest(test_softmax, "Softmax Kernel");
     runTest(test_attention, "Attention Kernel");
     runTest(test_topk, "Top-K Kernel");
+    runTest(test_spec_decode_accept, "Spec-Decode Acceptance Kernel");
+    runTest(test_tree_spec_decode, "Tree Spec-Decode Build + Greedy Verify");
+    runTest(test_tree_spec_rejection, "Tree Spec-Decode Rejection Sampler");
+    runTest(test_kv_cache_update_2d, "KV Cache Update (2D) Kernel");
     runTest(test_mla_fmha, "MLA FMHA Kernel");
     runTest(test_mla_fmha_prefill, "MLA FMHA Prefill Kernel");
     runTest(test_mla_fmha_sliding_window, "MLA FMHA Sliding-Window Kernel");

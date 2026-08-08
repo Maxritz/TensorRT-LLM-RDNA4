@@ -1,0 +1,117 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Speculative-decoding greedy tree verification.
+// Vulkan port of verifyDynamicTreeGreedyPackedKernel in
+// cpp/tensorrt_llm/kernels/speculativeDecoding/dynamicTreeKernels.cu (line 284).
+//
+// One workgroup per batch row (local_size_x = 1). Walks the retrieve-packed
+// linked list: for each spec step, follow retrieveNextToken (first child) then
+// retrieveNextSibling chain, accepting the first sibling whose draft token
+// matches the target prediction at the last-accepted position. Stops on first
+// mismatch (rejection) or exhaustion.
+//
+// retrievePacked layout [B, numDraftTokens, 3] int32 row-major:
+//   [b, n, 0] = retrieveIndex  (local traversal order)
+//   [b, n, 1] = retrieveNextToken (first child)
+//   [b, n, 2] = retrieveNextSibling (next sibling)
+//
+// Push constants: matches VulkanKernelDispatcher::dispatchTreeSpecGreedyVerify.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint numSpeculativeTokens;  // numSpecStep (J in CUDA)
+    uint numDraftTokens;        // dT
+} pc;
+
+// binding 0: acceptIndex  [B, numSpeculativeTokens]   int32  (output)
+// binding 1: acceptTokenNum [B]                        uint32 (output)
+// binding 2: acceptToken   [B, numSpeculativeTokens]   int32  (output)
+// binding 3: candidates   [B, numDraftTokens]         int32  (draft token ids)
+// binding 4: retrievePacked [B, numDraftTokens, 3]    int32  (index/child/sibling triple)
+// binding 5: targetPredict [B, numDraftTokens]        int32  (target-predicted token ids)
+// binding 6: treeValid     [B]                         int32  (0 = invalid/empty row)
+layout(std430, binding = 0) restrict writeonly buffer BufAcceptIdx { int acceptIndex[]; };
+layout(std430, binding = 1) restrict writeonly buffer BufAcceptNum { uint acceptTokenNum[]; };
+layout(std430, binding = 2) restrict writeonly buffer BufAcceptTok { int acceptToken[]; };
+layout(std430, binding = 3) restrict readonly  buffer BufCand     { int candidates[]; };
+layout(std430, binding = 4) restrict readonly  buffer BufRetPack  { int retrievePacked[]; };
+layout(std430, binding = 5) restrict readonly  buffer BufTarget    { int targetPredict[]; };
+layout(std430, binding = 6) restrict readonly  buffer BufValid    { int treeValid[]; };
+
+void main()
+{
+    uint bx = gl_WorkGroupID.x;
+    uint dT = pc.numDraftTokens;
+    uint J = pc.numSpeculativeTokens;
+
+    // retrievePacked layout [B, dT, 3] int32 interleaved:
+    //   [b, n, 0]=retrieveIndex, [b, n, 1]=retrieveNextToken, [b, n, 2]=retrieveNextSibling
+    uint retBase = bx * dT * 3u;
+
+    // treeValid: 0 means invalid/empty tree -> emit single root target prediction.
+    if (treeValid[bx] == 0)
+    {
+        acceptTokenNum[bx] = 0u;
+        acceptIndex[bx * J] = 0;
+        acceptToken[bx * J] = targetPredict[bx * dT];
+        return;
+    }
+
+    int lastAcceptedLocalIdx = retrievePacked[retBase + 0u];  // retrieveIndex[0]
+    acceptIndex[bx * J] = lastAcceptedLocalIdx;
+    uint numAcceptedTokens = 0u;
+    int curIndex = 0;
+
+    acceptToken[bx * J] = targetPredict[bx * dT + uint(lastAcceptedLocalIdx)];
+
+    for (uint j = 1u; j < J; ++j)
+    {
+        // Follow first-child pointer: retrievePacked[curIndex].y
+        curIndex = int(retrievePacked[retBase + uint(curIndex) * 3u + 1u]);
+        int candBase = int(bx * dT);
+
+        while (curIndex >= 0 && uint(curIndex) < dT)
+        {
+            int draftLocalIdx = int(retrievePacked[retBase + uint(curIndex) * 3u + 0u]);
+            int draftTokenId   = candidates[candBase + uint(curIndex)];
+            int targetTokenId  = targetPredict[candBase + uint(lastAcceptedLocalIdx)];
+
+            if (draftTokenId == targetTokenId)
+            {
+                ++numAcceptedTokens;
+                acceptIndex[bx * J + numAcceptedTokens] = draftLocalIdx;
+                acceptToken[bx * J + numAcceptedTokens]
+                    = targetPredict[candBase + uint(draftLocalIdx)];
+                lastAcceptedLocalIdx = draftLocalIdx;
+                break;
+            }
+            // Follow next-sibling pointer: retrievePacked[curIndex].z
+            curIndex = int(retrievePacked[retBase + uint(curIndex) * 3u + 2u]);
+        }
+
+        if (curIndex < 0 || uint(curIndex) >= dT)
+        {
+            break;
+        }
+    }
+
+    acceptTokenNum[bx] = numAcceptedTokens;
+}

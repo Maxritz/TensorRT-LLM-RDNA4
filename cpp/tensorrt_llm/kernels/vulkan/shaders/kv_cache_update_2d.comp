@@ -1,0 +1,220 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limit under the License.
+ */
+
+// KV-cache compaction for speculative decoding (2D variant).
+// Vulkan port of updateKVCacheDraftTokenLocationBatchedKernel2D in
+// cpp/tensorrt_llm/kernels/speculativeDecoding/kvCacheUpdateKernels.cu
+// (line 140).
+//
+// After speculative decoding acceptance, only some draft tokens survive.
+// This kernel compacts the KV cache: it copies K/V data from the draft
+// token positions (scattered) to contiguous positions starting at
+// (pastKeyValueLen - rewindDraftTokenCommonCount).
+//
+// Layout (per layer, linear KV cache):
+//   kvCache[seqSlot * numKVHeads * maxKVCacheLen * headDim  \
+//         + headIdx  * maxKVCacheLen * headDim               \
+//         + tokenPos * headDim                               \
+//         + channelIdx]
+//
+// One workgroup per (seq, head); local_size_x = 128.
+// Threads cooperatively load from source positions into shared memory,
+// then store to compacted positions — preventing read-after-write hazards.
+//
+// Push constants: matches VulkanKernelDispatcher::dispatchKVCacheUpdate2D.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC
+{
+    uint maxDraftLen;
+    uint numKVHeads;
+    uint maxKVCacheLen;
+    uint headDim;
+    int  rewindDraftTokenCommonCount;
+    uint layerCount;
+    uint seqCount;
+} pc;
+
+// 0: kvCacheK      [layerCount, seqCount, numKVHeads, maxKVCacheLen, headDim] float
+// 1: kvCacheV      [layerCount, seqCount, numKVHeads, maxKVCacheLen, headDim] float
+// 2: acceptedDraftTokensIndices2D  [seqCount, maxDraftLen]  int32  (-1 = padding)
+// 3: numAcceptedTokens [seqCount]   int32
+// 4: pastKeyValueLengths  [seqCount]  int32
+// 5: rewindDraftTokenSeparateAdjustments [seqCount]  int32  (-1 = not used)
+// 6: seqSlotRemapping [seqCount]  int32  (-1 = not used, identity)
+layout(std430, binding = 0) restrict buffer BufK
+{
+    float kvCacheK[];
+};
+layout(std430, binding = 1) restrict buffer BufV
+{
+    float kvCacheV[];
+};
+layout(std430, binding = 2) restrict readonly buffer BufAccepted
+{
+    int acceptedDraftTokensIndices2D[];
+};
+layout(std430, binding = 3) restrict readonly buffer BufNumAcc
+{
+    int numAcceptedTokens[];
+};
+layout(std430, binding = 4) restrict readonly buffer BufPastKV
+{
+    int pastKeyValueLengths[];
+};
+layout(std430, binding = 5) restrict readonly buffer BufRewind
+{
+    int rewindDraftTokenSeparateAdjustments[];
+};
+layout(std430, binding = 6) restrict readonly buffer BufSlotRemap
+{
+    int seqSlotRemapping[];
+};
+
+#define WG 128u
+#define SHM_FLOATS 2048u
+
+// ---- Shared-memory staging buffer (load → sync → store) ----
+shared float sMem[SHM_FLOATS];
+
+void main()
+{
+    uint seqIdx = gl_WorkGroupID.x;
+    uint headIdx = gl_WorkGroupID.y;
+    uint layerIdx = gl_WorkGroupID.z;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint V = pc.headDim;
+    uint S = pc.maxKVCacheLen;
+    uint H = pc.numKVHeads;
+    uint seqCnt = pc.seqCount;
+    uint draftLen = pc.maxDraftLen;
+
+    int numAccepted = numAcceptedTokens[seqIdx];
+    int seqDraftCount = numAccepted - 1;
+    if (seqDraftCount < 0)
+        seqDraftCount = 0;
+    if (seqDraftCount == 0)
+        return;
+
+    int seqSlot;
+    if (seqSlotRemapping[seqIdx] >= 0)
+        seqSlot = seqSlotRemapping[seqIdx];
+    else
+        seqSlot = int(seqIdx);
+
+    int tokenStartIdx = pastKeyValueLengths[seqSlot] - pc.rewindDraftTokenCommonCount;
+    if (rewindDraftTokenSeparateAdjustments[seqSlot] != -1)
+    {
+        tokenStartIdx -= rewindDraftTokenSeparateAdjustments[seqSlot];
+    }
+    if (tokenStartIdx < 0)
+        return;
+
+    uint layerStride = seqCnt * H * S * V;
+    uint seqStride = H * S * V;
+    uint headStride = S * V;
+
+    uint kBase = layerIdx * layerStride + uint(seqSlot) * seqStride + headIdx * headStride;
+    uint vBase = kBase; // K and V share same layout
+
+    uint seqRow = seqIdx * draftLen;
+
+    // Chunking over channels (mirrors CUDA's channel-offset loop)
+    uint remainingChannels = V;
+    uint startC = 0u;
+    while (remainingChannels > 0u)
+    {
+        uint eltCountCurrentMove = min(remainingChannels, remainingChannels);
+        // Determine how many elements we can fit in shared memory
+        uint maxElems = SHM_FLOATS / uint(seqDraftCount);
+        uint eltCountPerMove = min(eltCountCurrentMove, maxElems);
+        eltCountPerMove = min(eltCountPerMove, V - startC);
+        if (eltCountPerMove == 0u)
+        {
+            ++startC;
+            --remainingChannels;
+            continue;
+        }
+
+        uint warpIdx = tid / 32u;
+        uint laneIdx = tid & 31u;
+
+        // ---- Load K from source positions into shared memory ----
+        for (uint tokenIdx = warpIdx; tokenIdx < uint(seqDraftCount); tokenIdx += (WG / 32u))
+        {
+            int draftPos = acceptedDraftTokensIndices2D[seqRow + tokenIdx];
+            if (draftPos < 0)
+                draftPos = 0;
+            int srcKVPos = tokenStartIdx + draftPos;
+            for (uint c = laneIdx; c < eltCountPerMove; c += 32u)
+            {
+                uint ch = startC + c;
+                sMem[tokenIdx * eltCountPerMove + c]
+                    = kvCacheK[kBase + uint(srcKVPos) * V + ch];
+            }
+        }
+        // All 128 threads must hit this barrier (even those beyond eltCountPerMove)
+        barrier();
+
+        // ---- Store K from shared memory to compacted positions ----
+        for (uint tokenIdx = warpIdx; tokenIdx < uint(seqDraftCount); tokenIdx += (WG / 32u))
+        {
+            for (uint c = laneIdx; c < eltCountPerMove; c += 32u)
+            {
+                uint ch = startC + c;
+                kvCacheK[kBase + (tokenStartIdx + int(tokenIdx)) * int(V) + int(ch)]
+                    = sMem[tokenIdx * eltCountPerMove + c];
+            }
+        }
+        barrier();
+
+        // ---- Load V from source positions into shared memory ----
+        for (uint tokenIdx = warpIdx; tokenIdx < uint(seqDraftCount); tokenIdx += (WG / 32u))
+        {
+            int draftPos = acceptedDraftTokensIndices2D[seqRow + tokenIdx];
+            if (draftPos < 0)
+                draftPos = 0;
+            int srcKVPos = tokenStartIdx + draftPos;
+            for (uint c = laneIdx; c < eltCountPerMove; c += 32u)
+            {
+                uint ch = startC + c;
+                sMem[tokenIdx * eltCountPerMove + c]
+                    = kvCacheV[vBase + uint(srcKVPos) * V + ch];
+            }
+        }
+        barrier();
+
+        // ---- Store V from shared memory to compacted positions ----
+        for (uint tokenIdx = warpIdx; tokenIdx < uint(seqDraftCount); tokenIdx += (WG / 32u))
+        {
+            for (uint c = laneIdx; c < eltCountPerMove; c += 32u)
+            {
+                uint ch = startC + c;
+                kvCacheV[vBase + (tokenStartIdx + int(tokenIdx)) * int(V) + int(ch)]
+                    = sMem[tokenIdx * eltCountPerMove + c];
+            }
+        }
+        barrier();
+
+        startC += eltCountPerMove;
+        remainingChannels -= eltCountPerMove;
+    }
+}

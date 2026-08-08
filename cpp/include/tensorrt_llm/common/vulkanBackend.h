@@ -101,6 +101,41 @@ public:
                            uint32_t totalTokens, uint32_t totalOutputTokens,
                            void* stream = nullptr);
 
+    static bool launchSpecDecodeAccept(
+        void* targetLogits, void* draftLogits, void* uniformRng, void* draftTokens,
+        void* acceptCount, void* acceptedTokens, void* resampleProbs,
+        uint32_t batchSize, uint32_t draftLen, uint32_t vocabSize,
+        float temperature, float acceptProbFloor, void* stream = nullptr);
+
+    static bool launchTreeSpecBuild(
+        void* parentListUvec2, void* selectedIndexUvec2,
+        void* treeMask, void* positions, void* retrieveIndex,
+        void* retrieveNextToken, void* retrieveNextSibling,
+        uint32_t batchSize, uint32_t draftTokenNum, uint32_t topK,
+        uint32_t depth, uint32_t numInt32PerRow, void* stream = nullptr);
+
+    static bool launchTreeSpecGreedyVerify(
+        void* acceptIndex, void* acceptTokenNum, void* acceptToken,
+        void* candidates, void* retrievePacked, void* targetPredict,
+        void* treeValid,
+         uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens,
+         void* stream = nullptr);
+
+    static bool launchTreeSpecRejection(
+        void* acceptIndex, void* acceptTokenNum, void* acceptToken,
+        void* draftTokens, void* targetProbs, void* retrieveNextToken,
+        void* retrieveNextSibling, void* treeValid, void* rngSamples,
+        uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens,
+         uint32_t vocabSize, uint32_t kMaxTriedPerLevel, void* stream = nullptr);
+
+    static bool launchKVCacheUpdate2D(void* kvCacheK, void* kvCacheV,
+        void* acceptedDraftTokensIndices2D, void* numAcceptedTokens,
+        void* pastKeyValueLengths, void* rewindDraftTokenSeparateAdjustments,
+        void* seqSlotRemapping,
+        uint32_t batchSize, uint32_t numKVHeads, uint32_t maxKVCacheLen,
+        uint32_t headDim, uint32_t maxDraftLen, int32_t rewindDraftTokenCommonCount,
+        uint32_t layerCount, void* stream = nullptr);
+
     static bool launchMlaFmha(void* q, void* kv, void* pageTable, void* cacheSeqs,
                               void* output,
                               uint32_t numHeads, uint32_t seqQLen, uint32_t batchSize,
