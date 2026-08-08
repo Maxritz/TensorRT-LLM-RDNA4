@@ -41,3 +41,15 @@ target_link_libraries(common_src PUBLIC trtllm_gen_fmha_interface)
 if(ENABLE_CUBLASLT_FP4_GEMM)
   target_compile_definitions(common_src PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
 endif()
+
+# Link Vulkan when enabled
+if(ENABLE_VULKAN)
+  target_link_libraries(common_src PUBLIC ${Vulkan_LIBRARY})
+  target_include_directories(common_src PUBLIC ${Vulkan_INCLUDE_DIR})
+  target_compile_definitions(common_src PUBLIC ENABLE_VULKAN=1)
+
+  # Windows-specific warnings suppression for Vulkan headers
+  if(WIN32)
+    target_compile_options(common_src PRIVATE /wd4127 /wd4459 /wd4201 /wd4100)
+  endif()
+endif()

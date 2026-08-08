@@ -1,0 +1,47 @@
+cmake_minimum_required(VERSION 3.27 FATAL_ERROR)
+project(vulkan_trace_test CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Find Vulkan
+find_package(Vulkan REQUIRED)
+message(STATUS "Vulkan found: ${Vulkan_LIBRARY}")
+message(STATUS "Vulkan headers: ${Vulkan_INCLUDE_DIR}")
+
+# Include directories
+include_directories(
+    ${Vulkan_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# Collect all Vulkan source files
+file(GLOB_RECURSE VULKAN_SRCS
+    "tensorrt_llm/common/vulkan*.cpp"
+    "tensorrt_llm/kernels/vulkanKernelRegistry.cpp"
+)
+
+# Main executable
+add_executable(vulkan_trace_test
+    tests/vulkanTraceMain.cpp
+    ${VULKAN_SRCS}
+)
+
+target_link_libraries(vulkan_trace_test PUBLIC ${Vulkan_LIBRARY})
+
+# Compiler warnings
+if(MSVC)
+    target_compile_options(vulkan_trace_test PRIVATE /W4 /wd4201 /wd4459 /wd4100 /wd4127 /wd4505)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(vulkan_trace_test PRIVATE -Wall -Wno-unused-parameter)
+endif()
+
+# Enable Vulkan by default
+target_compile_definitions(vulkan_trace_test PUBLIC ENABLE_VULKAN=1)
+
+# Shader files need to be accessible at runtime
+set_target_properties(vulkan_trace_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)

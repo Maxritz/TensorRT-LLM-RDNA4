@@ -85,6 +85,15 @@ option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
        "Using open sourced Cutlass AR gemm kernel" ON)
 option(SKIP_SOFTMAX_STAT "Enable Statistics of Skip-Softmax" OFF)
 
+# Vulkan support for AMD GPU compatibility layer
+option(ENABLE_VULKAN "Enable Vulkan backend for AMD GPU support" OFF)
+if(ENABLE_VULKAN)
+  find_package(Vulkan REQUIRED)
+  message(STATUS "Vulkan SDK: ${Vulkan_VERSION}")
+  message(STATUS "Vulkan libraries: ${Vulkan_LIBRARY}")
+  message(STATUS "Vulkan include dirs: ${Vulkan_INCLUDE_DIR}")
+endif()
+
 message(STATUS "ENABLE_NVSHMEM is ${ENABLE_NVSHMEM}")
 
 if(NVTX_DISABLE)

@@ -35,6 +35,10 @@ add_subdirectory(kimiK3AttnRes)
 add_subdirectory(mhcKernels)
 add_subdirectory(compressorKernels)
 
+if(ENABLE_VULKAN)
+  add_subdirectory(vulkan)
+endif()
+
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
@@ -67,6 +71,9 @@ list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
+if(ENABLE_VULKAN)
+  list(FILTER SRC_CPP EXCLUDE REGEX "vulkan/.*")
+endif()
 # Marlin is built as its own Hopper-only OBJECT library below.
 list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
@@ -117,3 +124,8 @@ target_include_directories(
 )
 target_link_libraries(kernels_src PUBLIC trtllm_gen_fmha_interface)
 add_cuda_architectures(kernels_src 89)
+
+# Link Vulkan kernels when enabled
+if(ENABLE_VULKAN)
+  target_link_libraries(kernels_src PUBLIC vulkan_kernels_src)
+endif()

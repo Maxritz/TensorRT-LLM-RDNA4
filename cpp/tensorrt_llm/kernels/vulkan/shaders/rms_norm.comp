@@ -1,0 +1,186 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// Specialization constants for wave size adaptation
+layout(constant_id = 0) const uint SPEC_SUBGROUP_SIZE = 32;
+layout(constant_id = 1) const uint SPEC_WG_SIZE_X = 256;
+layout(constant_id = 2) const uint SPEC_D = 4096;
+layout(constant_id = 3) const uint SPEC_FFN_DIM = 11008;
+layout(constant_id = 4) const uint SPEC_HEAD_DIM = 128;
+layout(constant_id = 5) const uint SPEC_N_HEADS = 32;
+layout(constant_id = 6) const uint SPEC_N_KV_HEADS = 8;
+layout(constant_id = 7) const uint SPEC_VOCAB_SIZE = 128000;
+layout(constant_id = 8) const uint SPEC_KV_PAGE_TOKENS = 256;
+layout(constant_id = 9) const uint SPEC_PAGES_PER_LAYER = 16;
+layout(constant_id = 10) const uint SPEC_QUANT_TYPE = 0;
+layout(constant_id = 11) const uint SPEC_WARP_PER_WG = 2;
+layout(constant_id = 12) const uint SPEC_MAX_SEQ_LEN = 4096;
+
+#ifndef SUBGROUP_SIZE
+#define SUBGROUP_SIZE SPEC_SUBGROUP_SIZE
+#endif
+#define WG_SIZE_X     SPEC_WG_SIZE_X
+#define D             SPEC_D
+#define FFN_DIM       SPEC_FFN_DIM
+#define HEAD_DIM      SPEC_HEAD_DIM
+#define N_HEADS       SPEC_N_HEADS
+#define N_KV_HEADS    SPEC_N_KV_HEADS
+#define VOCAB_SIZE    SPEC_VOCAB_SIZE
+#define KV_PAGE_TOKENS SPEC_KV_PAGE_TOKENS
+#define PAGES_PER_LAYER SPEC_PAGES_PER_LAYER
+#define WARP_PER_WG   SPEC_WARP_PER_WG
+#define MAX_SEQ_LEN   SPEC_MAX_SEQ_LEN
+
+#define WARP_SIZE     SUBGROUP_SIZE
+
+// Quantization types
+layout(constant_id = 10) const uint QUANT_FP16 = 0;
+layout(constant_id = 10) const uint QUANT_Q8_0 = 1;
+layout(constant_id = 10) const uint QUANT_Q4_K = 2;
+layout(constant_id = 10) const uint QUANT_Q6_K = 3;
+layout(constant_id = 10) const uint QUANT_IQ4_XS = 4;
+
+// Push constants
+layout(push_constant, scalar) uniform PushConstants {
+    uint  layer_idx;
+    uint  kv_cache_pos;
+    uint  seq_len;
+    uint  head_dim;
+    uint  num_heads;
+    uint  num_kv_heads;
+    float attn_scale;
+    float rope_theta;
+    float norm_eps;
+    uint  norm_type;
+    uint  rope_is_neox;
+    int   token_id;
+    uint  attn_norm_offset;
+    uint  ffn_norm_offset;
+    uint  output_norm_offset;
+    uint  q_norm_offset;
+    uint  k_norm_offset;
+    uint  q_offset;
+    uint  k_offset;
+    uint  v_offset;
+    uint  o_offset;
+    uint  gate_offset;
+    uint  up_offset;
+    uint  down_offset;
+    uint  has_qkv_bias;
+    uint  q_bias_offset;
+    uint  k_bias_offset;
+    uint  v_bias_offset;
+    float embedding_scale;
+    float residual_scale;
+    float logit_scale;
+} pc;
+
+// Buffer declarations
+layout(std430, binding = 0) restrict readonly  buffer BufHiddenIn  { float16_t hidden_in  []; };
+layout(std430, binding = 1) restrict writeonly buffer BufHiddenOut { float16_t hidden_out []; };
+layout(std430, binding = 2) restrict readonly  buffer BufNormW    { float16_t gamma_w    []; };
+layout(std430, binding = 3) restrict readonly  buffer BufNormB    { float16_t beta_w     []; };
+
+// Shared memory for reduction
+shared float s_subgroup_sums[16];
+
+float warpReduceSum(float val) {
+    [[unroll]] for (uint i = SUBGROUP_SIZE / 2; i > 0; i /= 2) {
+        val += subgroupShuffleDownAdd(gl_SubgroupInvocationID, val, i);
+    }
+    return val;
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+
+    uint norm_offset;
+    if (pc.norm_type == 0u) {
+        norm_offset = pc.attn_norm_offset;
+    } else if (pc.norm_type == 1u) {
+        norm_offset = pc.ffn_norm_offset;
+    } else {
+        norm_offset = pc.output_norm_offset;
+    }
+
+    // Step 1: Strided squared-sum accumulation
+    uint lane_id = gl_SubgroupInvocationID;
+    uint subgroup_id = gl_SubgroupID;
+    uint num_subgroups = WG_SIZE_X / SUBGROUP_SIZE;
+
+    float local_sq_sum = 0.0;
+    for (uint k = tid; k < D; k += WG_SIZE_X) {
+        float val = float(hidden_in.x[k]);
+        local_sq_sum += val * val;
+    }
+
+    // Step 2: Subgroup reduction of squared sum
+    float sg_sum_sq = warpReduceSum(local_sq_sum);
+
+    // Step 3: Cross-subgroup reduction
+    float total_sum_sq;
+
+    if (num_subgroups == 1u) {
+        total_sum_sq = sg_sum_sq;
+    } else {
+        if (lane_id == 0u) {
+            s_subgroup_sums[subgroup_id] = sg_sum_sq;
+        }
+        barrier();
+        barrier();
+
+        float local_sum = 0.0;
+        if (subgroup_id == 0u) {
+            for (uint i = lane_id; i < num_subgroups; i += SUBGROUP_SIZE) {
+                local_sum += s_subgroup_sums[i];
+            }
+            total_sum_sq = warpReduceSum(local_sum);
+        }
+
+        barrier();
+        barrier();
+
+        if (subgroup_id == 0u && lane_id == 0u) {
+            s_subgroup_sums[0] = total_sum_sq;
+        }
+        barrier();
+        barrier();
+        total_sum_sq = s_subgroup_sums[0];
+    }
+
+    // Step 4: Compute inverse RMS
+    float denom = total_sum_sq / float(D) + pc.norm_eps;
+    float inv_rms = (denom > 0.0 && denom == denom) ? inversesqrt(denom) : 0.0;
+
+    // Step 5: Strided output write
+    for (uint k = tid; k < D; k += WG_SIZE_X) {
+        float w = float(gamma_w[norm_offset / 2 + k]);
+        float val = float(hidden_in.x[k]);
+        hidden_out.y[k] = float16_t(val * inv_rms * w);
+    }
+}

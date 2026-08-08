@@ -203,6 +203,13 @@ set(TRTLLM_LINK_LIBS
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})
+
+# Vulkan backend libraries
+if(ENABLE_VULKAN)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${Vulkan_LIBRARY})
+  message(STATUS "Vulkan backend enabled with library: ${Vulkan_LIBRARY}")
+endif()
+
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} low_latency_gemm_src)
   message(STATUS "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
@@ -262,6 +269,9 @@ target_link_libraries(
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
+if(ENABLE_VULKAN)
+  target_link_libraries(${SHARED_TARGET} PUBLIC vulkan_kernels_src)
+endif()
 
 # Cyclic dependency of batch manager on TRT-LLM
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
