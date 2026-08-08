@@ -119,6 +119,7 @@ bool VulkanKernelRegistry::initialize()
         desc.blockK = 256;
         desc.requiresCooperativeMatrix = false;
         desc.requiresFP16 = true;
+        desc.bindingCount = 4; // input, gamma, beta, output
         registerKernel(desc);
     }
 
@@ -714,8 +715,85 @@ VulkanResult VulkanKernelDispatcher::dispatchRmsNorm(
     float eps, size_t hiddenDim, size_t tokenCount,
     uint32_t blockSize)
 {
-    TLLM_LOG_WARNING("Vulkan RMS norm dispatch is not implemented; no kernel executed");
-    return VulkanResult::FEATURE_NOT_PRESENT;
+    if (!mContext || !mKernelRegistry)
+    {
+        return VulkanResult::INITIALIZATION_FAILED;
+    }
+
+    auto variant = mKernelRegistry->getBestVariant("rms_norm");
+    if (!variant || !variant->isValid())
+    {
+        return VulkanResult::FEATURE_NOT_PRESENT;
+    }
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+    {
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    uint32_t totalElements = static_cast<uint32_t>(hiddenDim * tokenCount);
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(input), reinterpret_cast<VkBuffer>(gamma),
+                          reinterpret_cast<VkBuffer>(beta), reinterpret_cast<VkBuffer>(output)};
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[4]{};
+    bufInfos[0].buffer = buffers[0];
+    bufInfos[1].buffer = buffers[1];
+    bufInfos[2].buffer = buffers[2];
+    bufInfos[3].buffer = buffers[3];
+    bufInfos[0].range = static_cast<VkDeviceSize>(totalElements) * sizeof(float);
+    bufInfos[1].range = static_cast<VkDeviceSize>(hiddenDim) * sizeof(float);
+    bufInfos[2].range = static_cast<VkDeviceSize>(hiddenDim) * sizeof(float);
+    bufInfos[3].range = static_cast<VkDeviceSize>(totalElements) * sizeof(float);
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        bufInfos[i].offset = 0;
+    }
+
+    VkWriteDescriptorSet writes[4]{};
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 4, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t hiddenDim;
+        uint32_t totalElements;
+        float eps;
+    } pc{};
+    pc.hiddenDim = static_cast<uint32_t>(hiddenDim);
+    pc.totalElements = totalElements;
+    pc.eps = eps;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t workGroupsX = (totalElements + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
 }
 
 VulkanResult VulkanKernelDispatcher::dispatchFp16Gemm(

@@ -337,6 +337,131 @@ bool test_utilization_tracking()
     return true;
 }
 
+bool test_rms_norm()
+{
+    TRACE_TEST("RMS Norm Kernel Dispatch");
+
+    auto backend = VulkanBackend::getInstance();
+    if (!backend->isActive() && !backend->initialize(0))
+    {
+        TRACE_FAIL("Backend not available");
+        return false;
+    }
+
+    const size_t tokenCount = 8;
+    const size_t hiddenDim = 128;
+    const size_t totalElements = tokenCount * hiddenDim;
+    const size_t inputBytes = totalElements * sizeof(float);
+    const size_t featBytes = hiddenDim * sizeof(float);
+    const float eps = 1e-6f;
+
+    void* input = VulkanBackend::malloc(inputBytes);
+    void* gamma = VulkanBackend::malloc(featBytes);
+    void* beta = VulkanBackend::malloc(featBytes);
+    void* output = VulkanBackend::malloc(inputBytes);
+
+    if (!input || !gamma || !beta || !output)
+    {
+        TRACE_FAIL("Device memory allocation failed");
+        if (input) VulkanBackend::free(input);
+        if (gamma) VulkanBackend::free(gamma);
+        if (beta) VulkanBackend::free(beta);
+        if (output) VulkanBackend::free(output);
+        return false;
+    }
+
+    std::vector<float> hostIn(totalElements), hostGamma(hiddenDim), hostBeta(hiddenDim), result(totalElements, 0.0f);
+    for (size_t i = 0; i < totalElements; ++i)
+    {
+        hostIn[i] = 1.0f + (float)(i % 50) * 0.1f;
+    }
+    for (size_t d = 0; d < hiddenDim; ++d)
+    {
+        hostGamma[d] = 0.5f + (float)d * 0.01f;
+        hostBeta[d] = (float)d * 0.1f;
+    }
+
+    if (!VulkanBackend::memcpyHostToDevice(input, hostIn.data(), inputBytes) ||
+        !VulkanBackend::memcpyHostToDevice(gamma, hostGamma.data(), featBytes) ||
+        !VulkanBackend::memcpyHostToDevice(beta, hostBeta.data(), featBytes))
+    {
+        TRACE_FAIL("HostToDevice memcpy failed");
+        VulkanBackend::free(input);
+        VulkanBackend::free(gamma);
+        VulkanBackend::free(beta);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    bool launchResult = VulkanBackend::launchRmsNorm(input, gamma, beta, output, eps, hiddenDim, tokenCount);
+    if (!launchResult)
+    {
+        TRACE_FAIL(std::string("RMS norm launch failed: ") + backend->getLastError());
+        VulkanBackend::free(input);
+        VulkanBackend::free(gamma);
+        VulkanBackend::free(beta);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    if (!VulkanBackend::memcpyDeviceToHost(result.data(), output, inputBytes))
+    {
+        TRACE_FAIL("DeviceToHost memcpy failed");
+        VulkanBackend::free(input);
+        VulkanBackend::free(gamma);
+        VulkanBackend::free(beta);
+        VulkanBackend::free(output);
+        return false;
+    }
+
+    // CPU reference: out[tid] = in[tid] * invRms * gamma[dim] + beta[dim]
+    bool allCorrect = true;
+    for (size_t t = 0; t < tokenCount; ++t)
+    {
+        size_t base = t * hiddenDim;
+        float sumSq = 0.0f;
+        for (size_t k = 0; k < hiddenDim; ++k)
+        {
+            float v = hostIn[base + k];
+            sumSq += v * v;
+        }
+        float invRms = 1.0f / std::sqrt(sumSq / (float)hiddenDim + eps);
+        for (size_t d = 0; d < hiddenDim; ++d)
+        {
+            size_t idx = base + d;
+            float ref = hostIn[idx] * invRms * hostGamma[d] + hostBeta[d];
+            if (std::abs(result[idx] - ref) > 1e-3f)
+            {
+                allCorrect = false;
+                std::cout << "      mismatch t=" << t << " d=" << d << " got=" << result[idx]
+                          << " ref=" << ref << std::endl;
+                break;
+            }
+        }
+        if (!allCorrect)
+        {
+            break;
+        }
+    }
+
+    if (!allCorrect)
+    {
+        TRACE_FAIL("Incorrect RMS norm results");
+    }
+    else
+    {
+        std::cout << "      Result verified: RMS norm matches CPU reference" << std::endl;
+        TRACE_PASS();
+    }
+
+    VulkanBackend::free(input);
+    VulkanBackend::free(gamma);
+    VulkanBackend::free(beta);
+    VulkanBackend::free(output);
+
+    return allCorrect;
+}
+
 int main()
 {
     std::cout << "========================================" << std::endl;
@@ -368,6 +493,7 @@ int main()
     runTest(test_memory_allocation, "Memory Allocation");
     runTest(test_kernel_registry, "Kernel Registry");
     runTest(test_elementwise_kernel, "Elementwise Add Kernel");
+    runTest(test_rms_norm, "RMS Norm Kernel");
     runTest(test_resource_leak_prevention, "Resource Leak Prevention");
     runTest(test_utilization_tracking, "GPU Utilization Tracking");
 
