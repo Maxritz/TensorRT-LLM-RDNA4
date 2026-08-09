@@ -25,7 +25,10 @@ import psutil
 import safetensors
 import torch
 import tqdm
-from mpi4py import MPI as _MPI
+try:
+    from mpi4py import MPI as _MPI
+except (ImportError, RuntimeError, ModuleNotFoundError):
+    _MPI = None
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
@@ -186,7 +189,7 @@ class HfWeightLoader(BaseWeightLoader):
         available_host_memory = psutil.virtual_memory().available
         if ENABLE_MULTI_DEVICE:
             return local_mpi_comm().allreduce(available_host_memory,
-                                              op=_MPI.MIN)
+                                              op=_MPI.MIN if _MPI is not None else None)
         return available_host_memory
 
     def _with_weight_cache(self, weight_files: List[str],

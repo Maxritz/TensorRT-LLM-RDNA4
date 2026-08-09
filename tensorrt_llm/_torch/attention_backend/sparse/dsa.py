@@ -34,10 +34,17 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
-from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
-                                    fp8_fp4_paged_mqa_logits, fp8_mqa_logits,
-                                    fp8_paged_mqa_logits,
-                                    get_paged_mqa_logits_metadata)
+try:
+    from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
+                                        fp8_fp4_paged_mqa_logits, fp8_mqa_logits,
+                                        fp8_paged_mqa_logits,
+                                        get_paged_mqa_logits_metadata)
+except (ImportError, ModuleNotFoundError):
+    fp8_fp4_mqa_logits = None
+    fp8_fp4_paged_mqa_logits = None
+    fp8_mqa_logits = None
+    fp8_paged_mqa_logits = None
+    get_paged_mqa_logits_metadata = None
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig

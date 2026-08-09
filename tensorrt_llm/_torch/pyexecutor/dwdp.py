@@ -34,7 +34,10 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-from mpi4py.MPI import COMM_WORLD
+try:
+    from mpi4py.MPI import COMM_WORLD
+except (ImportError, RuntimeError, ModuleNotFoundError):
+    COMM_WORLD = None  # single-process fallback
 
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.modules.dwdp import DWDPWeightManager, setup_dwdp

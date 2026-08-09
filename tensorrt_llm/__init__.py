@@ -42,6 +42,7 @@ if _on_windows_stub:
     quantization = None
     runtime = None
     tools = None
+    deep_gemm = None
     MnnvlMemory = None
     MnnvlMoe = None
     MoEAlltoallInfo = None
@@ -79,6 +80,10 @@ else:
     import tensorrt_llm.quantization as quantization
     import tensorrt_llm.runtime as runtime
     import tensorrt_llm.tools as tools
+
+    # Eagerly import custom ops so all torch.ops.trtllm.* are registered
+    # at import time (needed by model modules that call them directly).
+    from tensorrt_llm._torch import custom_ops  # noqa: F401
 
     from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
     from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,

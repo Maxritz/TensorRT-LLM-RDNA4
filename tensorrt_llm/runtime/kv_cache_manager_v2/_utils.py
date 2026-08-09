@@ -383,24 +383,38 @@ PROT_WRITE: Final[int] = 0x2
 MREMAP_MAYMOVE: Final[int] = 1
 MAP_FAILED: Final[int] = -1
 
-_libc = ctypes.CDLL(find_library("c"), use_errno=True)
-_libc.mmap.restype = ctypes.c_void_p
-_libc.mmap.argtypes = [
-    ctypes.c_void_p,
-    ctypes.c_size_t,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_longlong,
-]
-_libc.munmap.restype = ctypes.c_int
-_libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-_libc.mremap.restype = ctypes.c_void_p
-_libc.mremap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int]
-_libc.madvise.restype = ctypes.c_int
-_libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-_libc.posix_fallocate.restype = ctypes.c_int
-_libc.posix_fallocate.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
+_libc = None
+if os.name != "nt":
+    _libc = ctypes.CDLL(find_library("c"), use_errno=True)
+    _libc.mmap.restype = ctypes.c_void_p
+    _libc.mmap.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_longlong,
+    ]
+    _libc.munmap.restype = ctypes.c_int
+    _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    _libc.mremap.restype = ctypes.c_void_p
+    _libc.mremap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int]
+    _libc.madvise.restype = ctypes.c_int
+    _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    _libc.posix_fallocate.restype = ctypes.c_int
+    _libc.posix_fallocate.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
+else:
+    _kernel32 = ctypes.windll.kernel32
+    _kernel32.VirtualAlloc.restype = ctypes.c_void_p
+    _kernel32.VirtualAlloc.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_uint]
+    _kernel32.VirtualFree.restype = ctypes.c_bool
+    _kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+
+    _MEM_COMMIT: Final[int] = 0x00001000
+    _MEM_RESERVE: Final[int] = 0x00002000
+    _MEM_RELEASE: Final[int] = 0x00008000
+    _PAGE_READWRITE: Final[int] = 0x04
 
 MADV_HUGEPAGE: Final[int] = 14
 MADV_NOHUGEPAGE: Final[int] = 15
@@ -438,6 +452,16 @@ def _mmap(size: int) -> int:
     Returns the address as an integer.
     Raises HostOOMError on failure.
     """
+    if os.name == "nt":
+        ptr = _kernel32.VirtualAlloc(
+            None, ctypes.c_size_t(size),
+            ctypes.c_uint(_MEM_COMMIT | _MEM_RESERVE),
+            ctypes.c_uint(_PAGE_READWRITE))
+        ptr_int = ptr or 0
+        if ptr_int == 0:
+            raise HostOOMError("VirtualAlloc failed")
+        return ptr_int
+
     prot = PROT_READ | PROT_WRITE
     flags = MAP_PRIVATE | MAP_ANONYMOUS
 
@@ -459,6 +483,10 @@ def _mmap(size: int) -> int:
 
 
 def _munmap(ptr: int, size: int) -> None:
+    if os.name == "nt":
+        _kernel32.VirtualFree(ctypes.c_void_p(ptr), 0, _MEM_RELEASE)
+        return
+
     ret = _libc.munmap(ctypes.c_void_p(ptr), ctypes.c_size_t(size))
     if ret != 0:
         error_code = ctypes.get_errno()
@@ -471,6 +499,22 @@ def _mremap(ptr: int, old_size: int, new_size: int) -> int:
     Returns the new address as an integer.
     Raises HostOOMError on failure.
     """
+    if os.name == "nt":
+        # No direct equivalent of mremap; allocate new, copy, free old
+        new_ptr = _kernel32.VirtualAlloc(
+            None, ctypes.c_size_t(new_size),
+            ctypes.c_uint(_MEM_COMMIT | _MEM_RESERVE),
+            ctypes.c_uint(_PAGE_READWRITE))
+        new_ptr_int = new_ptr or 0
+        if new_ptr_int == 0:
+            raise HostOOMError("VirtualAlloc failed")
+        if ptr:
+            ctypes.memmove(
+                ctypes.c_void_p(new_ptr_int), ctypes.c_void_p(ptr),
+                ctypes.c_size_t(min(old_size, new_size)))
+            _kernel32.VirtualFree(ctypes.c_void_p(ptr), 0, _MEM_RELEASE)
+        return new_ptr_int
+
     ptr_new = _libc.mremap(
         ctypes.c_void_p(ptr),
         ctypes.c_size_t(old_size),
@@ -485,6 +529,8 @@ def _mremap(ptr: int, old_size: int, new_size: int) -> int:
 
 
 def _posix_fallocate(fd: int, offset: int, length: int) -> None:
+    if os.name == "nt":
+        return
     ret = _libc.posix_fallocate(
         ctypes.c_int(fd), ctypes.c_longlong(offset), ctypes.c_longlong(length)
     )

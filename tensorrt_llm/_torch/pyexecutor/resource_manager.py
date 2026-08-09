@@ -23,7 +23,11 @@ from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
 
 import torch
-from mpi4py import MPI
+
+try:
+    from mpi4py import MPI
+except (ImportError, RuntimeError, ModuleNotFoundError):
+    MPI = None  # single-process fallback
 
 import tensorrt_llm
 import tensorrt_llm.bindings

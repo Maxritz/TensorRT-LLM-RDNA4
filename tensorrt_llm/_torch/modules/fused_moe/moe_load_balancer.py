@@ -7,7 +7,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except (ImportError, RuntimeError, ModuleNotFoundError):
+    class _MPIStub:
+        Comm = type('Comm', (), {})  # stub Comm class
+        COMM_WORLD = None
+    MPI = _MPIStub()
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.runtime as _tbr

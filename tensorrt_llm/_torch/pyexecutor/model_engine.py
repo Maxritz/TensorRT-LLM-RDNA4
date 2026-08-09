@@ -16,7 +16,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch._dynamo.config
 
-import tensorrt_llm.bindings.internal.userbuffers as ub
+try:
+    import tensorrt_llm.bindings.internal.userbuffers as ub
+except (ImportError, ModuleNotFoundError):
+    ub = None  # C++ extension not available (e.g., Windows stub path)
 from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
@@ -6988,6 +6991,8 @@ class PyTorchModelEngine(ModelEngine):
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
+            return False
+        if ub is None:
             return False
 
         # Disable UB for unsupported platforms

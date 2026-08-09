@@ -235,6 +235,14 @@ class _Internal:
     def barrier(group=None):
         pass
 
+    def __getattr__(self, name):
+        import importlib
+        try:
+            return importlib.import_module(
+                f"tensorrt_llm.bindings.internal.{name}")
+        except ImportError:
+            return _Stub()
+
 
 internal = _Internal()
 
@@ -432,6 +440,21 @@ class _Stub:
 
     def __getattr__(self, name):
         return _Stub()
+
+    def __or__(self, other):
+        return self
+
+    def __ror__(self, other):
+        return self
+
+    def __iter__(self):
+        return iter([])
+
+    def __int__(self):
+        return 0
+
+    def __mro_entries__(self, bases):
+        return (object,)
 
 
 def __getattr__(name):

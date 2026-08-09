@@ -58,18 +58,20 @@ def reduce_op_to_torch(op: ReduceOp) -> torch.distributed.ReduceOp:
     return _reduce_op_to_torch_dict[op]
 
 
-_reduce_op_to_mpi_dict = {
-    ReduceOp.SUM: MPI.SUM,
-    ReduceOp.PRODUCT: MPI.PROD,
-    ReduceOp.MIN: MPI.MIN,
-    ReduceOp.MAX: MPI.MAX,
-    ReduceOp.BAND: MPI.BAND,
-    ReduceOp.BOR: MPI.BOR,
-    ReduceOp.BXOR: MPI.BXOR,
-}
+_reduce_op_to_mpi_dict = {}
+if MPI is not None:
+    _reduce_op_to_mpi_dict = {
+        ReduceOp.SUM: MPI.SUM,
+        ReduceOp.PRODUCT: MPI.PROD,
+        ReduceOp.MIN: MPI.MIN,
+        ReduceOp.MAX: MPI.MAX,
+        ReduceOp.BAND: MPI.BAND,
+        ReduceOp.BOR: MPI.BOR,
+        ReduceOp.BXOR: MPI.BXOR,
+    }
 
 
-def reduce_op_to_mpi(op: ReduceOp) -> MPI.Op:
+def reduce_op_to_mpi(op: ReduceOp) -> "Optional[Any]":
     return _reduce_op_to_mpi_dict[op]
 
 
@@ -645,7 +647,7 @@ def safe_allgather(
 
 
 class MPIDist(Distributed):
-    tp_comm: MPI.Comm
+    tp_comm: Optional[Any] = None
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)

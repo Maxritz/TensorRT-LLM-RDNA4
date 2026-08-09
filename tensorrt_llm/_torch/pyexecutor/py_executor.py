@@ -23,7 +23,10 @@ from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 try:
     from cuda.bindings import runtime as cudart
 except ImportError:
-    from cuda import cudart
+    try:
+        from cuda import cudart
+    except ImportError:
+        cudart = None
 
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  is_trace_enabled, mpi_comm, mpi_disabled,
@@ -2535,7 +2538,8 @@ class PyExecutor:
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
-        CUASSERT(cudart.cudaSetDevice(self.device_id))
+        if cudart is not None:
+            CUASSERT(cudart.cudaSetDevice(self.device_id))
         microbatch_id = 0
         with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
@@ -2864,7 +2868,8 @@ class PyExecutor:
         )
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
-        CUASSERT(cudart.cudaSetDevice(self.device_id))
+        if cudart is not None:
+            CUASSERT(cudart.cudaSetDevice(self.device_id))
         # pkl5.Intracomm serializes send/recv through internal locks. Sharing
         # one communicator between the executor loop and this background
         # thread can serialize unrelated traffic or deadlock. Use the
@@ -2952,7 +2957,8 @@ class PyExecutor:
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         torch.cuda.set_device(self.device_id)
-        CUASSERT(cudart.cudaSetDevice(self.device_id))
+        if cudart is not None:
+            CUASSERT(cudart.cudaSetDevice(self.device_id))
         set_thread_local_mpi_comm(self._sleep_wakeup_comm)
         try:
             while True:
@@ -4010,7 +4016,8 @@ class PyExecutor:
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
-        CUASSERT(cudart.cudaSetDevice(self.device_id))
+        if cudart is not None:
+            CUASSERT(cudart.cudaSetDevice(self.device_id))
         with self._profiler() as profile_step, self.hang_detector:
             sample_state = None
             iter_start_time = time.time()
@@ -4479,7 +4486,8 @@ class PyExecutor:
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
-        CUASSERT(cudart.cudaSetDevice(self.device_id))
+        if cudart is not None:
+            CUASSERT(cudart.cudaSetDevice(self.device_id))
         with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None

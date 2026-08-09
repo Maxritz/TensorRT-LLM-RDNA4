@@ -2,12 +2,16 @@ import ast
 import contextlib
 import copy
 import enum
-import fcntl
 import inspect
 import itertools
 import json
 import os
 import time
+
+try:
+    import fcntl  # POSIX only
+except ImportError:
+    fcntl = None  # Windows fallback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -408,13 +412,16 @@ def _exclusive_cache_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        fcntl.lockf(fd, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.lockf(fd, fcntl.LOCK_EX)
         yield
     finally:
-        try:
-            fcntl.lockf(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        if fcntl is not None:
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
 
 
 class AutoTunerProfilingCache:

@@ -14,5 +14,5 @@ try:
                                                     'CublasLtFP4GemmRunner'):
         logger.info(f"cuBLASLt FP4 GEMM is available")
         IS_CUBLASLT_AVAILABLE = True
-except ImportError:
+except (ImportError, AttributeError, RuntimeError):
     pass
