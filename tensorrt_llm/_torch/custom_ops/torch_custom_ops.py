@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import enum
 import os
 import threading
@@ -20,6 +21,7 @@ from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import triton  # type: ignore[import]
 
@@ -74,13 +76,12 @@ def _safe_register_fake(name):
 
 
 # ---------------------------------------------------------------------------
-# C++ extension availability detection and fallbacks
+# C++ extension availability detection and Vulkan fallbacks
 # ---------------------------------------------------------------------------
 # The TRT-LLM C++ extension (torch.classes.trtllm.*) is not available on the
-# Windows/Vulkan stub path.  On those platforms the Runner classes below fall
-# back to either Vulkan compute shaders (via vulkan_backend) or pure-PyTorch
-# GPU implementations so that model forward passes work without the C++
-# extension, Triton, or CUDA-specific kernels.
+# Windows/Vulkan stub path.  The Runner classes below fall back to Vulkan
+# compute shaders via vulkan_backend.torch_bridge (ctypes bridge to the
+# vulkan_backend shared library).
 _TLLM_CPP_AVAILABLE = False
 try:
     torch.classes.trtllm.FusedMoeRunner  # noqa: B018
@@ -112,11 +113,11 @@ def _vk_call(fn_name: str, *args) -> object:
     return getattr(_VK_COMPUTE, fn_name)(*args)
 
 
-class _TorchGemmFallback:
-    """Pure-PyTorch GEMM fallback for when C++ runners are unavailable.
+class _VulkanGemmFallback:
+    """Vulkan GEMM fallback for when C++ runners are unavailable.
 
-    Supports fp16/bf16/fp32 via torch.nn.functional.linear which dispatches
-    to ROCm cuBLAS (available on AMD GPUs).
+    Delegates to the vulkan_backend shared library via torch_bridge.
+    Raises RuntimeError if Vulkan compute is not available.
     """
 
     @staticmethod
@@ -140,9 +141,12 @@ class _TorchGemmFallback:
                          do_preparation: bool,
                          activation_type: ActivationType,
                          unpadded_hidden_size: int):
-        output_dtype = weight.dtype
-        output = torch.nn.functional.linear(act, weight, bias)
-        return [output.to(output_dtype)]
+        from ..vulkan_backend.torch_bridge import vulkan_gemm
+        output = vulkan_gemm(act, weight)
+        if bias is not None:
+            from ..vulkan_backend.torch_bridge import vulkan_elementwise_add
+            output = vulkan_elementwise_add(output, bias)
+        return [output.to(weight.dtype)]
 
     @staticmethod
     def get_num_configs() -> int:
@@ -154,15 +158,13 @@ class _TorchGemmFallback:
 
 
 class _VulkanGemmRunner:
-    """Fallback GEMM runner for when C++ extension is unavailable.
+    """Vulkan GEMM runner for when C++ extension is unavailable.
 
-    Delegates to Vulkan compute via vulkan_backend when available;
-    otherwise uses PyTorch ops for correctness on any backend.
+    Delegates to Vulkan compute via vulkan_backend.torch_bridge.
     """
 
     def __init__(self, output_dtype: torch.dtype, **kwargs):
         self.output_dtype = output_dtype
-        self._vk = _VK_COMPUTE
         self._workspace_ptr = None
 
     def get_num_configs(self) -> int:
@@ -195,18 +197,21 @@ class _VulkanGemmRunner:
                          do_preparation: bool,
                          activation_type,
                          unpadded_hidden_size: int):
-        if self._vk is not None:
-            return _vk_call("run_gemm", act, weight, bias, self.output_dtype,
-                            act_scale, weight_scale, global_scale)
-        output = torch.nn.functional.linear(act, weight, bias)
+        from ..vulkan_backend.torch_bridge import vulkan_gemm
+        output = vulkan_gemm(act, weight)
+        if bias is not None:
+            from ..vulkan_backend.torch_bridge import vulkan_elementwise_add
+            output = vulkan_elementwise_add(output, bias)
         return [output.to(self.output_dtype)]
 
     def run_gemm(self, act, weight, bias, output_dtype=None):
+        from ..vulkan_backend.torch_bridge import vulkan_gemm
         if output_dtype is None:
             output_dtype = self.output_dtype
-        if self._vk is not None:
-            return _vk_call("run_gemm", act, weight, bias, output_dtype)
-        output = torch.nn.functional.linear(act, weight, bias)
+        output = vulkan_gemm(act, weight)
+        if bias is not None:
+            from ..vulkan_backend.torch_bridge import vulkan_elementwise_add
+            output = vulkan_elementwise_add(output, bias)
         return [output.to(output_dtype)]
 
     def clear_cache(self):
@@ -234,9 +239,10 @@ def _create_fused_moe_runner(x_dtype, weight_dtype, output_dtype,
 
 
 class _VulkanMoERunner:
-    """Fallback for FusedMoeRunner when C++ extension is unavailable.
+    """Vulkan MoE runner for when C++ extension is unavailable.
 
-    Delegates to Vulkan compute when available, otherwise uses PyTorch ops.
+    Delegates GEMM to Vulkan compute via vulkan_backend.torch_bridge.
+    Raises RuntimeError if Vulkan compute is not available.
     """
 
     def __init__(self, x_dtype, weight_dtype, output_dtype,
@@ -255,25 +261,35 @@ class _VulkanMoERunner:
     def clear_workspaces(self):
         self._workspace_ptr = None
 
-    def _apply_activation(self, x: torch.Tensor, activation_type: int) -> torch.Tensor:
-        if activation_type == int(ActivationType.Silu):
-            return torch.nn.functional.silu(x)
-        elif activation_type == int(ActivationType.Gelu):
-            return torch.nn.functional.gelu(x)
-        elif activation_type == int(ActivationType.GeluTanhApproximate):
-            return torch.nn.functional.gelu(x, approximate="tanh")
-        elif activation_type == int(ActivationType.Swiglu):
-            if self.unpadded_hidden_size is not None and self.unpadded_hidden_size > 0:
-                hidden = self.unpadded_hidden_size
-                x_up, x_gate = x[..., :hidden], x[..., hidden:]
+    def _apply_activation(self, x, activation_type):
+        from ..vulkan_backend.torch_bridge import _init
+        inst = _init()
+        dt = x.dtype
+        xf = x.detach().float().contiguous()
+        n = xf.numel()
+        xh = xf.cpu().numpy().astype('float32')
+        px = inst.malloc(xh.nbytes)
+        pout = inst.malloc(xh.nbytes)
+        try:
+            inst.memcpy_h2d(px, xh.ctypes.data, xh.nbytes)
+            if activation_type == ActivationType.Silu:
+                lib_fn = inst._funcs.tllm_vulkan_silu
+            elif activation_type == ActivationType.Gelu:
+                lib_fn = inst._funcs.tllm_vulkan_gelu
+            elif activation_type == ActivationType.Swiglu:
+                lib_fn = inst._funcs.tllm_vulkan_swiglu
             else:
-                x_up, x_gate = x.chunk(2, dim=-1)
-            return x_up * torch.nn.functional.silu(x_gate)
-        elif activation_type == int(ActivationType.Relu):
-            return torch.relu(x)
-        elif activation_type == int(ActivationType.Relu2):
-            return torch.relu(x) ** 2
-        return x
+                return x
+            lib_fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            lib_fn.restype = ctypes.c_int32
+            if not lib_fn(px, pout, n):
+                raise RuntimeError("Vulkan activation dispatch failed")
+            oh = np.empty(xh.shape, dtype=np.float32)
+            inst.memcpy_d2h(oh.ctypes.data, pout, xh.nbytes)
+        finally:
+            inst.free(px)
+            inst.free(pout)
+        return torch.from_numpy(oh).to(device=x.device, dtype=dt)
 
     def run_gemm_profile(self,
                          x, fc1_expert_weights, fc1_expert_biases,
@@ -287,52 +303,34 @@ class _VulkanMoERunner:
             self.activation_type = ActivationType(activation_type) if isinstance(activation_type, int) else activation_type
             self.unpadded_hidden_size = unpadded_hidden_size
 
-        # Simple MoE forward: loop over tokens and route to experts
+        from ..vulkan_backend.torch_bridge import vulkan_gemm
         num_tokens = x.shape[0]
         hidden = x.shape[1]
         output_dtype = self.output_dtype
 
-        # For simplicity: use a single GEMM approach for all experts combined
-        # This is a correctness-first fallback; performance will be lower.
-        fc1_weight = fc1_expert_weights  # [num_experts, 2*intermediate, hidden]
-        fc2_weight = fc2_expert_weights  # [num_experts, hidden, intermediate]
-
-        output = torch.zeros(num_tokens, hidden,
-                             dtype=output_dtype, device=x.device)
-
-        if fc1_expert_biases is not None:
-            fc1_bias = fc1_expert_biases
-        if fc2_expert_biases is not None:
-            fc2_bias = fc2_expert_biases
-
-        # Get routing info from the autotuner inputs (token_selected_experts etc.)
-        # In the real flow, these are passed but not used here directly.
-        # This fallback implements the basic MoE computation.
-        from ..modules.fused_moe.moe_sort import moe_sort, moe_finalize
-        from ..modules.fused_moe.moe_permute import moe_permute
-
-        # Use the trtllm ops for sorting/permutation if available
-        # For fallback, we need to implement routing manually
-        # Actually, the routing (token_to_expert mapping) is done by the
-        # fused_moe custom_op wrapper, not by the runner.
-        # The runner only does the GEMM part.
-
-        # For a single-expert fallback:
-        # fc1: [hidden] -> [2*intermediate]
-        # activation (swiglu)
-        # fc2: [intermediate] -> [hidden]
+        fc1_weight = fc1_expert_weights
+        fc2_weight = fc2_expert_weights
         num_experts = fc1_weight.shape[0]
         intermediate = fc1_weight.shape[1] // 2
 
-        # For the fallback, use a simple per-expert GEMM
-        # This matches the non-quantized path
         results = torch.zeros(num_tokens, hidden,
                               dtype=output_dtype, device=x.device)
 
-        # Each token goes to one expert (top_k=1 for this fallback)
-        # In practice, the routing is handled by the caller
-        # We need to get token_selected_experts and token_final_scales
-        # These are the additional inputs to the fused_moe custom_op
+        for e in range(num_experts):
+            w1 = fc1_weight[e]
+            w2 = fc2_weight[e]
+            gate_out = vulkan_gemm(x, w1)
+            if fc1_expert_biases is not None:
+                from ..vulkan_backend.torch_bridge import vulkan_elementwise_add
+                gate_out = vulkan_elementwise_add(gate_out, fc1_expert_biases[e])
+            act_out = self._apply_activation(gate_out, self.activation_type)
+            # SwiGLU splits
+            up, gate = act_out.chunk(2, dim=-1)
+            act_out = up * gate
+            fc2_out = vulkan_gemm(act_out, w2)
+            if fc2_expert_biases is not None:
+                fc2_out = vulkan_elementwise_add(fc2_out, fc2_expert_biases[e])
+            results = results + fc2_out
 
         return [results]
 
