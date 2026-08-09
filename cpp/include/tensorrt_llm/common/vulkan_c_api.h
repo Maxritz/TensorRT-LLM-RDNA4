@@ -247,6 +247,46 @@ extern "C" int32_t tllm_vulkan_q8_0_gemm(
     }
 }
 
+extern "C" int32_t tllm_vulkan_silu(
+    void* input, void* output, size_t elementCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchSilu(input, output, elementCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_gelu(
+    void* input, void* output, size_t elementCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchGelu(input, output, elementCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_swiglu(
+    void* input, void* output,
+    uint32_t hiddenDim, uint32_t tokenCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchSwiglu(input, output, hiddenDim, tokenCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* KV Cache Update (2D) — post speculative decode                      */
 /* ------------------------------------------------------------------ */

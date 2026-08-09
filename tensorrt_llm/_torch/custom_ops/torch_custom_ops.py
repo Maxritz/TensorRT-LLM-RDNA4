@@ -192,20 +192,20 @@ class _VulkanGenMoERunner:
             output = torch.zeros(num_tokens, hidden, dtype=hidden_states.dtype,
                                  device=hidden_states.device)
 
-        # Compute routing
-        if routing_logits is not None:
-            routing_scores = torch.matmul(routing_logits, gemm1_weights[0])
-            if routing_bias is not None:
-                routing_scores = routing_scores + routing_bias
-            routing_scores = vulkan_softmax(routing_scores)
-            if routing_method_type == 0:
+        # Use pre-computed topk if provided, otherwise compute from routing_logits
+        if topk_ids is None:
+            if routing_logits is not None:
+                routing_scores = torch.matmul(routing_logits, gemm1_weights[0])
+                if routing_bias is not None:
+                    routing_scores = routing_scores + routing_bias
+                routing_scores = vulkan_softmax(routing_scores)
                 topk_val, topk_ids = torch.topk(routing_scores, top_k, dim=-1)
+                topk_weights = topk_val
             else:
-                topk_val, topk_ids = torch.topk(routing_scores, top_k, dim=-1)
-            topk_weights = topk_val
-
-        topk_ids = topk_ids if topk_ids is not None else token_selected_experts
-        topk_weights = topk_weights if topk_weights is not None else token_final_scales
+                raise RuntimeError("Either routing_logits or topk_ids must be provided")
+        else:
+            if topk_weights is None:
+                topk_weights = torch.ones_like(topk_ids, dtype=hidden_states.dtype)
 
         for e in range(num_experts):
             mask = (topk_ids == e)
@@ -408,34 +408,27 @@ class _VulkanMoERunner:
         self._workspace_ptr = None
 
     def _apply_activation(self, x, activation_type):
-        from ..vulkan_backend.torch_bridge import _init
-        inst = _init()
-        dt = x.dtype
-        xf = x.detach().float().contiguous()
-        n = xf.numel()
-        xh = xf.cpu().numpy().astype('float32')
-        px = inst.malloc(xh.nbytes)
-        pout = inst.malloc(xh.nbytes)
-        try:
-            inst.memcpy_h2d(px, xh.ctypes.data, xh.nbytes)
-            if activation_type == ActivationType.Silu:
-                lib_fn = inst._funcs.tllm_vulkan_silu
-            elif activation_type == ActivationType.Gelu:
-                lib_fn = inst._funcs.tllm_vulkan_gelu
-            elif activation_type == ActivationType.Swiglu:
-                lib_fn = inst._funcs.tllm_vulkan_swiglu
+        from ..vulkan_backend.torch_bridge import (
+            vulkan_silu, vulkan_gelu, vulkan_swiglu)
+        if activation_type == ActivationType.Silu:
+            return vulkan_silu(x)
+        elif activation_type == ActivationType.Gelu:
+            return vulkan_gelu(x)
+        elif activation_type == ActivationType.GeluTanhApproximate:
+            return torch.nn.functional.gelu(x, approximate="tanh")
+        elif activation_type == ActivationType.Swiglu:
+            if self.unpadded_hidden_size and self.unpadded_hidden_size > 0:
+                hidden = self.unpadded_hidden_size
+                up = x[..., :hidden]
+                gate = x[..., hidden:hidden * 2]
+                return up * torch.sigmoid(gate)
             else:
-                return x
-            lib_fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-            lib_fn.restype = ctypes.c_int32
-            if not lib_fn(px, pout, n):
-                raise RuntimeError("Vulkan activation dispatch failed")
-            oh = np.empty(xh.shape, dtype=np.float32)
-            inst.memcpy_d2h(oh.ctypes.data, pout, xh.nbytes)
-        finally:
-            inst.free(px)
-            inst.free(pout)
-        return torch.from_numpy(oh).to(device=x.device, dtype=dt)
+                return vulkan_swiglu(x)
+        elif activation_type == ActivationType.Relu:
+            return torch.relu(x)
+        elif activation_type == ActivationType.Relu2:
+            return torch.relu(x) ** 2
+        return x
 
     def run_gemm_profile(self,
                          x, fc1_expert_weights, fc1_expert_biases,
@@ -463,19 +456,16 @@ class _VulkanMoERunner:
                               dtype=output_dtype, device=x.device)
 
         for e in range(num_experts):
-            w1 = fc1_weight[e]
-            w2 = fc2_weight[e]
-            gate_out = vulkan_gemm(x, w1)
+            w1 = fc1_weight[e]  # [2*intermediate, hidden]
+            w2 = fc2_weight[e]  # [hidden, intermediate]
+            gate_out = vulkan_gemm(x, w1.T.contiguous())
             if fc1_expert_biases is not None:
                 from ..vulkan_backend.torch_bridge import vulkan_elementwise_add
-                gate_out = vulkan_elementwise_add(gate_out, fc1_expert_biases[e])
+                gate_out = vulkan_elementwise_add(gate_out, fc1_expert_biases[e].expand_as(gate_out))
             act_out = self._apply_activation(gate_out, self.activation_type)
-            # SwiGLU splits
-            up, gate = act_out.chunk(2, dim=-1)
-            act_out = up * gate
-            fc2_out = vulkan_gemm(act_out, w2)
+            fc2_out = vulkan_gemm(act_out, w2.T.contiguous())
             if fc2_expert_biases is not None:
-                fc2_out = vulkan_elementwise_add(fc2_out, fc2_expert_biases[e])
+                fc2_out = vulkan_elementwise_add(fc2_out, fc2_expert_biases[e].expand_as(fc2_out))
             results = results + fc2_out
 
         return [results]

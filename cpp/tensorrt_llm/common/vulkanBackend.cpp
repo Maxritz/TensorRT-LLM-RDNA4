@@ -293,6 +293,70 @@ bool VulkanBackend::launchQ8_0Gemm(void* weight, void* activation, void* output,
     return true;
 }
 
+bool VulkanBackend::launchSilu(void* input, void* output,
+                               size_t elementCount, void* stream)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchSilu(
+        input, output, elementCount);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("SiLU launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchGelu(void* input, void* output,
+                               size_t elementCount, void* stream)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchGelu(
+        input, output, elementCount);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("GELU launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchSwiglu(void* input, void* output,
+                                 uint32_t hiddenDim, uint32_t tokenCount,
+                                 void* stream)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchSwiglu(
+        input, output, hiddenDim, tokenCount);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("SwiGLU launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
 bool VulkanBackend::launchSoftmax(void* input, void* output,
                                   uint32_t batchSize, uint32_t numHeads, uint32_t seqLen,
                                   void* stream)

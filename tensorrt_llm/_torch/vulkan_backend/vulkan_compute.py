@@ -131,6 +131,26 @@ class _VulkanCompute:
         ]
         lib.tllm_vulkan_elementwise_add.restype = ctypes.c_int32
 
+        # tllm_vulkan_silu(void* input, void* output, size_t elementCount)
+        lib.tllm_vulkan_silu.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        lib.tllm_vulkan_silu.restype = ctypes.c_int32
+
+        # tllm_vulkan_gelu(void* input, void* output, size_t elementCount)
+        lib.tllm_vulkan_gelu.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        lib.tllm_vulkan_gelu.restype = ctypes.c_int32
+
+        # tllm_vulkan_swiglu(void* input, void* output, uint32_t hiddenDim, uint32_t tokenCount)
+        if hasattr(lib, "tllm_vulkan_swiglu"):
+            lib.tllm_vulkan_swiglu.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            lib.tllm_vulkan_swiglu.restype = ctypes.c_int32
+
         # tllm_vulkan_attention(void* q, void* k, void* v, void* output,
         #                       uint32_t batchSize, uint32_t numHeads,
         #                       uint32_t seqLenQ, uint32_t seqLenK, uint32_t headDim,
@@ -237,6 +257,15 @@ class _VulkanCompute:
     def elementwise_add(self, a, b, output, element_count):
         return self._funcs.tllm_vulkan_elementwise_add(a, b, output, element_count)
 
+    def silu(self, input_ptr, output_ptr, element_count):
+        return self._funcs.tllm_vulkan_silu(input_ptr, output_ptr, element_count)
+
+    def gelu(self, input_ptr, output_ptr, element_count):
+        return self._funcs.tllm_vulkan_gelu(input_ptr, output_ptr, element_count)
+
+    def swiglu(self, input_ptr, output_ptr, hidden_dim, token_count):
+        return self._funcs.tllm_vulkan_swiglu(input_ptr, output_ptr, hidden_dim, token_count)
+
     def attention(self, q, k, v, output, batch_size, num_heads, seq_len_q, seq_len_k, head_dim, causal):
         return self._funcs.tllm_vulkan_attention(q, k, v, output,
             batch_size, num_heads, seq_len_q, seq_len_k, head_dim, causal)
@@ -299,6 +328,9 @@ tllm_vulkan_softmax = _vk.softmax if is_available() else None
 tllm_vulkan_gemm = _vk.gemm if is_available() else None
 tllm_vulkan_rms_norm = _vk.rms_norm if is_available() else None
 tllm_vulkan_elementwise_add = _vk.elementwise_add if is_available() else None
+tllm_vulkan_silu = _vk.silu if is_available() else None
+tllm_vulkan_gelu = _vk.gelu if is_available() else None
+tllm_vulkan_swiglu = _vk.swiglu if is_available() else None
 tllm_vulkan_attention = _vk.attention if is_available() else None
 tllm_vulkan_topk = _vk.topk if is_available() else None
 tllm_vulkan_q8_0_gemm = _vk.q8_0_gemm if is_available() else None

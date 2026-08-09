@@ -77,13 +77,23 @@ public:
                                      void* stream = nullptr);
 
     static bool launchFp16Gemm(void* a, void* b, void* output,
-                              uint32_t M, uint32_t N, uint32_t K,
-                              void* stream = nullptr);
+                               uint32_t M, uint32_t N, uint32_t K,
+                               void* stream = nullptr);
 
     static bool launchQ8_0Gemm(void* weight, void* activation, void* output,
                                uint32_t M, uint32_t N, uint32_t K,
                                uint32_t blocksPerRow = 0,
                                void* stream = nullptr);
+
+    static bool launchSilu(void* input, void* output,
+                           size_t elementCount, void* stream = nullptr);
+
+    static bool launchGelu(void* input, void* output,
+                           size_t elementCount, void* stream = nullptr);
+
+    static bool launchSwiglu(void* input, void* output,
+                             uint32_t hiddenDim, uint32_t tokenCount,
+                             void* stream = nullptr);
 
     static bool launchSoftmax(void* input, void* output,
                               uint32_t batchSize, uint32_t numHeads, uint32_t seqLen,

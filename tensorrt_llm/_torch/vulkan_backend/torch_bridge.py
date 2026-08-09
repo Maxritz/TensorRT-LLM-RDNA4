@@ -49,7 +49,8 @@ from . import vulkan_compute as _vc
 __all__ = [
     "is_available", "vulkan_attention", "vulkan_topk",
     "vulkan_softmax", "vulkan_rms_norm", "vulkan_gemm",
-    "vulkan_elementwise_add",
+    "vulkan_elementwise_add", "vulkan_silu", "vulkan_gelu",
+    "vulkan_swiglu",
 ]
 
 _CUDA = "cuda"
@@ -397,4 +398,94 @@ def vulkan_elementwise_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         _free(inst, pa, pb, po)
 
     out = torch.from_numpy(oh).to(device=a.device, dtype=dt)
+    return out
+
+
+def vulkan_silu(x: torch.Tensor) -> torch.Tensor:
+    """SiLU (swish) activation: x * sigmoid(x) via Vulkan compute shader."""
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if x.device.type != _CUDA:
+        raise RuntimeError("vulkan_silu requires GPU tensors")
+
+    inst = _init()
+    dt = x.dtype
+    xf = x.detach().float().contiguous()
+    n = xf.numel()
+    xh = _as_host_array(xf)
+
+    pin = inst.malloc(xh.nbytes)
+    pout = inst.malloc(xh.nbytes)
+    try:
+        inst.memcpy_h2d(pin, xh.ctypes.data, xh.nbytes)
+        if not inst._funcs.tllm_vulkan_silu(pin, pout, n):
+            raise RuntimeError("tllm_vulkan_silu dispatch failed")
+        oh = np.empty(xh.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, xh.nbytes)
+    finally:
+        _free(inst, pin, pout)
+
+    out = torch.from_numpy(oh).to(device=x.device, dtype=dt)
+    return out
+
+
+def vulkan_gelu(x: torch.Tensor) -> torch.Tensor:
+    """GELU activation (tanh approximation) via Vulkan compute shader."""
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if x.device.type != _CUDA:
+        raise RuntimeError("vulkan_gelu requires GPU tensors")
+
+    inst = _init()
+    dt = x.dtype
+    xf = x.detach().float().contiguous()
+    n = xf.numel()
+    xh = _as_host_array(xf)
+
+    pin = inst.malloc(xh.nbytes)
+    pout = inst.malloc(xh.nbytes)
+    try:
+        inst.memcpy_h2d(pin, xh.ctypes.data, xh.nbytes)
+        if not inst._funcs.tllm_vulkan_gelu(pin, pout, n):
+            raise RuntimeError("tllm_vulkan_gelu dispatch failed")
+        oh = np.empty(xh.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, xh.nbytes)
+    finally:
+        _free(inst, pin, pout)
+
+    out = torch.from_numpy(oh).to(device=x.device, dtype=dt)
+    return out
+
+
+def vulkan_swiglu(x: torch.Tensor) -> torch.Tensor:
+    """SwiGLU activation via Vulkan compute shader.
+
+    Input ``[M, 2*H]`` (up then gate), output ``[M, H]`` = up * sigmoid(gate).
+    """
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if x.device.type != _CUDA:
+        raise RuntimeError("vulkan_swiglu requires GPU tensors")
+
+    inst = _init()
+    dt = x.dtype
+    xf = x.detach().float().contiguous()
+    assert xf.dim() == 2 and xf.shape[-1] % 2 == 0
+    hidden = xf.shape[-1] // 2
+    tokens = xf.shape[0]
+    xh = _as_host_array(xf)
+
+    pin = inst.malloc(xh.nbytes)
+    pout_bytes = tokens * hidden * 4  # fp32
+    pout = inst.malloc(pout_bytes)
+    try:
+        inst.memcpy_h2d(pin, xh.ctypes.data, xh.nbytes)
+        if not inst._funcs.tllm_vulkan_swiglu(pin, pout, hidden, tokens):
+            raise RuntimeError("tllm_vulkan_swiglu dispatch failed")
+        oh = np.empty((tokens, hidden), dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, pout_bytes)
+    finally:
+        _free(inst, pin, pout)
+
+    out = torch.from_numpy(oh).to(device=x.device, dtype=dt)
     return out

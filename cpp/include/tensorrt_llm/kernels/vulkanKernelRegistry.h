@@ -275,6 +275,25 @@ public:
         void* output, float value, size_t elementCount,
         uint32_t blockSize = 256);
 
+    // ==================== Activation Operations ====================
+    // SiLU (swish): out = x * sigmoid(x)
+    common::VulkanResult dispatchSilu(
+        void* input, void* output,
+        size_t elementCount,
+        uint32_t blockSize = 256);
+
+    // GELU (tanh approximation)
+    common::VulkanResult dispatchGelu(
+        void* input, void* output,
+        size_t elementCount,
+        uint32_t blockSize = 256);
+
+    // SwiGLU: input [M, 2*H], output [M, H] = up * sigmoid(gate)
+    common::VulkanResult dispatchSwiglu(
+        void* input, void* output,
+        uint32_t hiddenDim, uint32_t tokenCount,
+        uint32_t blockSize = 256);
+
 private:
     std::shared_ptr<common::VulkanContext> mContext;
     std::shared_ptr<common::VulkanShaderCompiler> mCompiler;
