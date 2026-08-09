@@ -25,9 +25,12 @@ in CUDA-dependent extensions on some hosts).
 
 import importlib.util
 import os
+import sys
 
 import numpy as np
 import pytest
+import torch
+import torch.nn.functional as F
 
 _REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -50,6 +53,36 @@ if not vc.is_available():
     )
 
 _vk = vc._vk
+
+
+# ---------------------------------------------------------------------------
+# Load torch_bridge.py via a fake package so its relative import
+# ``from . import vulkan_compute`` resolves correctly.  This mirrors the
+# lazy-loading approach used by the runtime on Windows: the full
+# ``tensorrt_llm`` package is never imported.
+# ---------------------------------------------------------------------------
+_TB_PATH = os.path.join(os.path.dirname(_VC_PATH), "torch_bridge.py")
+tb = None
+if os.path.isfile(_TB_PATH):
+    try:
+        import types as _types
+        _pkg_name = "vk_bridge_test_pkg"
+        _pkg = _types.ModuleType(_pkg_name)
+        _pkg.__path__ = [os.path.dirname(_VC_PATH)]
+        sys.modules[_pkg_name] = _pkg
+        sys.modules[f"{_pkg_name}.vulkan_compute"] = vc
+        _tb_spec = importlib.util.spec_from_file_location(
+            f"{_pkg_name}.torch_bridge", _TB_PATH)
+        tb = importlib.util.module_from_spec(_tb_spec)
+        sys.modules[f"{_pkg_name}.torch_bridge"] = tb
+        _tb_spec.loader.exec_module(tb)
+    except Exception:
+        tb = None
+
+_HAS_TORCH_CUDA = torch.cuda.is_available()
+_requires_vulkan_torch = pytest.mark.skipif(
+    tb is None or not _HAS_TORCH_CUDA,
+    reason="torch_bridge + CUDA/ROCm GPU required")
 
 
 @pytest.fixture(scope="module")
@@ -235,3 +268,73 @@ def test_topk_matches_reference(vk):
     finally:
         _free(vk, p_scores, p_inoff, p_outoff, p_topk)
     assert np.array_equal(got, expected), f"topk mismatch: {got} != {expected}"
+
+
+# ---------------------------------------------------------------------------
+# torch_bridge.py tests: validate vulkan_attention vs F.scaled_dot_product_attention
+# and vulkan_topk vs a NumPy reference, using real torch GPU tensors.
+# ---------------------------------------------------------------------------
+@_requires_vulkan_torch
+@pytest.mark.parametrize("B,H,sq,sk,hd,causal", [
+    (1, 2, 5, 6, 8, True),
+    (2, 4, 5, 6, 8, False),
+    (1, 1, 16, 16, 16, True),
+    (3, 8, 4, 7, 32, False),
+])
+@pytest.mark.parametrize("dt", [torch.float32, torch.float16])
+def test_vulkan_attention_matches_pytorch(B, H, sq, sk, hd, causal, dt):
+    q = torch.randn(B, H, sq, hd, device="cuda")
+    k = torch.randn(B, H, sk, hd, device="cuda")
+    v = torch.randn(B, H, sk, hd, device="cuda")
+    qd, kd, vd = q.to(dt), k.to(dt), v.to(dt)
+    with torch.no_grad():
+        o = tb.vulkan_attention(qd, kd, vd, causal)
+    ref = F.scaled_dot_product_attention(qd.float(), kd.float(), vd.float(),
+                                         is_causal=causal)
+    tol = 5e-2 if dt == torch.float16 else 1e-3
+    assert (o.float() - ref).abs().max().item() <= tol, \
+        f"attention mismatch: err={(o.float() - ref).abs().max().item():.3e} tol={tol:.0e}"
+
+
+@_requires_vulkan_torch
+def test_vulkan_topk_matches_reference():
+    num_heads, batch, topk, total_tokens = 2, 2, 3, 8
+    total_out = 6
+    scores = torch.randn(num_heads, total_tokens, device="cuda")
+    in_off = torch.tensor([0, 5, total_tokens], dtype=torch.uint32, device="cuda")
+    out_off = torch.tensor([0, 3, 6], dtype=torch.uint32, device="cuda")
+    got = tb.vulkan_topk(scores, topk, in_off, out_off)
+
+    # Reference: per (head, req) pick top-k row-local argmax descending
+    expected = torch.empty(num_heads * total_out, dtype=torch.int32, device="cuda")
+    for h in range(num_heads):
+        row = scores[h].cpu().numpy()
+        for b in range(batch):
+            s = int(in_off[b].item()); e = int(in_off[b + 1].item())
+            window = row[s:e].copy()
+            picks = int(out_off[b + 1].item()) - int(out_off[b].item())
+            picked = []
+            for _ in range(min(picks, topk)):
+                j = int(np.argmax(window))
+                picked.append(j)
+                window[j] = -np.inf
+            for s_idx, val in enumerate(picked):
+                expected[h * total_out + int(out_off[b].item()) + s_idx] = val
+
+    assert torch.equal(got, expected), \
+        f"topk mismatch:\ngot={got.cpu().numpy()}\nexp={expected.cpu().numpy()}"
+
+
+@_requires_vulkan_torch
+def test_vulkan_attention_fp16_exact_shapes():
+    """Quick smoke test for fp16 attention with non-trivial shapes."""
+    B, H, sq, sk, hd = 2, 4, 3, 4, 16
+    q = torch.randn(B, H, sq, hd, device="cuda", dtype=torch.float16)
+    k = torch.randn(B, H, sk, hd, device="cuda", dtype=torch.float16)
+    v = torch.randn(B, H, sk, hd, device="cuda", dtype=torch.float16)
+    out = tb.vulkan_attention(q, k, v, causal=False)
+    assert out.shape == (B, H, sq, hd)
+    assert out.dtype == torch.float16
+    ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float(),
+                                         is_causal=False)
+    assert (out.float() - ref).abs().max().item() <= 5e-2
