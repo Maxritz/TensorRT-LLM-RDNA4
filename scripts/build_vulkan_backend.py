@@ -31,6 +31,7 @@ The produced library exposes the ``tllm_vulkan_*`` C-ABI entry points. Loading
 it does not require a GPU; only ``tllm_vulkan_init`` (vkCreateInstance) needs a
 Vulkan-capable device.
 """
+
 import platform
 import shutil
 import subprocess
@@ -78,17 +79,46 @@ def build() -> None:
     _run(["cmake", "--build", str(BUILD_DIR), "--target", "vulkan_backend", "--config", "Release"])
 
 
+# mingw/Strawberry compiler-runtime companions that must sit next to the
+# backend DLL for ctypes.CDLL to resolve transitive dependencies on Windows.
+# The backend links the mingw CRT dynamically, so all of these must be
+# loadable from the package directory at ctypes.CDLL time.
+_RUNTIME_DLLS = ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
+
+
+def _candidate_runtime_dirs(lib: Path) -> list[Path]:
+    dirs = [lib.parent]
+    cache = BUILD_DIR / "CMakeCache.txt"
+    if cache.is_file():
+        for line in cache.read_text(errors="replace").splitlines():
+            if "CMAKE_CXX_COMPILER:" in line and "=" in line:
+                compiler = Path(line.split("=", 1)[1].strip())
+                dirs.append(compiler.parent)
+                break
+    return dirs
+
+
 def stage() -> Path:
     lib = _find_built_lib()
     if lib is None:
         raise SystemExit(
             f"Built vulkan_backend library not found under {BUILD_DIR} "
-            f"(expected one of {_lib_names()}).")
+            f"(expected one of {_lib_names()})."
+        )
     PKG_DIR.mkdir(parents=True, exist_ok=True)
     dest = PKG_DIR / lib.name
     shutil.copy2(lib, dest)
     print(f"Staged {lib.name} -> {dest}")
-    print("The ctypes loader in vulkan_compute.py will find it in the package directory.")
+    # Stage compiler-runtime companions (mingw shared CRT) from the build's
+    # output dir and/or the toolchain bin dir recorded in the CMake cache.
+    for name in _RUNTIME_DLLS:
+        for d in _candidate_runtime_dirs(lib):
+            rt = d / name
+            if rt.is_file():
+                shutil.copy2(rt, PKG_DIR / name)
+                print(f"Staged runtime {name} -> {PKG_DIR / name}")
+                break
+    print("The ctypes loader in vulkan_compute.py will find the library in the package directory.")
     return dest
 
 
