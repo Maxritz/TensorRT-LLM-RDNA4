@@ -123,6 +123,59 @@ extern "C" int32_t tllm_vulkan_softmax(
 }
 
 /* ------------------------------------------------------------------ */
+/* Core compute ops (GEMM, RMS norm, elementwise)                      */
+/* ------------------------------------------------------------------ */
+
+// FP16/FP32 GEMM: C[M,N] = A[M,K] * B[K,N], row-major, non-transposed.
+// (This variant stores operands/output in fp32 for deterministic
+//  verification — see fp16_gemm.comp; a folded float16 variant is a
+//  follow-up.) Mirrors launchFp16Gemm which hard-codes aT=bT=false.
+extern "C" int32_t tllm_vulkan_gemm(
+    void* a, void* b, void* output,
+    uint32_t M, uint32_t N, uint32_t K)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchFp16Gemm(a, b, output, M, N, K);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// RMSNorm: out = (in / sqrt(mean(in^2) + eps)) * gamma + beta,
+// feature-normalized per token over hiddenDim (row-major
+// tokenCount * hiddenDim) — matches the rms_norm.comp reference.
+extern "C" int32_t tllm_vulkan_rms_norm(
+    void* input, void* gamma, void* beta, void* output,
+    float eps, size_t hiddenDim, size_t tokenCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchRmsNorm(input, gamma, beta, output, eps, hiddenDim, tokenCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Elementwise add: output = a + b (fp32), matches elementwise_add.comp.
+extern "C" int32_t tllm_vulkan_elementwise_add(
+    void* a, void* b, void* output, size_t elementCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchElementwiseAdd(a, b, output, elementCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* KV Cache Update (2D) — post speculative decode                      */
 /* ------------------------------------------------------------------ */
 

@@ -110,6 +110,27 @@ class _VulkanCompute:
         ]
         lib.tllm_vulkan_softmax.restype = ctypes.c_int32
 
+        # tllm_vulkan_gemm(void* a, void* b, void* output, uint32_t M, uint32_t N, uint32_t K)
+        lib.tllm_vulkan_gemm.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ]
+        lib.tllm_vulkan_gemm.restype = ctypes.c_int32
+
+        # tllm_vulkan_rms_norm(void* input, void* gamma, void* beta, void* output,
+        #                      float eps, size_t hiddenDim, size_t tokenCount)
+        lib.tllm_vulkan_rms_norm.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_float, ctypes.c_size_t, ctypes.c_size_t,
+        ]
+        lib.tllm_vulkan_rms_norm.restype = ctypes.c_int32
+
+        # tllm_vulkan_elementwise_add(void* a, void* b, void* output, size_t elementCount)
+        lib.tllm_vulkan_elementwise_add.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        lib.tllm_vulkan_elementwise_add.restype = ctypes.c_int32
+
         # tllm_vulkan_kv_cache_update_2d(...)
         lib.tllm_vulkan_kv_cache_update_2d.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p,   # kv_cache_k, kv_cache_v
@@ -177,6 +198,15 @@ class _VulkanCompute:
     def softmax(self, input_ptr, output_ptr, batch, heads, seqlen, dtype):
         return self._funcs.tllm_vulkan_softmax(input_ptr, output_ptr, batch, heads, seqlen, dtype)
 
+    def gemm(self, a, b, output, M, N, K):
+        return self._funcs.tllm_vulkan_gemm(a, b, output, M, N, K)
+
+    def rms_norm(self, input, gamma, beta, output, eps, hidden_dim, token_count):
+        return self._funcs.tllm_vulkan_rms_norm(input, gamma, beta, output, eps, hidden_dim, token_count)
+
+    def elementwise_add(self, a, b, output, element_count):
+        return self._funcs.tllm_vulkan_elementwise_add(a, b, output, element_count)
+
     def kv_cache_update_2d(self, *args):
         return self._funcs.tllm_vulkan_kv_cache_update_2d(*args)
 
@@ -224,6 +254,9 @@ def device_synchronize():
 # Re-export
 tllm_vulkan_init = _vk.init if is_available() else None
 tllm_vulkan_softmax = _vk.softmax if is_available() else None
+tllm_vulkan_gemm = _vk.gemm if is_available() else None
+tllm_vulkan_rms_norm = _vk.rms_norm if is_available() else None
+tllm_vulkan_elementwise_add = _vk.elementwise_add if is_available() else None
 tllm_vulkan_kv_cache_update_2d = _vk.kv_cache_update_2d if is_available() else None
 tllm_vulkan_tree_spec_build = _vk.tree_spec_build if is_available() else None
 tllm_vulkan_tree_spec_rejection = _vk.tree_spec_rejection if is_available() else None
