@@ -184,10 +184,9 @@ GPUTarget VulkanShaderCompiler::detectTarget() const
         // Extract device family from PCI device ID
         uint32_t deviceID = info.deviceID;
 
-        if ((deviceID & 0xFFFF) == 0x9690 || // RX 9070 XT (RDNA4)
-            (deviceID & 0xFFFF) == 0x9691 || // RX 9070 (RDNA4)
-            (deviceID & 0xFFFF) == 0x9692 || // RX 9050 (RDNA4)
-            (deviceID & 0xFF00) == 0x9600)   // RDNA4 family
+        if ((deviceID & 0xFFFF) == 0x7550 || // Navi 48: RX 9070 / 9070 XT / 9070 GRE (RDNA4)
+            (deviceID & 0xFFFF) == 0x7551 || // Navi 48: AI PRO R9700 (RDNA4)
+            (deviceID & 0xFFFF) == 0x7590)   // Navi 44: RX 9050 / 9060 XT (RDNA4)
         {
             target.arch = GPUTarget::Architecture::AMD_RDNA4;
             target.archName = "RDNA4";
