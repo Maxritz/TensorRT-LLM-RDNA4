@@ -3,8 +3,21 @@ from typing import TYPE_CHECKING, List
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup, get_process_group_ranks
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed import ProcessGroup
+try:
+    from torch.distributed import get_process_group_ranks
+except ImportError:
+    def get_process_group_ranks(pg):
+        return list(range(dist.get_world_size(pg) if pg is not None else 1))
+try:
+    from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
+except ImportError:
+    init_device_mesh = None
+    DeviceMesh = type("DeviceMesh", (), {})
+
+# Alias for type annotations
+if not hasattr(dist, "DeviceMesh"):
+    dist.DeviceMesh = DeviceMesh
 
 from tensorrt_llm.logger import logger
 

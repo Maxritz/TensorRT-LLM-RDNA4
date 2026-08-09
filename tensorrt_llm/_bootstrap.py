@@ -50,7 +50,9 @@ def _add_trt_llm_dll_directory():
     if on_windows:
         import sysconfig
 
-        os.add_dll_directory(Path(sysconfig.get_paths()["purelib"]) / "tensorrt_llm" / "libs")
+        _libs_dir = Path(sysconfig.get_paths()["purelib"]) / "tensorrt_llm" / "libs"
+        if _libs_dir.exists():
+            os.add_dll_directory(_libs_dir)
 
 
 def _preload_python_lib():

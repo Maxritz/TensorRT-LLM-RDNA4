@@ -20,8 +20,14 @@ Contains:
 """
 
 import torch
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+    triton = None
+    tl = None
 
 # ---------------------------------------------------------------------------
 # 1x128 block-scale quantization

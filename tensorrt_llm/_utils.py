@@ -35,8 +35,14 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 import nvtx
-from mpi4py import MPI
-from mpi4py.util import pkl5
+
+try:
+    from mpi4py import MPI
+    from mpi4py.util import pkl5
+except (RuntimeError, ImportError):
+    MPI = None
+    pkl5 = None
+    print("[WARNING] mpi4py could not load an MPI library; falling back to single-process mode.")
 from typing_extensions import ParamSpec
 
 # isort: off
@@ -45,7 +51,11 @@ import torch
 try:
     from cuda.bindings import runtime as cudart
 except ImportError:
-    from cuda import cudart
+    try:
+        from cuda import cudart
+    except ImportError:
+        cudart = None
+        print("[WARNING] CUDA runtime bindings not available; GPU utility functions will be no-ops.")
 
 try:
     from pynvml import (
@@ -402,7 +412,7 @@ def get_free_ports(num=1) -> List[int]:
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
-comm = pkl5.Intracomm(MPI.COMM_WORLD)
+comm = pkl5.Intracomm(MPI.COMM_WORLD) if MPI is not None else None
 
 
 def set_mpi_comm(new_comm):
@@ -424,7 +434,7 @@ def mpi_comm():
     return comm
 
 
-local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST) if mpi_comm() is not None else None
 
 
 def local_mpi_comm():

@@ -1,8 +1,14 @@
 from typing import Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+    triton = None
+    tl = None
 
 from tensorrt_llm._utils import nvtx_range
 

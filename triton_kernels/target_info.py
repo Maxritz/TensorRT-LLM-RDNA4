@@ -17,13 +17,19 @@ from triton.language.target_info import (
 __all__ = [
     "cuda_capability_geq",
     "get_cdna_version",
+    "get_rdna_version",
     "has_tma_gather",
     "has_native_mxfp",
     "is_cuda",
     "is_hip",
     "is_hip_cdna3",
     "is_hip_cdna4",
-    "num_sms",
+    "is_hip_rdna_rdna2",
+    "is_hip_rdna3",
+    "is_hip_rdna4",
+    "    num_sms",
+    "has_cooperative_matrix",
+    "rdna_wave_size",
 ]
 
 
@@ -42,6 +48,57 @@ def get_cdna_version():
     if target.arch == 'gfx950':
         return 4
     return -1
+
+
+@triton.constexpr_function
+def get_rdna_version():
+    """
+    Gets the AMD RDNA architecture version.
+    Returns:
+    - 1 for RDNA1 (gfx101x)
+    - 2 for RDNA2 (gfx103x) 
+    - 3 for RDNA3 (gfx110x, gfx115x)
+    - 4 for RDNA4 (gfx120x, gfx121x)
+    Returns -1 if not AMD hardware or unsupported architecture.
+    """
+    target = tl.target_info.current_target()
+    if target.backend != 'hip':
+        return -1
+    
+    arch = target.arch
+    # RDNA1 (Navi 1x series: RX 5000 series)
+    if arch in ('gfx1010', 'gfx1011', 'gfx1012'):
+        return 1
+    # RDNA2 (Navi 2x series: RX 6000 series like 6700 XT, 6800 XT, 6900 XT)
+    if arch.startswith('gfx103'):
+        return 2
+    # RDNA3 (Navi 3x series: RX 7000 series)
+    if arch.startswith('gfx11'):
+        return 3
+    # RDNA4 (Navi 4x series: RX 9000 series like RX 9070 XT)
+    if arch.startswith('gfx12'):
+        return 4
+    
+    return -1
+
+
+@triton.constexpr_function
+def is_hip_rdna_rdna2():
+    """Check if running on RDNA or RDNA2 (wave64 architecture)"""
+    version = get_rdna_version()
+    return version == 1 or version == 2
+
+
+@triton.constexpr_function
+def is_hip_rdna3():
+    """Check if running on RDNA3 (wave32 with 128KB L2 cache)"""
+    return get_rdna_version() == 3
+
+
+@triton.constexpr_function
+def is_hip_rdna4():
+    """Check if running on RDNA4 (RX 9000 series, wave32 with enhanced features)"""
+    return get_rdna_version() == 4
 
 
 @triton.constexpr_function

@@ -10,21 +10,13 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
                     NamedTuple, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
+import functools
 import torch
 import torch.nn.functional as F
-
-from tensorrt_llm.llmapi import tracing
-
-try:
-    pass
-except ModuleNotFoundError:
-    pass
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
-from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
@@ -33,6 +25,50 @@ from ..sampling_params import LogprobParams, SamplingParams
 from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
 from .utils import (EngineDeadError, ErrorResponse, has_event_loop,
                     is_llm_response)
+
+_tracing = None
+_global_tracer = None
+_AsyncQueue = None
+_print_traceback_on_error = None
+
+
+def _get_tracing():
+    global _tracing
+    if _tracing is None:
+        from tensorrt_llm.llmapi import tracing
+        _tracing = tracing
+    return _tracing
+
+
+def _get_global_tracer():
+    global _global_tracer
+    if _global_tracer is None:
+        from tensorrt_llm.llmapi.tracer import global_tracer
+        _global_tracer = global_tracer
+    return _global_tracer
+
+
+def _get_AsyncQueue():
+    global _AsyncQueue
+    if _AsyncQueue is None:
+        from tensorrt_llm.llmapi.utils import AsyncQueue
+        _AsyncQueue = AsyncQueue
+    return _AsyncQueue
+
+
+def _get_print_traceback_on_error():
+    global _print_traceback_on_error
+    if _print_traceback_on_error is None:
+        from tensorrt_llm.llmapi.utils import print_traceback_on_error
+        _print_traceback_on_error = print_traceback_on_error
+    return _print_traceback_on_error
+
+
+def _lazy_print_traceback_on_error(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        return _get_print_traceback_on_error()(func)(*args, **kwargs)
+    return wrapper
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -204,7 +240,7 @@ class GenerationResultBase:
         self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
 
         if has_event_loop():
-            self.aqueue = AsyncQueue()
+            self.aqueue = _get_AsyncQueue()()
             self.queue = self.aqueue.sync_q
         else:
             self.queue = Queue()
@@ -447,7 +483,7 @@ class GenerationResultBase:
             return [0.0] * len(prefix)
         return [{token_id: Logprob(logprob=0.0, rank=1)} for token_id in prefix]
 
-    @print_traceback_on_error
+    @_lazy_print_traceback_on_error
     @nvtx_range_debug("handle_response",
                       color="red",
                       category="GenerationResultBase")
@@ -750,6 +786,7 @@ class GenerationResultBase:
             output (CompletionOutput): The output of the generation result.
             req_perf_metrics_dict (Optional[dict[str, float]]): Request performance metrics. Defaults to None.
         """
+        tracing = _get_tracing()
         if not tracing.global_otlp_tracer():
             return
 
@@ -1035,7 +1072,7 @@ class GenerationResult(GenerationResultBase):
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         response = await self.aqueue.get()
-        global_tracer().log_instant("result_step.get")
+        _get_global_tracer().log_instant("result_step.get")
         if isinstance(response, EngineDeadError):
             self._terminal_error = response
             self._done = True
@@ -1151,7 +1188,7 @@ class IterationResult:
         self._timeout = 2
 
         if has_event_loop():
-            self.aqueue = AsyncQueue()
+            self.aqueue = _get_AsyncQueue()()
             self.queue = self.aqueue.sync_q
         else:
             self.queue = Queue()

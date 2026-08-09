@@ -123,6 +123,15 @@ tests/integration/defs/stress_test/artifacts/
 # Agent related files
 .claude/agent-memory/
 .claude/agent-tests/perf-test-sync/report.html
+
+# Graphify cache + analysis output
+graphify-out/
+
+# Vulkan build directory (out-of-tree CMake)
+build_vulkan/
+
+# Compiled shader binaries
+*.spv
 .claude/agent-tests/perf-test-sync/results.json
 .claude/settings.json
 

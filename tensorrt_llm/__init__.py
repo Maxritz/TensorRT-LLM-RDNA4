@@ -13,12 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This module is the package's compatibility surface: the re-exports below and
-# the `__all__` at the bottom are what `from tensorrt_llm import X` resolves to,
-# and later tasks of this layout migration extend that surface rather than
-# replace it. The bootstrap mechanics live in `_bootstrap.py`, which keeps its
-# module scope to the standard library so that importing it here cannot pull in
-# torch ahead of the environment preparation it performs.
+import os
+import platform
 import sys
 
 from ._bootstrap import _init, _prepare_environment
@@ -32,28 +28,81 @@ _prepare_environment()
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
 
-import tensorrt_llm._torch.models as torch_models
-import tensorrt_llm.math_utils as math_utils
-import tensorrt_llm.models as models
-import tensorrt_llm.quantization as quantization
-import tensorrt_llm.runtime as runtime
-import tensorrt_llm.tools as tools
+_platform = platform.system()
+_on_windows_stub = (_platform == "Windows"
+                    and os.environ.get("TLLM_VULKAN_BACKEND", "0") == "1")
 
-from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
-                     mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
-                     set_mpi_comm, str_dtype_to_torch)
-from .disaggregated_params import DisaggregatedParams
-from .llmapi import LLM, AsyncLLM, MultimodalEncoder
-from .llmapi.llm_args import LlmArgs, TorchLlmArgs
-from .logger import logger
-from .mapping import Mapping
-from .models.automodel import AutoConfig, AutoModelForCausalLM
-from .sampling_params import SamplingParams
-from .version import __version__
-from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
-                         VisualGenMetrics, VisualGenOutput, VisualGenParams,
-                         VisualGenResult)
+if _on_windows_stub:
+    # Windows + Vulkan path: C++ bindings and GPU libraries are not available.
+    # Skip heavy sub-module imports so purely Python helpers (e.g.
+    # ``flashinfer_utils``) can be loaded for testing / development.
+    torch_models = None
+    math_utils = None
+    models = None
+    quantization = None
+    runtime = None
+    tools = None
+    MnnvlMemory = None
+    MnnvlMoe = None
+    MoEAlltoallInfo = None
+    default_gpus_per_node = None
+    local_mpi_rank = None
+    local_mpi_size = None
+    mpi_barrier = None
+    mpi_comm = None
+    mpi_rank = None
+    mpi_world_size = None
+    set_mpi_comm = None
+    str_dtype_to_torch = None
+    DisaggregatedParams = None
+    LLM = None
+    AsyncLLM = None
+    MultimodalEncoder = None
+    LlmArgs = None
+    TorchLlmArgs = None
+    Mapping = None
+    AutoConfig = None
+    AutoModelForCausalLM = None
+    SamplingParams = None
+    VisualGen = None
+    VisualGenParams = None
+    VisualGenArgs = None
+    ExtraParamSchema = None
+    VisualGenMetrics = None
+    VisualGenOutput = None
+    VisualGenResult = None
+    KvCacheConfig = None
+else:
+    import tensorrt_llm._torch.models as torch_models
+    import tensorrt_llm.math_utils as math_utils
+    import tensorrt_llm.models as models
+    import tensorrt_llm.quantization as quantization
+    import tensorrt_llm.runtime as runtime
+    import tensorrt_llm.tools as tools
+
+    from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
+    from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
+                         mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
+                         set_mpi_comm, str_dtype_to_torch)
+    from .disaggregated_params import DisaggregatedParams
+    from .llmapi import LLM, AsyncLLM, MultimodalEncoder
+    from .llmapi.llm_args import LlmArgs, TorchLlmArgs
+    from .logger import logger
+    from .mapping import Mapping
+    from .models.automodel import AutoConfig, AutoModelForCausalLM
+    from .sampling_params import SamplingParams
+    from .version import __version__
+    from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
+                             VisualGenMetrics, VisualGenOutput, VisualGenParams,
+                             VisualGenResult)
+    from .kv_cache_config import KvCacheConfig
+
+# logger is always available (pure Python)
+from .logger import logger as _logger  # noqa: E402
+
+if _on_windows_stub:
+    from .logger import logger
+    from .version import __version__
 
 __all__ = [
     'AutoConfig',
@@ -96,7 +145,8 @@ __all__ = [
     '__version__',
 ]
 
-_init()
+if not _on_windows_stub:
+    _init()
 
 print(f"[TensorRT-LLM] TensorRT LLM version: {__version__}")
 
