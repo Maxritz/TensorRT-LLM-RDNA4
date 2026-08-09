@@ -30,6 +30,7 @@
 #include <thread>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -68,13 +69,8 @@ int executeCommand(std::string const& cmd, std::string& output)
 std::string findGlslcPath()
 {
     // Check common locations
-    std::vector<std::string> candidates = {
-        "glslc",
-        "/usr/bin/glslc",
-        "/usr/local/bin/glslc",
-        "C:/VulkanSDK/1.4.357.0/Bin/glslc.exe",
-        "C:/VulkanSDK/Bin/glslc.exe"
-    };
+    std::vector<std::string> candidates = {"glslc", "/usr/bin/glslc", "/usr/local/bin/glslc",
+        "C:/VulkanSDK/1.4.357.0/Bin/glslc.exe", "C:/VulkanSDK/Bin/glslc.exe"};
 
     for (auto const& path : candidates)
     {
@@ -96,19 +92,19 @@ std::string gpuTargetToString(GPUTarget::Architecture arch)
 {
     switch (arch)
     {
-        case GPUTarget::Architecture::AMD_RDNA1:   return "AMD RDNA1 (gfx10xx, wave64)";
-        case GPUTarget::Architecture::AMD_RDNA2:   return "AMD RDNA2 (gfx103x, wave64)";
-        case GPUTarget::Architecture::AMD_RDNA3:   return "AMD RDNA3 (gfx11xx, wave32)";
-        case GPUTarget::Architecture::AMD_RDNA4:   return "AMD RDNA4 (gfx12xx, wave32)";
-        case GPUTarget::Architecture::AMD_CDNA1:   return "AMD CDNA1 (gfx90a, wave64)";
-        case GPUTarget::Architecture::AMD_CDNA2:   return "AMD CDNA2 (gfx908, wave64)";
-        case GPUTarget::Architecture::AMD_CDNA3:   return "AMD CDNA3 (gfx94x, wave64)";
-        case GPUTarget::Architecture::AMD_CDNA4:   return "AMD CDNA4 (gfx950, wave64)";
-        case GPUTarget::Architecture::NVIDIA_TURING:   return "NVIDIA Turing";
-        case GPUTarget::Architecture::NVIDIA_AMPERE:   return "NVIDIA Ampere";
-        case GPUTarget::Architecture::NVIDIA_HOPPER:   return "NVIDIA Hopper";
-        case GPUTarget::Architecture::NVIDIA_BLACKWELL: return "NVIDIA Blackwell";
-        default: return "Unknown";
+    case GPUTarget::Architecture::AMD_RDNA1: return "AMD RDNA1 (gfx10xx, wave64)";
+    case GPUTarget::Architecture::AMD_RDNA2: return "AMD RDNA2 (gfx103x, wave64)";
+    case GPUTarget::Architecture::AMD_RDNA3: return "AMD RDNA3 (gfx11xx, wave32)";
+    case GPUTarget::Architecture::AMD_RDNA4: return "AMD RDNA4 (gfx12xx, wave32)";
+    case GPUTarget::Architecture::AMD_CDNA1: return "AMD CDNA1 (gfx90a, wave64)";
+    case GPUTarget::Architecture::AMD_CDNA2: return "AMD CDNA2 (gfx908, wave64)";
+    case GPUTarget::Architecture::AMD_CDNA3: return "AMD CDNA3 (gfx94x, wave64)";
+    case GPUTarget::Architecture::AMD_CDNA4: return "AMD CDNA4 (gfx950, wave64)";
+    case GPUTarget::Architecture::NVIDIA_TURING: return "NVIDIA Turing";
+    case GPUTarget::Architecture::NVIDIA_AMPERE: return "NVIDIA Ampere";
+    case GPUTarget::Architecture::NVIDIA_HOPPER: return "NVIDIA Hopper";
+    case GPUTarget::Architecture::NVIDIA_BLACKWELL: return "NVIDIA Blackwell";
+    default: return "Unknown";
     }
 }
 
@@ -188,10 +184,10 @@ GPUTarget VulkanShaderCompiler::detectTarget() const
         // Extract device family from PCI device ID
         uint32_t deviceID = info.deviceID;
 
-        if ((deviceID & 0xFFFF) == 0x9690 ||  // RX 9070 XT (RDNA4)
-            (deviceID & 0xFFFF) == 0x9691 ||  // RX 9070 (RDNA4)
-            (deviceID & 0xFFFF) == 0x9692 ||  // RX 9050 (RDNA4)
-            (deviceID & 0xFF00) == 0x9600)    // RDNA4 family
+        if ((deviceID & 0xFFFF) == 0x9690 || // RX 9070 XT (RDNA4)
+            (deviceID & 0xFFFF) == 0x9691 || // RX 9070 (RDNA4)
+            (deviceID & 0xFFFF) == 0x9692 || // RX 9050 (RDNA4)
+            (deviceID & 0xFF00) == 0x9600)   // RDNA4 family
         {
             target.arch = GPUTarget::Architecture::AMD_RDNA4;
             target.archName = "RDNA4";
@@ -213,7 +209,7 @@ GPUTarget VulkanShaderCompiler::detectTarget() const
         {
             target.arch = GPUTarget::Architecture::AMD_RDNA1;
             target.archName = "RDNA1";
-            target.subgroupSize = 32; // RDNA1 supports both wave sizes
+            target.subgroupSize = 32;           // RDNA1 supports both wave sizes
         }
         else if ((deviceID & 0xFF00) == 0x9800) // CDNA1
         {
@@ -250,20 +246,18 @@ GPUTarget VulkanShaderCompiler::detectTarget() const
     else if (info.vendorID == 0x10DE /* NVIDIA */)
     {
         // Parse NVIDIA GPU from device name
-        if (info.deviceName.find("RTX 6000") != std::string::npos ||
-            info.deviceName.find("RTX 5000") != std::string::npos)
+        if (info.deviceName.find("RTX 6000") != std::string::npos
+            || info.deviceName.find("RTX 5000") != std::string::npos)
         {
             target.arch = GPUTarget::Architecture::NVIDIA_BLACKWELL;
             target.archName = "Blackwell";
         }
-        else if (info.deviceName.find("H100") != std::string::npos ||
-                 info.deviceName.find("H200") != std::string::npos)
+        else if (info.deviceName.find("H100") != std::string::npos || info.deviceName.find("H200") != std::string::npos)
         {
             target.arch = GPUTarget::Architecture::NVIDIA_HOPPER;
             target.archName = "Hopper";
         }
-        else if (info.deviceName.find("A100") != std::string::npos ||
-                 info.deviceName.find("A10") != std::string::npos)
+        else if (info.deviceName.find("A100") != std::string::npos || info.deviceName.find("A10") != std::string::npos)
         {
             target.arch = GPUTarget::Architecture::NVIDIA_AMPERE;
             target.archName = "Ampere";
@@ -302,44 +296,19 @@ std::string VulkanShaderCompiler::generateCompileOptions(GPUTarget const& target
     // Define architecture-specific macros
     switch (target.arch)
     {
-        case GPUTarget::Architecture::AMD_RDNA1:
-            opts << " -DRDNA1";
-            break;
-        case GPUTarget::Architecture::AMD_RDNA2:
-            opts << " -DRDNA2 -DWAVE64";
-            break;
-        case GPUTarget::Architecture::AMD_RDNA3:
-            opts << " -DRDNA3 -DWAVE32";
-            break;
-        case GPUTarget::Architecture::AMD_RDNA4:
-            opts << " -DRDNA4 -DWAVE32";
-            break;
-        case GPUTarget::Architecture::AMD_CDNA1:
-            opts << " -DCDNA1";
-            break;
-        case GPUTarget::Architecture::AMD_CDNA2:
-            opts << " -DCDNA2";
-            break;
-        case GPUTarget::Architecture::AMD_CDNA3:
-            opts << " -DCDNA3";
-            break;
-        case GPUTarget::Architecture::AMD_CDNA4:
-            opts << " -DCDNA4";
-            break;
-        case GPUTarget::Architecture::NVIDIA_TURING:
-            opts << " -DTURING";
-            break;
-        case GPUTarget::Architecture::NVIDIA_AMPERE:
-            opts << " -DAMPERE";
-            break;
-        case GPUTarget::Architecture::NVIDIA_HOPPER:
-            opts << " -DHOPPER";
-            break;
-        case GPUTarget::Architecture::NVIDIA_BLACKWELL:
-            opts << " -DBLACKWELL";
-            break;
-        default:
-            break;
+    case GPUTarget::Architecture::AMD_RDNA1: opts << " -DRDNA1"; break;
+    case GPUTarget::Architecture::AMD_RDNA2: opts << " -DRDNA2 -DWAVE64"; break;
+    case GPUTarget::Architecture::AMD_RDNA3: opts << " -DRDNA3 -DWAVE32"; break;
+    case GPUTarget::Architecture::AMD_RDNA4: opts << " -DRDNA4 -DWAVE32"; break;
+    case GPUTarget::Architecture::AMD_CDNA1: opts << " -DCDNA1"; break;
+    case GPUTarget::Architecture::AMD_CDNA2: opts << " -DCDNA2"; break;
+    case GPUTarget::Architecture::AMD_CDNA3: opts << " -DCDNA3"; break;
+    case GPUTarget::Architecture::AMD_CDNA4: opts << " -DCDNA4"; break;
+    case GPUTarget::Architecture::NVIDIA_TURING: opts << " -DTURING"; break;
+    case GPUTarget::Architecture::NVIDIA_AMPERE: opts << " -DAMPERE"; break;
+    case GPUTarget::Architecture::NVIDIA_HOPPER: opts << " -DHOPPER"; break;
+    case GPUTarget::Architecture::NVIDIA_BLACKWELL: opts << " -DBLACKWELL"; break;
+    default: break;
     }
 
     // Feature-specific defines
@@ -381,9 +350,7 @@ void VulkanShaderCompiler::processSpirV(std::vector<uint32_t>& spirv, GPUTarget 
 }
 
 std::string VulkanShaderCompiler::generateCacheKey(
-    std::string const& source,
-    GPUTarget const& target,
-    ShaderFeatureFlags const& features)
+    std::string const& source, GPUTarget const& target, ShaderFeatureFlags const& features)
 {
     std::stringstream key;
     key << target.archName << "_" << target.subgroupSize;
@@ -396,13 +363,8 @@ std::string VulkanShaderCompiler::generateCacheKey(
     return key.str();
 }
 
-VulkanResult VulkanShaderCompiler::compileInternal(
-    std::string const& source,
-    std::string const& entryPoint,
-    GPUTarget const& target,
-    ShaderFeatureFlags const& features,
-    std::vector<uint32_t>* pSpirvOut,
-    bool isHLSL)
+VulkanResult VulkanShaderCompiler::compileInternal(std::string const& source, std::string const& entryPoint,
+    GPUTarget const& target, ShaderFeatureFlags const& features, std::vector<uint32_t>* pSpirvOut, bool isHLSL)
 {
     if (!pSpirvOut || source.empty() || mCompilerPath.empty())
     {
@@ -481,33 +443,20 @@ VulkanResult VulkanShaderCompiler::compileInternal(
     return VulkanResult::SUCCESS;
 }
 
-VulkanResult VulkanShaderCompiler::compileGLSL(
-    std::string const& glslSource,
-    std::string const& entryPoint,
-    GPUTarget const& target,
-    ShaderFeatureFlags const& features,
-    std::vector<uint32_t>* pSpirvOut)
+VulkanResult VulkanShaderCompiler::compileGLSL(std::string const& glslSource, std::string const& entryPoint,
+    GPUTarget const& target, ShaderFeatureFlags const& features, std::vector<uint32_t>* pSpirvOut)
 {
     return compileInternal(glslSource, entryPoint, target, features, pSpirvOut, false);
 }
 
-VulkanResult VulkanShaderCompiler::compileHLSL(
-    std::string const& hlslSource,
-    std::string const& entryPoint,
-    GPUTarget const& target,
-    ShaderFeatureFlags const& features,
-    std::vector<uint32_t>* pSpirvOut)
+VulkanResult VulkanShaderCompiler::compileHLSL(std::string const& hlslSource, std::string const& entryPoint,
+    GPUTarget const& target, ShaderFeatureFlags const& features, std::vector<uint32_t>* pSpirvOut)
 {
     return compileInternal(hlslSource, entryPoint, target, features, pSpirvOut, true);
 }
 
-VulkanResult VulkanShaderCompiler::compile(
-    std::string const& source,
-    std::string const& entryPoint,
-    std::vector<uint32_t>* pSpirvOut,
-    bool isHLSL,
-    ShaderFeatureFlags const* pFeatures,
-    GPUTarget const* pTarget)
+VulkanResult VulkanShaderCompiler::compile(std::string const& source, std::string const& entryPoint,
+    std::vector<uint32_t>* pSpirvOut, bool isHLSL, ShaderFeatureFlags const* pFeatures, GPUTarget const* pTarget)
 {
     GPUTarget target = pTarget ? *pTarget : mDetectedTarget;
     ShaderFeatureFlags features = pFeatures ? *pFeatures : getFeatureFlags();
@@ -538,13 +487,8 @@ VulkanResult VulkanShaderCompiler::createShaderModule(std::vector<uint32_t> cons
     return VulkanRuntime::translateVkResult(result);
 }
 
-VulkanResult VulkanShaderCompiler::compileAndCreateShader(
-    std::string const& source,
-    std::string const& entryPoint,
-    VkShaderModule* pModule,
-    bool isHLSL,
-    ShaderFeatureFlags const* pFeatures,
-    GPUTarget const* pTarget)
+VulkanResult VulkanShaderCompiler::compileAndCreateShader(std::string const& source, std::string const& entryPoint,
+    VkShaderModule* pModule, bool isHLSL, ShaderFeatureFlags const* pFeatures, GPUTarget const* pTarget)
 {
     std::vector<uint32_t> spirv;
     VulkanResult result = compile(source, entryPoint, &spirv, isHLSL, pFeatures, pTarget);
@@ -608,10 +552,10 @@ ShaderFeatureFlags VulkanShaderCompiler::getFeatureFlags() const
         VulkanDeviceInfo const& info = mContext->getDeviceInfo();
         flags.enableFP16 = info.hasFP16;
         flags.enableCooperativeMatrix = info.hasCooperativeMatrix;
-        flags.enableTF32 = true; // Always available
-        flags.enableFP8 = false; // Would need extension check
+        flags.enableTF32 = true;  // Always available
+        flags.enableFP8 = false;  // Would need extension check
         flags.enableInt4 = false; // Would need custom support check
-        flags.enableInt8 = true; // Standard support
+        flags.enableInt8 = true;  // Standard support
     }
 
     return flags;
@@ -623,4 +567,5 @@ void VulkanShaderCompiler::clearCache()
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END
