@@ -16,6 +16,7 @@ cpp/Release
 build
 !tensorrt_llm/bench/build
 !builders/
+build_trace/
 *.egg-info/
 .coverage
 *.onnx
