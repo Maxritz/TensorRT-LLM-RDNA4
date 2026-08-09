@@ -153,6 +153,66 @@ class _TorchGemmFallback:
         pass
 
 
+class _VulkanGemmRunner:
+    """Fallback GEMM runner for when C++ extension is unavailable.
+
+    Delegates to Vulkan compute via vulkan_backend when available;
+    otherwise uses PyTorch ops for correctness on any backend.
+    """
+
+    def __init__(self, output_dtype: torch.dtype, **kwargs):
+        self.output_dtype = output_dtype
+        self._vk = _VK_COMPUTE
+        self._workspace_ptr = None
+
+    def get_num_configs(self) -> int:
+        return 1
+
+    def clear_workspaces(self):
+        self._workspace_ptr = None
+
+    def get_tactic_num(self, gemm_idx: int) -> int:
+        return 0
+
+    def run_gemm_profile(self,
+                         act: torch.Tensor,
+                         weight: torch.Tensor,
+                         bias: Optional[torch.Tensor],
+                         act_scale: Optional[torch.Tensor],
+                         weight_scale: Optional[torch.Tensor],
+                         global_scale: Optional[torch.Tensor],
+                         top_k: int,
+                         tp_size: int,
+                         tp_rank: int,
+                         ep_size: int,
+                         ep_rank: int,
+                         cluster_size: int,
+                         cluster_rank: int,
+                         enable_alltoall: bool,
+                         min_latency_mode: bool,
+                         gemm_idx: int,
+                         tactic: int,
+                         do_preparation: bool,
+                         activation_type,
+                         unpadded_hidden_size: int):
+        if self._vk is not None:
+            return _vk_call("run_gemm", act, weight, bias, self.output_dtype,
+                            act_scale, weight_scale, global_scale)
+        output = torch.nn.functional.linear(act, weight, bias)
+        return [output.to(self.output_dtype)]
+
+    def run_gemm(self, act, weight, bias, output_dtype=None):
+        if output_dtype is None:
+            output_dtype = self.output_dtype
+        if self._vk is not None:
+            return _vk_call("run_gemm", act, weight, bias, output_dtype)
+        output = torch.nn.functional.linear(act, weight, bias)
+        return [output.to(output_dtype)]
+
+    def clear_cache(self):
+        pass
+
+
 def _create_fused_moe_runner(x_dtype, weight_dtype, output_dtype,
                              use_deepseek_fp8_block_scale, use_w4_group_scaling,
                              use_int8_woq_per_channel, use_mxfp8_act_scaling,

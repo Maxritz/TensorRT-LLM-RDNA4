@@ -1,0 +1,10 @@
+^F:\NV\TENSORRT-LLM\BUILD_TRACE\CMAKEFILES\EDDC16FD2674AE18D0658F14F87B6B66\GENERATE.STAMP.RULE
+setlocal
+C:\Strawberry\c\bin\cmake.exe -SF:/NV/TensorRT-LLM/cpp/trace_test -BF:/NV/TensorRT-LLM/build_trace --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file F:/NV/TensorRT-LLM/build_trace/vulkan_trace_test.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

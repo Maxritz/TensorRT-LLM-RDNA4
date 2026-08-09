@@ -24,6 +24,17 @@ from utils.util import (skip_blackwell_geforce, skip_pre_blackwell_unittest,
 import tensorrt_llm
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
+_CPP_EXT_AVAILABLE = False
+try:
+    torch.classes.trtllm.FP4GemmRunner  # noqa: B018
+    _CPP_EXT_AVAILABLE = True
+except (AttributeError, RuntimeError, ModuleNotFoundError):
+    pass
+
+_skip_if_no_cpp = unittest.skipIf(
+    not _CPP_EXT_AVAILABLE,
+    "Requires TRT-LLM C++ extension (torch.classes.trtllm.*)")
+
 
 # Used by the (fp16 -> int4) quant layer + int4 gemm network.
 def e2m1_and_ufp8_scale_to_float_tensor_v2(

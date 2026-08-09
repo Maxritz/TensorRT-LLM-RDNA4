@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="F:\NV\TensorRT-LLM\build_trace\CMakeFiles\eddc16fd2674ae18d0658f14f87b6b66\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{52BE6F01-4432-36DD-8D3C-6E9718FE5F63}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

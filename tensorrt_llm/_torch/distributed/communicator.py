@@ -32,6 +32,14 @@ try:
 except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
+# C++ extension availability detection
+_TLLM_CPP_AVAILABLE = False
+try:
+    torch.classes.trtllm.NcclCommunicatorOp  # noqa: B018
+    _TLLM_CPP_AVAILABLE = True
+except (AttributeError, RuntimeError, ModuleNotFoundError):
+    pass
+
 
 class ReduceOp(IntEnum):
     SUM = 0
@@ -1186,36 +1194,55 @@ class PPCommNCCL:
 
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
-        self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
-            self.mapping.world_size,
-            self.mapping.rank,
-        )
+        self.pg = self.mapping.pp_group_pg
+        self.pg_group = self.mapping.pp_group
+        if _TLLM_CPP_AVAILABLE:
+            self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
+                self.mapping.world_size,
+                self.mapping.rank,
+            )
+        else:
+            logger.info("Falling back to PPCommTorch (no C++ NcclCommunicatorOp)")
+            self.nccl_comm = None
         self.tensor_ready_event = torch.cuda.Event()
         self.send_stream = torch.cuda.Stream()
+
+    def _global_to_local_rank(self, global_rank: int):
+        assert global_rank in self.pg_group
+        return self.pg_group.index(global_rank)
 
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
 
-        # NCCL send kernel in send_stream cannot be captured,
-        # so we send in the current stream instead in CUDA graph cases.
-        if torch.cuda.is_current_stream_capturing():
-            self.nccl_comm.send(tensor, dest)
-            return
+        if self.nccl_comm is not None:
+            # NCCL send kernel in send_stream cannot be captured,
+            # so we send in the current stream instead in CUDA graph cases.
+            if torch.cuda.is_current_stream_capturing():
+                self.nccl_comm.send(tensor, dest)
+                return
 
-        # If the tensor is allocated from non-default memory pool
-        # like userbuffers, its underlying memory may be reused
-        # before the send operation is completed.
-        # We clone the tensor to avoid write-write conflicts.
-        tensor = tensor.clone()
-        self.send_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.send_stream):
-            self.nccl_comm.send(tensor, dest)
+            # If the tensor is allocated from non-default memory pool
+            # like userbuffers, its underlying memory may be reused
+            # before the send operation is completed.
+            # We clone the tensor to avoid write-write conflicts.
+            tensor = tensor.clone()
+            self.send_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.send_stream):
+                self.nccl_comm.send(tensor, dest)
+        else:
+            work = self.pg.send([tensor], self._global_to_local_rank(dest), tag=0)
+            if torch.cuda.is_current_stream_capturing():
+                work.block_current_stream()
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
-        self.nccl_comm.recv(tensor, src)
+        if self.nccl_comm is not None:
+            self.nccl_comm.recv(tensor, src)
+        else:
+            work = self.pg.recv([tensor], self._global_to_local_rank(src), tag=0)
+            work.block_current_stream()
 
 
 class PPCommTorch:

@@ -1,0 +1,40 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="F:\NV\TensorRT-LLM\cpp\include\tensorrt_llm\common\vulkan_c_api.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="F:\NV\TensorRT-LLM\cpp\tensorrt_llm\common\vulkanBackend.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="F:\NV\TensorRT-LLM\cpp\tensorrt_llm\common\vulkanContext.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="F:\NV\TensorRT-LLM\cpp\tensorrt_llm\common\vulkanFence.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="F:\NV\TensorRT-LLM\cpp\tensorrt_llm\common\vulkanMemoryAllocator.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="F:\NV\TensorRT-LLM\cpp\tensorrt_llm\common\vulkanRuntime.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="F:\NV\TensorRT-LLM\cpp\tensorrt_llm\common\vulkanShaderCompiler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="F:\NV\TensorRT-LLM\cpp\tensorrt_llm\common\vulkanUtilizationTracker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="F:\NV\TensorRT-LLM\cpp\tensorrt_llm\kernels\vulkanKernelRegistry.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="F:\NV\TensorRT-LLM\cpp\trace_test\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{C9193B9C-5962-3DA1-B2C7-123D3EAC109C}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

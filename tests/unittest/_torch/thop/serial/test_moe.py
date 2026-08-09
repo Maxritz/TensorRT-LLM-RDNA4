@@ -32,6 +32,17 @@ from enum import Enum
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+
+_CPP_EXT_AVAILABLE = False
+try:
+    torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner  # noqa: B018
+    _CPP_EXT_AVAILABLE = True
+except (AttributeError, RuntimeError, ModuleNotFoundError):
+    pass
+
+_skip_if_no_cpp_ext = pytest.mark.skipif(
+    not _CPP_EXT_AVAILABLE,
+    reason="Requires TRT-LLM C++ extension (torch.classes.trtllm.*) not available")
 from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
 from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.utils.fp4_utils import (
@@ -53,6 +64,7 @@ def test_act_type_enum_values_stable():
     assert ActType.SiTu.value == 3
 
 
+@_skip_if_no_cpp_ext
 @pytest.mark.skipif(
     getSMVersion() not in (100, 103),
     reason="The SiTu kernel only supports SM100/SM103. Current SM is %d." %

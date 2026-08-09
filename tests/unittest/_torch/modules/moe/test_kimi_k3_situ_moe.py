@@ -38,9 +38,20 @@ from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import (
 from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
+_CPP_EXT_AVAILABLE = False
+try:
+    torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner  # noqa: B018
+    _CPP_EXT_AVAILABLE = True
+except (AttributeError, RuntimeError, ModuleNotFoundError):
+    pass
+
 situ_supported = pytest.mark.skipif(
     not is_native_situ_supported(),
     reason="native SiTU cubins require SM100/SM103 (Blackwell)",
+)
+_cpp_ext_required = pytest.mark.skipif(
+    not _CPP_EXT_AVAILABLE,
+    reason="Requires TRT-LLM C++ extension (torch.classes.trtllm.*)",
 )
 
 
@@ -239,6 +250,7 @@ def test_make_situ_alpha_beta_contract():
         )
 
 
+@_cpp_ext_required
 @situ_supported
 def test_situ_runner_returns_valid_tactics():
     runner = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(int(ActType_TrtllmGen.SiTu), True)
