@@ -23,9 +23,17 @@ Provides:
 import torch
 import torch.nn.functional as F
 
+try:
+    from . import torch_bridge as _tb
+    _HAS_TORCH_BRIDGE = _tb.is_available()
+except Exception:
+    _HAS_TORCH_BRIDGE = False
+
 
 def rmsnorm(input, weight, eps, enable_pdl=None):
     """Standard RMS norm."""
+    if _HAS_TORCH_BRIDGE:
+        return _tb.vulkan_rms_norm(input, weight, None, eps)
     return input * weight / torch.sqrt(input.float().pow(2).mean(dim=-1, keepdim=True).to(input.dtype) + eps)
 
 

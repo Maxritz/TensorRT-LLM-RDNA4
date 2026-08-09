@@ -31,6 +31,12 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+try:
+    from . import torch_bridge as _tb
+    _HAS_TORCH_BRIDGE = _tb.is_available()
+except Exception:
+    _HAS_TORCH_BRIDGE = False
+
 
 def _to_device(t, device):
     if t is None:
@@ -356,6 +362,7 @@ class BatchPrefillWithRaggedKVCacheWrapper(_PagedAttentionBase):
         causal = plan["causal"]
         sm_scale = plan["sm_scale"] or (1.0 / (head_dim ** 0.5))
         window_left = plan["window_left"]
+        custom_mask = plan.get("custom_mask")
 
         qo_indptr = plan["qo_indptr"]
         # k, v: [total_kv_tokens, num_kv_heads * head_dim]
@@ -371,6 +378,43 @@ class BatchPrefillWithRaggedKVCacheWrapper(_PagedAttentionBase):
         num_seqs = len(qo_indptr) - 1
 
         out_flat = out.view(-1, num_heads, head_dim)
+
+        # --- Vulkan fast path: batch all sequences when possible ---
+        # Conditions: Vulkan backend available, no custom mask, no sliding
+        # window, default sm_scale (shader applies 1/sqrt(head_dim) itself),
+        # and all sequences share the same kv_len so K/V can be batched.
+        default_sm_scale = 1.0 / (head_dim ** 0.5)
+        use_vulkan = (
+            _HAS_TORCH_BRIDGE
+            and custom_mask is None
+            and (window_left is None or window_left < 0)
+            and abs(sm_scale - default_sm_scale) < 1e-6
+        ) if num_seqs > 0 else False
+
+        if use_vulkan:
+            # Check if all sequences have equal q_len and kv_len for batching
+            q_lens = [int(qo_indptr[i + 1] - qo_indptr[i]) for i in range(num_seqs)]
+            kv_starts = [int(qo_indptr[i]) for i in range(num_seqs)]
+            kv_ends = [int(qo_indptr[i + 1]) if i + 2 <= num_seqs else k.shape[0]
+                       for i in range(num_seqs)]
+            kv_lens = [kv_ends[i] - kv_starts[i] for i in range(num_seqs)]
+            if len(set(q_lens)) == 1 and len(set(kv_lens)) == 1:
+                q_len = q_lens[0]
+                kv_len = kv_lens[0]
+                # Q: [num_seqs, q_len, H, D] -> [num_seqs, H, q_len, D]
+                q_batched = q.view(num_seqs, q_len, num_heads, head_dim).transpose(1, 2)
+                # K/V: [num_seqs, kv_len, H, D] -> [num_seqs, H, kv_len, D]
+                k_batched = k.view(num_seqs, kv_len, num_heads, head_dim).transpose(1, 2)
+                v_batched = v.view(num_seqs, kv_len, num_heads, head_dim).transpose(1, 2)
+                # vulkan_attention applies 1/sqrt(head_dim) internally;
+                # undo the manual sm_scale applied on line 377
+                q_batched = q_batched / sm_scale
+                out_attn = _tb.vulkan_attention(q_batched, k_batched, v_batched, causal)
+                # out_attn: [num_seqs, H, q_len, D] -> [num_seqs, q_len, H, D] -> flat
+                out_flat[:] = out_attn.transpose(1, 2).reshape(num_seqs, q_len, num_heads, head_dim).reshape(-1, num_heads, head_dim)
+                return out
+
+        # --- PyTorch fallback (per-sequence loop) ---
         for i in range(num_seqs):
             q_start = int(qo_indptr[i])
             q_end = int(qo_indptr[i + 1])

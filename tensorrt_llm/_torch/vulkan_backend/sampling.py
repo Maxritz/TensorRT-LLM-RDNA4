@@ -17,6 +17,12 @@ do not need to change their code.
 
 import torch
 
+try:
+    from . import torch_bridge as _tb
+    _HAS_TORCH_BRIDGE = _tb.is_available()
+except Exception:
+    _HAS_TORCH_BRIDGE = False
+
 
 def _as_float(val):
     """Convert scalar tensor or float to a Python float."""
@@ -42,6 +48,8 @@ def _top_k_val(probs_or_logits, top_k, dim=-1):
 
 def softmax(logits: torch.Tensor, temperature=None, enable_pdl: bool = True) -> torch.Tensor:
     """FlashInfer-compatible softmax with optional temperature scaling."""
+    if _HAS_TORCH_BRIDGE and temperature is None:
+        return _tb.vulkan_softmax(logits)
     logits = logits.to(torch.float32)
     if temperature is not None:
         if isinstance(temperature, torch.Tensor):

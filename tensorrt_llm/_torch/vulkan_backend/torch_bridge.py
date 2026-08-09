@@ -39,13 +39,18 @@ helper must be used with the default scale (callers needing a custom
 """
 
 import ctypes
+from typing import Optional
 
 import numpy as np
 import torch
 
 from . import vulkan_compute as _vc
 
-__all__ = ["is_available", "vulkan_attention", "vulkan_topk"]
+__all__ = [
+    "is_available", "vulkan_attention", "vulkan_topk",
+    "vulkan_softmax", "vulkan_rms_norm", "vulkan_gemm",
+    "vulkan_elementwise_add",
+]
 
 _CUDA = "cuda"
 
@@ -185,3 +190,211 @@ def vulkan_topk(scores: torch.Tensor, topk: int,
         _free(inst, p_scores, p_in, p_out, p_idx)
 
     return torch.from_numpy(oh).to(device=scores.device, dtype=torch.int32)
+
+
+def _dispatch_elementwise(fn_name: str, inst, host_arr: np.ndarray,
+                          *dims) -> np.ndarray:
+    """Generic elementwise dispatch: stage host->vulkan->host."""
+    pin = inst.malloc(host_arr.nbytes)
+    pout = inst.malloc(host_arr.nbytes)
+    try:
+        inst.memcpy_h2d(pin, host_arr.ctypes.data, host_arr.nbytes)
+        fn = getattr(inst, fn_name)
+        if not fn(pin, pout, *dims):
+            raise RuntimeError(f"tllm_vulkan_{fn_name} dispatch failed")
+        oh = np.empty(host_arr.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, host_arr.nbytes)
+    finally:
+        _free(inst, pin, pout)
+    return oh
+
+
+def vulkan_softmax(x: torch.Tensor) -> torch.Tensor:
+    """Softmax along the last dimension via the Vulkan ``softmax.comp`` shader.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        ``[batch, vocab]`` or ``[batch, heads, seq_len]`` GPU tensor, fp16 or fp32.
+
+    Returns
+    -------
+    torch.Tensor
+        Same shape, device, and dtype as *x*.
+    """
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if x.device.type != _CUDA:
+        raise RuntimeError("vulkan_softmax requires GPU tensors")
+
+    inst = _init()
+    dt = x.dtype
+    xf = x.detach().float().contiguous()
+    xh = _as_host_array(xf)
+
+    # Reshape to 3D [batch, heads, seq_len] for the shader
+    if xh.ndim == 2:
+        batch, seq_len = xh.shape
+        heads = 1
+    elif xh.ndim == 3:
+        batch, heads, seq_len = xh.shape
+    else:
+        xh = xh.reshape(-1, 1, xh.shape[-1])
+        batch, heads, seq_len = xh.shape
+
+    oh = _dispatch_elementwise("softmax", inst, xh, batch, heads, seq_len, 0)
+    oh = oh.reshape(xf.shape)
+    out = torch.from_numpy(oh).to(device=x.device, dtype=dt)
+    return out
+
+
+def vulkan_rms_norm(input: torch.Tensor, weight: torch.Tensor,
+                    beta: Optional[torch.Tensor] = None,
+                    eps: float = 1e-6) -> torch.Tensor:
+    """RMS normalization via the Vulkan ``rms_norm.comp`` shader.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        ``[tokens, hidden_dim]`` GPU tensor, fp16 or fp32.
+    weight : torch.Tensor
+        ``[hidden_dim]`` GPU tensor (gamma).
+    beta : torch.Tensor, optional
+        ``[hidden_dim]`` GPU tensor (bias/β).  Defaults to zeros.
+    eps : float
+        Epsilon for numerical stability.
+
+    Returns
+    -------
+    torch.Tensor
+        Same shape, device, and dtype as *input*.
+    """
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    for t in (input, weight):
+        if t.device.type != _CUDA:
+            raise RuntimeError("vulkan_rms_norm requires GPU tensors")
+    if beta is not None and beta.device.type != _CUDA:
+        raise RuntimeError("vulkan_rms_norm requires GPU beta tensor")
+
+    inst = _init()
+    dt = input.dtype
+    inp = input.detach().float().contiguous()
+    w = weight.detach().float().contiguous()
+    b = beta.detach().float().contiguous() if beta is not None else torch.zeros_like(w)
+
+    tokens, hidden = inp.shape
+    ih = _as_host_array(inp)
+    wh = _as_host_array(w)
+    bh = _as_host_array(b)
+
+    pin = inst.malloc(ih.nbytes)
+    pg = inst.malloc(wh.nbytes)
+    pb = inst.malloc(bh.nbytes)
+    pout = inst.malloc(ih.nbytes)
+    try:
+        inst.memcpy_h2d(pin, ih.ctypes.data, ih.nbytes)
+        inst.memcpy_h2d(pg, wh.ctypes.data, wh.nbytes)
+        inst.memcpy_h2d(pb, bh.ctypes.data, bh.nbytes)
+        if not inst.rms_norm(pin, pg, pb, pout, ctypes.c_float(eps), hidden, tokens):
+            raise RuntimeError("tllm_vulkan_rms_norm dispatch failed")
+        oh = np.empty(ih.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, ih.nbytes)
+    finally:
+        _free(inst, pin, pg, pb, pout)
+
+    out = torch.from_numpy(oh).to(device=input.device, dtype=dt)
+    return out
+
+
+def vulkan_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """FP32 GEMM: C[M, N] = A[M, K] * B[K, N] via the Vulkan ``gemm.comp`` shader.
+
+    Parameters
+    ----------
+    a, b : torch.Tensor
+        2-D GPU tensors, fp16 or fp32.  ``a`` is ``[M, K]``, ``b`` is ``[K, N]``.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[M, N]`` on the input device and dtype.
+    """
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    for t in (a, b):
+        if t.device.type != _CUDA:
+            raise RuntimeError("vulkan_gemm requires GPU tensors")
+
+    inst = _init()
+    dt = a.dtype
+    af = a.detach().float().contiguous()
+    bf = b.detach().float().contiguous()
+    M, K = af.shape
+    K2, N = bf.shape
+    assert K == K2, f"shape mismatch: a[K]={K} vs b[K]={K2}"
+
+    ah = _as_host_array(af)
+    bh = _as_host_array(bf)
+    ch = np.empty((M, N), dtype=np.float32)
+
+    pa = inst.malloc(ah.nbytes)
+    pb = inst.malloc(bh.nbytes)
+    pc = inst.malloc(ch.nbytes)
+    try:
+        inst.memcpy_h2d(pa, ah.ctypes.data, ah.nbytes)
+        inst.memcpy_h2d(pb, bh.ctypes.data, bh.nbytes)
+        if not inst.gemm(pa, pb, pc, M, N, K):
+            raise RuntimeError("tllm_vulkan_gemm dispatch failed")
+        inst.memcpy_d2h(ch.ctypes.data, pc, ch.nbytes)
+    finally:
+        _free(inst, pa, pb, pc)
+
+    out = torch.from_numpy(ch).to(device=a.device, dtype=dt)
+    return out
+
+
+def vulkan_elementwise_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Elementwise add via the Vulkan ``elementwise.comp`` shader.
+
+    Parameters
+    ----------
+    a, b : torch.Tensor
+        Same-shape GPU tensors, fp16 or fp32.
+
+    Returns
+    -------
+    torch.Tensor
+        Elementwise sum, same shape, device, and dtype.
+    """
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    for t in (a, b):
+        if t.device.type != _CUDA:
+            raise RuntimeError("vulkan_elementwise_add requires GPU tensors")
+
+    inst = _init()
+    dt = a.dtype
+    af = a.detach().float().contiguous()
+    bf = b.detach().float().contiguous()
+    assert af.shape == bf.shape, f"shape mismatch: {af.shape} vs {bf.shape}"
+
+    ah = _as_host_array(af)
+    bh = _as_host_array(bf)
+    n = ah.size
+
+    pa = inst.malloc(ah.nbytes)
+    pb = inst.malloc(bh.nbytes)
+    po = inst.malloc(ah.nbytes)
+    try:
+        inst.memcpy_h2d(pa, ah.ctypes.data, ah.nbytes)
+        inst.memcpy_h2d(pb, bh.ctypes.data, bh.nbytes)
+        if not inst.elementwise_add(pa, pb, po, n):
+            raise RuntimeError("tllm_vulkan_elementwise_add dispatch failed")
+        oh = np.empty(ah.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, po, ah.nbytes)
+    finally:
+        _free(inst, pa, pb, po)
+
+    out = torch.from_numpy(oh).to(device=a.device, dtype=dt)
+    return out
