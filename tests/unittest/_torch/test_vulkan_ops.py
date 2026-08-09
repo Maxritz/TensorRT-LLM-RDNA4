@@ -63,14 +63,16 @@ FTY = np.float32
 
 
 def _h2d(vk, arr):
-    a = np.ascontiguousarray(arr, dtype=FTY)
+    # Preserve dtype: uint32/int32 buffers (topk offsets/indices) must not be
+    # coerced to float32.
+    a = np.ascontiguousarray(arr)
     ptr = vk.malloc(a.nbytes)
     vk.memcpy_h2d(ptr, a.ctypes.data, a.nbytes)
     return ptr
 
 
-def _d2h(vk, dev_ptr, nbytes, shape=None):
-    out = np.empty(nbytes // 4, dtype=FTY)
+def _d2h(vk, dev_ptr, nbytes, shape=None, dtype=FTY):
+    out = np.empty(nbytes // 4, dtype=dtype)
     vk.memcpy_d2h(out.ctypes.data, dev_ptr, nbytes)
     return out.reshape(shape) if shape else out
 
@@ -134,3 +136,64 @@ def test_elementwise_add_fp32_matches_python(vk):
     finally:
         _free(vk, pa, pb, po)
     assert np.max(np.abs(out - ref)) <= 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Attention: O = softmax((Q K^T)/sqrt(headDim)) V, optional causal mask.
+# Q/K/V/O fp32 laid out [batch, numHeads, seq, headDim] (row-major).
+# ---------------------------------------------------------------------------
+def test_attention_fp32_matches_numpy(vk):
+    B, nh, sq, sk, hd, causal = 2, 3, 4, 5, 8, True
+    Q = np.random.randn(B, nh, sq, hd).astype(FTY)
+    K = np.random.randn(B, nh, sk, hd).astype(FTY)
+    V = np.random.randn(B, nh, sk, hd).astype(FTY)
+
+    iscore = 1.0 / np.sqrt(hd)
+    scores = np.einsum("bnid,bnjd->bnij", Q, K).astype(np.float64) * iscore
+    if causal:
+        keep = np.tri(sq, sk, k=0, dtype=bool)  # True where j <= i
+        scores = np.where(keep[None, None, :, :], scores, -1e9)
+    scores = scores - scores.max(axis=-1, keepdims=True)
+    p = np.exp(scores)
+    p = p / p.sum(axis=-1, keepdims=True)
+    O_ref = np.einsum("bnij,bnjd->bnid", p, V).astype(FTY)
+
+    pQ, pK, pV = _h2d(vk, Q), _h2d(vk, K), _h2d(vk, V)
+    pO = vk.malloc(O_ref.nbytes)
+    try:
+        assert vk.attention(pQ, pK, pV, pO, B, nh, sq, sk, hd, int(causal))
+        O = _d2h(vk, pO, O_ref.nbytes, O_ref.shape)
+    finally:
+        _free(vk, pQ, pK, pV, pO)
+    assert np.max(np.abs(O - O_ref)) <= 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Top-K (sparse attention token selection). For each (batch, head) row we
+# emit `topk` row-local token offsets of the largest scores, descending,
+# first-max wins ties (strict >). Exact integer comparison.
+# ---------------------------------------------------------------------------
+def test_topk_matches_reference(vk):
+    num_heads, batch, total_tokens, topk = 1, 2, 8, 3
+    total_out = 6
+    # single head, one row of 8 distinct scores
+    scores = np.array([10, 30, 20, 50, 40, 70, 60, 80], dtype=FTY)
+    # request 0 spans scores[0:5], request 1 spans scores[5:8]
+    in_off = np.array([0, 5, 8], dtype=np.uint32)
+    out_off = np.array([0, 3, 6], dtype=np.uint32)
+    # Expected row-local argmax-by-value (descending), first-max wins:
+    #   req0 top-3 of [10,30,20,50,40] -> 50(i3),40(i4),30(i1) -> [3,4,1]
+    #   req1 top-3 of [70,60,80]        -> 80(i2),70(i0),60(i1) -> [2,0,1]
+    expected = np.array([3, 4, 1, 2, 0, 1], dtype=np.int32)
+
+    p_scores = _h2d(vk, scores)
+    p_inoff = _h2d(vk, in_off)
+    p_outoff = _h2d(vk, out_off)
+    p_topk = vk.malloc(expected.nbytes)
+    try:
+        assert vk.topk(p_scores, p_inoff, p_outoff, p_topk,
+                       topk, num_heads, batch, total_tokens, total_out)
+        got = _d2h(vk, p_topk, expected.nbytes, expected.shape, dtype=np.int32)
+    finally:
+        _free(vk, p_scores, p_inoff, p_outoff, p_topk)
+    assert np.array_equal(got, expected), f"topk mismatch: {got} != {expected}"

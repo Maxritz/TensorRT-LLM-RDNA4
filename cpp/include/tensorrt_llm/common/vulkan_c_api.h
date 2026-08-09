@@ -176,6 +176,55 @@ extern "C" int32_t tllm_vulkan_elementwise_add(
 }
 
 /* ------------------------------------------------------------------ */
+/* Attention (scaled dot-product, fp32)                                 */
+/* ------------------------------------------------------------------ */
+
+// O = softmax((Q K^T) / sqrt(headDim)) V, row-major [batch, numHeads, seq, headDim].
+// `causal` masks keys j > i (set to -inf). Mirrors attention.comp, which is
+// one thread per query, deterministic 3-pass (max/sum/out) reduction.
+extern "C" int32_t tllm_vulkan_attention(
+    void* q, void* k, void* v, void* output,
+    uint32_t batchSize, uint32_t numHeads,
+    uint32_t seqLenQ, uint32_t seqLenK, uint32_t headDim,
+    uint32_t causal)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchAttention(q, k, v, output,
+            batchSize, numHeads, seqLenQ, seqLenK, headDim, causal != 0u);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Top-K (sparse attention token selection, fp32)                        */
+/* ------------------------------------------------------------------ */
+
+// Top-k per (batch, head) row from `scores`: emits up to `topk` row-local
+// token offsets (descending value, first-max wins ties). input_offsets and
+// output_offsets are [batchSize+1] uint exclusive scans; topkIndices is
+// [numHeads * totalOutputTokens] int. Mirrors topk.comp.
+extern "C" int32_t tllm_vulkan_topk(
+    void* scores, void* inputOffsets, void* outputOffsets,
+    void* topkIndices,
+    uint32_t topk, uint32_t numHeads, uint32_t batchSize,
+    uint32_t totalTokens, uint32_t totalOutputTokens)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchTopk(scores, inputOffsets, outputOffsets, topkIndices,
+            topk, numHeads, batchSize, totalTokens, totalOutputTokens);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* KV Cache Update (2D) — post speculative decode                      */
 /* ------------------------------------------------------------------ */
 
