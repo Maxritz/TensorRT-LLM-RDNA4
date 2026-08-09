@@ -163,9 +163,11 @@ class _VulkanGenMoERunner:
                 gate_out = vulkan_elementwise_add(gate_out, fc1_expert_biases[e].expand_as(gate_out))
             if self.activation_type == ActivationType.Swiglu:
                 up, gate = gate_out.chunk(2, dim=-1)
-                gate_out = up * torch.sigmoid(gate)
+                from ..vulkan_backend.torch_bridge import vulkan_sigmoid
+                gate_out = up * vulkan_sigmoid(gate)
             else:
-                gate_out = torch.relu(gate_out)
+                from ..vulkan_backend.torch_bridge import vulkan_relu
+                gate_out = vulkan_relu(gate_out)
             fc2_out = vulkan_gemm(gate_out, w2)
             if fc2_expert_biases is not None:
                 fc2_out = vulkan_elementwise_add(fc2_out, fc2_expert_biases[e].expand_as(fc2_out))
@@ -188,24 +190,25 @@ class _VulkanGenMoERunner:
         from ..vulkan_backend.torch_bridge import vulkan_gemm, vulkan_softmax
 
         num_tokens, hidden = hidden_states.shape
+        from ..vulkan_backend.torch_bridge import (
+            vulkan_gemm, vulkan_softmax, vulkan_topk_general)
+
         if output is None:
             output = torch.zeros(num_tokens, hidden, dtype=hidden_states.dtype,
                                  device=hidden_states.device)
 
-        # Use pre-computed topk if provided, otherwise compute from routing_logits
         if topk_ids is None:
             if routing_logits is not None:
-                routing_scores = torch.matmul(routing_logits, gemm1_weights[0])
+                routing_scores = vulkan_gemm(routing_logits, gemm1_weights[0].T.contiguous())
                 if routing_bias is not None:
                     routing_scores = routing_scores + routing_bias
                 routing_scores = vulkan_softmax(routing_scores)
-                topk_val, topk_ids = torch.topk(routing_scores, top_k, dim=-1)
-                topk_weights = topk_val
+                topk_ids, topk_weights = vulkan_topk_general(routing_scores, top_k)
             else:
                 raise RuntimeError("Either routing_logits or topk_ids must be provided")
-        else:
-            if topk_weights is None:
-                topk_weights = torch.ones_like(topk_ids, dtype=hidden_states.dtype)
+        elif topk_weights is None:
+            topk_weights = torch.ones(topk_ids.shape, dtype=hidden_states.dtype,
+                                      device=topk_ids.device)
 
         for e in range(num_experts):
             mask = (topk_ids == e)
@@ -222,7 +225,8 @@ class _VulkanGenMoERunner:
                 fc1_out = vulkan_elementwise_add(fc1_out, gemm1_bias[e].expand_as(fc1_out))
 
             up, gate = fc1_out.chunk(2, dim=-1)
-            act_out = up * torch.sigmoid(gate)
+            from ..vulkan_backend.torch_bridge import vulkan_sigmoid
+            act_out = up * vulkan_sigmoid(gate)
 
             w2 = gemm2_weights[e + local_expert_offset]
             fc2_out = vulkan_gemm(act_out, w2)
@@ -409,25 +413,28 @@ class _VulkanMoERunner:
 
     def _apply_activation(self, x, activation_type):
         from ..vulkan_backend.torch_bridge import (
-            vulkan_silu, vulkan_gelu, vulkan_swiglu)
+            vulkan_silu, vulkan_gelu, vulkan_swiglu,
+            vulkan_sigmoid, vulkan_relu)
         if activation_type == ActivationType.Silu:
             return vulkan_silu(x)
         elif activation_type == ActivationType.Gelu:
             return vulkan_gelu(x)
         elif activation_type == ActivationType.GeluTanhApproximate:
-            return torch.nn.functional.gelu(x, approximate="tanh")
+            return vulkan_gelu(x)
         elif activation_type == ActivationType.Swiglu:
             if self.unpadded_hidden_size and self.unpadded_hidden_size > 0:
                 hidden = self.unpadded_hidden_size
                 up = x[..., :hidden]
                 gate = x[..., hidden:hidden * 2]
-                return up * torch.sigmoid(gate)
+                gate = vulkan_sigmoid(gate)
+                return up * gate
             else:
                 return vulkan_swiglu(x)
         elif activation_type == ActivationType.Relu:
-            return torch.relu(x)
+            return vulkan_relu(x)
         elif activation_type == ActivationType.Relu2:
-            return torch.relu(x) ** 2
+            r = vulkan_relu(x)
+            return r * r
         return x
 
     def run_gemm_profile(self,
@@ -531,7 +538,8 @@ class _VulkanMoERunner:
             else:
                 up, gate = fc1_out.chunk(2, dim=-1)
 
-            gate = torch.sigmoid(gate)
+            from ..vulkan_backend.torch_bridge import vulkan_sigmoid
+            gate = vulkan_sigmoid(gate)
             act_out = up * gate  # SwiGLU
 
             w2 = fc2_expert_weights[e]  # [hidden, intermediate]

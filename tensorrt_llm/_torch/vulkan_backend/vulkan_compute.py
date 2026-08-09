@@ -137,6 +137,12 @@ class _VulkanCompute:
         ]
         lib.tllm_vulkan_silu.restype = ctypes.c_int32
 
+        # tllm_vulkan_sigmoid(void* input, void* output, size_t elementCount)
+        lib.tllm_vulkan_sigmoid.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        lib.tllm_vulkan_sigmoid.restype = ctypes.c_int32
+
         # tllm_vulkan_gelu(void* input, void* output, size_t elementCount)
         lib.tllm_vulkan_gelu.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
@@ -150,6 +156,20 @@ class _VulkanCompute:
                 ctypes.c_uint32, ctypes.c_uint32,
             ]
             lib.tllm_vulkan_swiglu.restype = ctypes.c_int32
+
+        # tllm_vulkan_topk_general(input, indices_out, values_out, rows, cols, topk)
+        if hasattr(lib, "tllm_vulkan_topk_general"):
+            lib.tllm_vulkan_topk_general.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            lib.tllm_vulkan_topk_general.restype = ctypes.c_int32
+
+        # tllm_vulkan_relu(void* input, void* output, size_t elementCount)
+        lib.tllm_vulkan_relu.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        lib.tllm_vulkan_relu.restype = ctypes.c_int32
 
         # tllm_vulkan_attention(void* q, void* k, void* v, void* output,
         #                       uint32_t batchSize, uint32_t numHeads,
@@ -260,11 +280,20 @@ class _VulkanCompute:
     def silu(self, input_ptr, output_ptr, element_count):
         return self._funcs.tllm_vulkan_silu(input_ptr, output_ptr, element_count)
 
+    def sigmoid(self, input_ptr, output_ptr, element_count):
+        return self._funcs.tllm_vulkan_sigmoid(input_ptr, output_ptr, element_count)
+
     def gelu(self, input_ptr, output_ptr, element_count):
         return self._funcs.tllm_vulkan_gelu(input_ptr, output_ptr, element_count)
 
     def swiglu(self, input_ptr, output_ptr, hidden_dim, token_count):
         return self._funcs.tllm_vulkan_swiglu(input_ptr, output_ptr, hidden_dim, token_count)
+
+    def relu(self, input_ptr, output_ptr, element_count):
+        return self._funcs.tllm_vulkan_relu(input_ptr, output_ptr, element_count)
+
+    def topk_general(self, input_ptr, idx_out, val_out, rows, cols, topk):
+        return self._funcs.tllm_vulkan_topk_general(input_ptr, idx_out, val_out, rows, cols, topk)
 
     def attention(self, q, k, v, output, batch_size, num_heads, seq_len_q, seq_len_k, head_dim, causal):
         return self._funcs.tllm_vulkan_attention(q, k, v, output,
@@ -329,8 +358,11 @@ tllm_vulkan_gemm = _vk.gemm if is_available() else None
 tllm_vulkan_rms_norm = _vk.rms_norm if is_available() else None
 tllm_vulkan_elementwise_add = _vk.elementwise_add if is_available() else None
 tllm_vulkan_silu = _vk.silu if is_available() else None
+tllm_vulkan_sigmoid = _vk.sigmoid if is_available() else None
 tllm_vulkan_gelu = _vk.gelu if is_available() else None
 tllm_vulkan_swiglu = _vk.swiglu if is_available() else None
+tllm_vulkan_relu = _vk.relu if is_available() else None
+tllm_vulkan_topk_general = _vk.topk_general if is_available() else None
 tllm_vulkan_attention = _vk.attention if is_available() else None
 tllm_vulkan_topk = _vk.topk if is_available() else None
 tllm_vulkan_q8_0_gemm = _vk.q8_0_gemm if is_available() else None

@@ -88,12 +88,23 @@ public:
     static bool launchSilu(void* input, void* output,
                            size_t elementCount, void* stream = nullptr);
 
+    static bool launchSigmoid(void* input, void* output,
+                              size_t elementCount, void* stream = nullptr);
+
     static bool launchGelu(void* input, void* output,
+                           size_t elementCount, void* stream = nullptr);
+
+    static bool launchRelu(void* input, void* output,
                            size_t elementCount, void* stream = nullptr);
 
     static bool launchSwiglu(void* input, void* output,
                              uint32_t hiddenDim, uint32_t tokenCount,
                              void* stream = nullptr);
+
+    static bool launchTopKGeneral(void* input, void* outputIndices,
+                                  void* outputValues,
+                                  uint32_t rows, uint32_t cols, uint32_t topk,
+                                  void* stream = nullptr);
 
     static bool launchSoftmax(void* input, void* output,
                               uint32_t batchSize, uint32_t numHeads, uint32_t seqLen,

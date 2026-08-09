@@ -1,0 +1,59 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// General-purpose top-K per row.
+// input:  [rows, cols]  (binding 0)
+// output_indices: [rows, topk] (binding 1)
+// output_values:  [rows, topk] (binding 2)
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint rows;
+    uint cols;
+    uint topk;
+} pc;
+
+layout(std430, binding = 0) restrict readonly buffer BufIn { float in_[]; };
+layout(std430, binding = 1) restrict writeonly buffer BufIdx { uint idx_[]; };
+layout(std430, binding = 2) restrict writeonly buffer BufVal { float val_[]; };
+
+void main() {
+    uint row = gl_WorkGroupID.x * 64 + gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+
+    // Linear scan top-k (simple, no shared memory sort)
+    for (uint k = 0u; k < pc.topk; ++k) {
+        uint best = 0;
+        float bestVal = -1e30;
+        for (uint c = 0u; c < pc.cols; ++c) {
+            float v = in_[row * pc.cols + c];
+            // Skip already-selected (marked with NaN)
+            if (v != v) continue;
+            if (v > bestVal) {
+                bestVal = v;
+                best = c;
+            }
+        }
+        idx_[row * pc.topk + k] = best;
+        val_[row * pc.topk + k] = bestVal;
+        // Mark as selected
+        in_[row * pc.cols + best] = sqrt(-1.0); // NaN
+    }
+}

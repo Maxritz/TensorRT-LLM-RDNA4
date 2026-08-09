@@ -282,8 +282,20 @@ public:
         size_t elementCount,
         uint32_t blockSize = 256);
 
+    // Sigmoid: out = 1 / (1 + exp(-x))
+    common::VulkanResult dispatchSigmoid(
+        void* input, void* output,
+        size_t elementCount,
+        uint32_t blockSize = 256);
+
     // GELU (tanh approximation)
     common::VulkanResult dispatchGelu(
+        void* input, void* output,
+        size_t elementCount,
+        uint32_t blockSize = 256);
+
+    // Relu: out = max(x, 0)
+    common::VulkanResult dispatchRelu(
         void* input, void* output,
         size_t elementCount,
         uint32_t blockSize = 256);
@@ -293,6 +305,12 @@ public:
         void* input, void* output,
         uint32_t hiddenDim, uint32_t tokenCount,
         uint32_t blockSize = 256);
+
+    // Top-K per row (general purpose): input [rows, cols], output indices [rows, topk]
+    common::VulkanResult dispatchTopKGeneral(
+        void* input, void* outputIndices, void* outputValues,
+        uint32_t rows, uint32_t cols, uint32_t topk,
+        uint32_t blockSize = 64);
 
 private:
     std::shared_ptr<common::VulkanContext> mContext;

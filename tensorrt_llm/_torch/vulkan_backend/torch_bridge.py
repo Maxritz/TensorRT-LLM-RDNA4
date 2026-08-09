@@ -39,7 +39,7 @@ helper must be used with the default scale (callers needing a custom
 """
 
 import ctypes
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -50,7 +50,8 @@ __all__ = [
     "is_available", "vulkan_attention", "vulkan_topk",
     "vulkan_softmax", "vulkan_rms_norm", "vulkan_gemm",
     "vulkan_elementwise_add", "vulkan_silu", "vulkan_gelu",
-    "vulkan_swiglu",
+    "vulkan_swiglu", "vulkan_sigmoid", "vulkan_relu",
+    "vulkan_topk_general",
 ]
 
 _CUDA = "cuda"
@@ -489,3 +490,110 @@ def vulkan_swiglu(x: torch.Tensor) -> torch.Tensor:
 
     out = torch.from_numpy(oh).to(device=x.device, dtype=dt)
     return out
+
+
+def vulkan_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    """Sigmoid: 1 / (1 + exp(-x)) via Vulkan compute shader."""
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if x.device.type != _CUDA:
+        raise RuntimeError("vulkan_sigmoid requires GPU tensors")
+
+    inst = _init()
+    dt = x.dtype
+    xf = x.detach().float().contiguous()
+    n = xf.numel()
+    xh = _as_host_array(xf)
+
+    pin = inst.malloc(xh.nbytes)
+    pout = inst.malloc(xh.nbytes)
+    try:
+        inst.memcpy_h2d(pin, xh.ctypes.data, xh.nbytes)
+        if not inst._funcs.tllm_vulkan_sigmoid(pin, pout, n):
+            raise RuntimeError("tllm_vulkan_sigmoid dispatch failed")
+        oh = np.empty(xh.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, xh.nbytes)
+    finally:
+        _free(inst, pin, pout)
+
+    out = torch.from_numpy(oh).to(device=x.device, dtype=dt)
+    return out
+
+
+def vulkan_relu(x: torch.Tensor) -> torch.Tensor:
+    """ReLU: max(x, 0) via Vulkan compute shader."""
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if x.device.type != _CUDA:
+        raise RuntimeError("vulkan_relu requires GPU tensors")
+
+    inst = _init()
+    dt = x.dtype
+    xf = x.detach().float().contiguous()
+    n = xf.numel()
+    xh = _as_host_array(xf)
+
+    pin = inst.malloc(xh.nbytes)
+    pout = inst.malloc(xh.nbytes)
+    try:
+        inst.memcpy_h2d(pin, xh.ctypes.data, xh.nbytes)
+        if not inst._funcs.tllm_vulkan_relu(pin, pout, n):
+            raise RuntimeError("tllm_vulkan_relu dispatch failed")
+        oh = np.empty(xh.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, xh.nbytes)
+    finally:
+        _free(inst, pin, pout)
+
+    out = torch.from_numpy(oh).to(device=x.device, dtype=dt)
+    return out
+
+
+def vulkan_topk_general(scores: torch.Tensor, topk: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Top-K per row from a 2-D scores tensor via Vulkan compute shader.
+
+    Parameters
+    ----------
+    scores : torch.Tensor
+        ``[rows, cols]`` float32 GPU tensor.
+    topk : int
+        Number of top values to select per row.
+
+    Returns
+    -------
+    (indices, values) : Tuple[torch.Tensor, torch.Tensor]
+        ``[rows, topk]`` int32 indices and float32 values (descending).
+    """
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if scores.device.type != _CUDA:
+        raise RuntimeError("vulkan_topk_general requires GPU tensors")
+
+    inst = _init()
+    dt = scores.dtype
+    sf = scores.detach().float().contiguous()
+    rows, cols = sf.shape
+    assert topk <= cols, f"topk ({topk}) > cols ({cols})"
+
+    sh = _as_host_array(sf)
+    n_in = rows * cols
+    n_in_bytes = n_in * 4
+    n_out = rows * topk
+    n_out_bytes = n_out * 4
+
+    pin = inst.malloc(n_in_bytes)
+    pidx = inst.malloc(n_out_bytes)
+    pval = inst.malloc(n_out_bytes)
+    try:
+        inst.memcpy_h2d(pin, sh.ctypes.data, n_in_bytes)
+        if not inst._funcs.tllm_vulkan_topk_general(pin, pidx, pval, rows, cols, topk):
+            raise RuntimeError("tllm_vulkan_topk_general dispatch failed")
+        oh_idx = np.empty(n_out, dtype=np.uint32)
+        oh_val = np.empty(n_out, dtype=np.float32)
+        inst.memcpy_d2h(oh_idx.ctypes.data, pidx, n_out_bytes)
+        inst.memcpy_d2h(oh_val.ctypes.data, pval, n_out_bytes)
+    finally:
+        _free(inst, pin, pidx, pval)
+
+    idx = torch.from_numpy(oh_idx).to(device=scores.device, dtype=torch.int64).reshape(rows, topk)
+    val = torch.from_numpy(oh_val).to(device=scores.device, dtype=dt).reshape(rows, topk)
+    return idx, val

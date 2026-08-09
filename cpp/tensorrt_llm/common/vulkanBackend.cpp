@@ -335,6 +335,48 @@ bool VulkanBackend::launchGelu(void* input, void* output,
     return true;
 }
 
+bool VulkanBackend::launchSigmoid(void* input, void* output,
+                                  size_t elementCount, void* stream)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchSigmoid(
+        input, output, elementCount);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("Sigmoid launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchRelu(void* input, void* output,
+                               size_t elementCount, void* stream)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchRelu(
+        input, output, elementCount);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("ReLU launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
 bool VulkanBackend::launchSwiglu(void* input, void* output,
                                  uint32_t hiddenDim, uint32_t tokenCount,
                                  void* stream)
@@ -351,6 +393,29 @@ bool VulkanBackend::launchSwiglu(void* input, void* output,
     if (result != VulkanResult::SUCCESS)
     {
         backend->mLastError = std::string("SwiGLU launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchTopKGeneral(void* input, void* outputIndices,
+                                      void* outputValues,
+                                      uint32_t rows, uint32_t cols, uint32_t topk,
+                                      void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchTopKGeneral(
+        input, outputIndices, outputValues, rows, cols, topk);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("TopK launch failed: ") + VulkanContext::getErrorString(result);
         return false;
     }
 

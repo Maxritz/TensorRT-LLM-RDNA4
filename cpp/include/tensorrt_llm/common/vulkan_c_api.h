@@ -260,6 +260,19 @@ extern "C" int32_t tllm_vulkan_silu(
     }
 }
 
+extern "C" int32_t tllm_vulkan_sigmoid(
+    void* input, void* output, size_t elementCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchSigmoid(input, output, elementCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 extern "C" int32_t tllm_vulkan_gelu(
     void* input, void* output, size_t elementCount)
 {
@@ -280,6 +293,33 @@ extern "C" int32_t tllm_vulkan_swiglu(
     try {
         auto backend = getBackend();
         backend->launchSwiglu(input, output, hiddenDim, tokenCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_topk_general(
+    void* input, void* outputIndices, void* outputValues,
+    uint32_t rows, uint32_t cols, uint32_t topk)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchTopKGeneral(input, outputIndices, outputValues, rows, cols, topk);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_relu(
+    void* input, void* output, size_t elementCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchRelu(input, output, elementCount);
         backend->streamSynchronize();
         return 1;
     } catch (...) {
