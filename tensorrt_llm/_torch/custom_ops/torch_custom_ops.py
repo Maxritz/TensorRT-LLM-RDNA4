@@ -165,19 +165,18 @@ def _create_fused_moe_runner(x_dtype, weight_dtype, output_dtype,
             use_int8_woq_per_channel, use_mxfp8_act_scaling,
             use_mxfp8_weight_scaling, use_fused_finalize)
     else:
-        logger.info("Using PyTorch fallback for FusedMoeRunner (no C++ extension available)")
-        return _TorchMoERunner(
+        logger.info("Using Vulkan/torch fallback for FusedMoeRunner (no C++ extension)")
+        return _VulkanMoERunner(
             x_dtype, weight_dtype, output_dtype,
             use_deepseek_fp8_block_scale, use_w4_group_scaling,
             use_int8_woq_per_channel, use_mxfp8_act_scaling,
             use_mxfp8_weight_scaling, use_fused_finalize)
 
 
-class _TorchMoERunner:
-    """Pure-PyTorch fallback for FusedMoeRunner (no C++ extension, no Triton, no CUDA-specific kernels).
+class _VulkanMoERunner:
+    """Fallback for FusedMoeRunner when C++ extension is unavailable.
 
-    Works on any GPU tensor (including ROCm via CUDA-compat layer). Does not require
-    the TRT-LLM C++ extension or Triton.
+    Delegates to Vulkan compute when available, otherwise uses PyTorch ops.
     """
 
     def __init__(self, x_dtype, weight_dtype, output_dtype,
@@ -360,12 +359,20 @@ class MoERunner(TunableRunner):
                         use_mxfp8_weight_scaling)
 
         if instance_key not in MoERunner.runner_dict:
-            MoERunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FusedMoeRunner(
-                    x_dtype, weight_dtype, output_dtype,
-                    use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                    use_int8_woq_per_channel, use_mxfp8_act_scaling,
-                    use_mxfp8_weight_scaling, use_fused_finalize)
+            if _TLLM_CPP_AVAILABLE:
+                MoERunner.runner_dict[
+                    instance_key] = torch.classes.trtllm.FusedMoeRunner(
+                        x_dtype, weight_dtype, output_dtype,
+                        use_deepseek_fp8_block_scale, use_w4_group_scaling,
+                        use_int8_woq_per_channel, use_mxfp8_act_scaling,
+                        use_mxfp8_weight_scaling, use_fused_finalize)
+            else:
+                MoERunner.runner_dict[
+                    instance_key] = _VulkanMoERunner(
+                        x_dtype, weight_dtype, output_dtype,
+                        use_deepseek_fp8_block_scale, use_w4_group_scaling,
+                        use_int8_woq_per_channel, use_mxfp8_act_scaling,
+                        use_mxfp8_weight_scaling, use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -699,9 +706,11 @@ class FP8RowwiseGemmRunner(TunableRunner):
         self.group = group
         instance_key = (output_dtype, )
         if instance_key not in FP8RowwiseGemmRunner.runner_dict:
-            FP8RowwiseGemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP8RowwiseGemmRunner(
-                    output_dtype)
+            if _TLLM_CPP_AVAILABLE:
+                FP8RowwiseGemmRunner.runner_dict[instance_key] = torch.classes.trtllm.FP8RowwiseGemmRunner(output_dtype)
+            else:
+                logger.info("Using Vulkan fallback for FP8RowwiseGemmRunner (no C++ extension)")
+                FP8RowwiseGemmRunner.runner_dict[instance_key] = _VulkanGemmRunner(output_dtype)
         self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
             instance_key]
 
@@ -796,9 +805,11 @@ class FP4GemmRunner(TunableRunner):
         self.group = group
         instance_key = (output_dtype, int(fp4_gemm_type))
         if instance_key not in FP4GemmRunner.runner_dict:
-            FP4GemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP4GemmRunner(
-                    output_dtype, int(fp4_gemm_type))
+            if _TLLM_CPP_AVAILABLE:
+                FP4GemmRunner.runner_dict[instance_key] = torch.classes.trtllm.FP4GemmRunner(output_dtype, int(fp4_gemm_type))
+            else:
+                logger.info("Using Vulkan fallback for FP4GemmRunner (no C++ extension)")
+                FP4GemmRunner.runner_dict[instance_key] = _VulkanGemmRunner(output_dtype, fp4_gemm_type=fp4_gemm_type)
         self.fp4_gemm_runner = FP4GemmRunner.runner_dict[instance_key]
 
     def unique_id(self):
@@ -856,9 +867,11 @@ class CublasLtFP4GemmRunner(TunableRunner):
         instance_key = (output_dtype, )
 
         if instance_key not in CublasLtFP4GemmRunner.runner_dict:
-            CublasLtFP4GemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.CublasLtFP4GemmRunner(
-                    output_dtype)
+            if _TLLM_CPP_AVAILABLE:
+                CublasLtFP4GemmRunner.runner_dict[instance_key] = torch.classes.trtllm.CublasLtFP4GemmRunner(output_dtype)
+            else:
+                logger.info("Using Vulkan fallback for CublasLtFP4GemmRunner (no C++ extension)")
+                CublasLtFP4GemmRunner.runner_dict[instance_key] = _VulkanGemmRunner(output_dtype)
 
         self.cublaslt_runner = CublasLtFP4GemmRunner.runner_dict[instance_key]
 
@@ -1559,10 +1572,11 @@ class FP8BatchedGemmRunner(TunableRunner):
                         tile_size, epilogue_tile_m)
 
         if instance_key not in FP8BatchedGemmRunner.runner_dict:
-            FP8BatchedGemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP8BatchedGemmRunner(
-                    output_dtype, use_deep_seek_fp8, low_latency_kernel,
-                    tile_size, epilogue_tile_m)
+            if _TLLM_CPP_AVAILABLE:
+                FP8BatchedGemmRunner.runner_dict[instance_key] = torch.classes.trtllm.FP8BatchedGemmRunner(output_dtype, use_deep_seek_fp8, low_latency_kernel, tile_size, epilogue_tile_m)
+            else:
+                logger.info("Using Vulkan fallback for FP8BatchedGemmRunner (no C++ extension)")
+                FP8BatchedGemmRunner.runner_dict[instance_key] = _VulkanGemmRunner(output_dtype)
 
         self.kernel_runner = FP8BatchedGemmRunner.runner_dict[instance_key]
 
@@ -1805,9 +1819,11 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
         self.output_buffer_kind = output_buffer_kind
         instance_key = (activation_dtype, weight_dtype)
         if instance_key not in WeightOnlyQuantGemmRunner.runner_dict:
-            WeightOnlyQuantGemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.WeightOnlyQuantGemmRunner(
-                    activation_dtype, weight_dtype)
+            if _TLLM_CPP_AVAILABLE:
+                WeightOnlyQuantGemmRunner.runner_dict[instance_key] = torch.classes.trtllm.WeightOnlyQuantGemmRunner(activation_dtype, weight_dtype)
+            else:
+                logger.info("Using Vulkan fallback for WeightOnlyQuantGemmRunner (no C++ extension)")
+                WeightOnlyQuantGemmRunner.runner_dict[instance_key] = _VulkanGemmRunner(output_dtype)
         self.weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner.runner_dict[
             instance_key]
 
@@ -1891,9 +1907,11 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
         self.quant_mode = quant_mode
         instance_key = (activation_dtype, output_dtype, quant_mode)
         if instance_key not in FinegrainedMixedDtypeGemm._runner_dict:
-            FinegrainedMixedDtypeGemm._runner_dict[
-                instance_key] = torch.classes.trtllm.finegrainedMixedDtypeGemmRunner(
-                    activation_dtype, output_dtype, quant_mode)
+            if _TLLM_CPP_AVAILABLE:
+                FinegrainedMixedDtypeGemm._runner_dict[instance_key] = torch.classes.trtllm.finegrainedMixedDtypeGemmRunner(activation_dtype, output_dtype, quant_mode)
+            else:
+                logger.info("Using Vulkan fallback for finegrainedMixedDtypeGemmRunner (no C++ extension)")
+                FinegrainedMixedDtypeGemm._runner_dict[instance_key] = _VulkanGemmRunner(output_dtype)
         self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
             instance_key]
 
@@ -2682,9 +2700,11 @@ class Fp4GemmAllreduceRunner(TunableRunner):
         self.tp_group_str = '-'.join(str(g) for g in tp_group)
         instance_key = (output_dtype, self.tp_group_str)
         if instance_key not in Fp4GemmAllreduceRunner.runner_dict:
-            Fp4GemmAllreduceRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.Fp4GemmAllreduceRunner(
-                    output_dtype, tp_rank, tp_group)
+            if _TLLM_CPP_AVAILABLE:
+                Fp4GemmAllreduceRunner.runner_dict[instance_key] = torch.classes.trtllm.Fp4GemmAllreduceRunner(output_dtype, tp_rank, tp_group)
+            else:
+                logger.info("Using Vulkan fallback for Fp4GemmAllreduceRunner (no C++ extension)")
+                Fp4GemmAllreduceRunner.runner_dict[instance_key] = _VulkanGemmRunner(output_dtype)
         self.fp4_gemm_all_reduce_runner = Fp4GemmAllreduceRunner.runner_dict[
             instance_key]
 
