@@ -69,3 +69,29 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_real_prefill.bin)
             ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/mla_real_prefill.bin)
 endif()
 
+# ----------------------------------------------------------------------
+# Vulkan backend shared library
+# Builds the vulkan_backend.dll / libvulkan_backend.so that the Python
+# ctypes bridge (tensorrt_llm/_torch/vulkan_backend/vulkan_compute.py)
+# loads. Exports the extern "C" tllm_vulkan_* entry points declared in
+# vulkan_c_api.h (tllm_vulkan_init, malloc/free, memcpy, softmax,
+# kv_cache_update_2d, tree_spec_*, spec_accept).
+# ----------------------------------------------------------------------
+add_library(vulkan_backend SHARED
+    ${TLLM_ROOT}/include/tensorrt_llm/common/vulkan_c_api.cpp
+    ${VULKAN_SRCS}
+)
+target_link_libraries(vulkan_backend PUBLIC ${Vulkan_LIBRARY})
+target_compile_definitions(vulkan_backend PUBLIC ENABLE_VULKAN=1)
+if(MSVC)
+    target_compile_options(vulkan_backend PRIVATE /W4 /wd4201 /wd4459 /wd4100 /wd4127 /wd4505)
+endif()
+# On Windows, export the extern "C" symbols from the DLL so ctypes can
+# resolve tllm_vulkan_* via CDLL(). Harmless no-op on Linux/macOS.
+set_target_properties(vulkan_backend PROPERTIES
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+    ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+)
+
