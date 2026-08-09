@@ -30,10 +30,13 @@ AMD RDNA4 GPUs.
 | `tllm_vulkan_rms_norm` | `rms_norm.comp` | RMS normalization |
 | `tllm_vulkan_softmax` | `softmax.comp` | Softmax along last dim |
 | `tllm_vulkan_attention` | `attention.comp` | SDPA attention |
-| `tllm_vulkan_topk` | `topk.comp` | Top-K token selection |
+| `tllm_vulkan_topk` | `topk.comp` | Top-K (sparse attention) |
 | `tllm_vulkan_silu` | `silu.comp` | SiLU/swish activation |
+| `tllm_vulkan_sigmoid` | `sigmoid.comp` | Sigmoid |
 | `tllm_vulkan_gelu` | `gelu.comp` | GELU (tanh approx) |
+| `tllm_vulkan_relu` | `relu.comp` | ReLU |
 | `tllm_vulkan_swiglu` | `swiglu.comp` | SwiGLU activation |
+| `tllm_vulkan_topk_general` | `topk_general.comp` | General top-K per row |
 
 ## Fallback Classes
 - **`_VulkanGemmRunner`** — GEMM fallback; delegates to `vulkan_backend.torch_bridge.vulkan_gemm`. Implements `get_num_configs`, `run_gemm_profile`, `run_gemm`, `run_batched_gemm`, `get_valid_configs`, `get_num_heuristic_algos`, `get_tactic_num`, `clear_cache`.
@@ -50,3 +53,13 @@ Direct device-pointer path (VK_EXTERNAL_MEMORY) is the documented performance fo
 2. FP4/MXPF4 quantized MoE (needs dequant + Vulkan gemm)
 3. Direct device-pointer Vulkan path (VK_EXTERNAL_MEMORY)
 4. Auto-import vulkan_backend when C++ extension absent
+
+## Python Elimination Status
+All **compute** operations in fallback runners now go through Vulkan:
+- GEMM: `torch.matmul`/`torch.bmm` → `vulkan_gemm`
+- Activations: `torch.sigmoid`/`torch.relu`/etc → `vulkan_silu/sigmoid/gelu/relu/swiglu`
+- Routing: `torch.topk` → `vulkan_topk_general`
+- Softmax: PyTorch → `vulkan_softmax`
+
+Remaining torch calls are **tensor orchestration** only (zeros, ones, chunk,
+expand_as, index_add_) — no compute kernels remain in Python fallback paths.
