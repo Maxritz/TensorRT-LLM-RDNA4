@@ -50,7 +50,7 @@ VulkanBackend* getBackend()
                 backend->getLastError());
         }
     }
-    return backend;
+    return backend.get();
 }
 
 } // namespace
