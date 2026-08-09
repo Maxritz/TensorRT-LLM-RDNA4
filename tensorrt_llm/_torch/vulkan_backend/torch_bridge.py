@@ -597,3 +597,175 @@ def vulkan_topk_general(scores: torch.Tensor, topk: int) -> Tuple[torch.Tensor, 
     idx = torch.from_numpy(oh_idx).to(device=scores.device, dtype=torch.int64).reshape(rows, topk)
     val = torch.from_numpy(oh_val).to(device=scores.device, dtype=dt).reshape(rows, topk)
     return idx, val
+
+
+def vulkan_sigmoid_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Fused sigmoid+multiply: out = a * sigmoid(b) via Vulkan compute shader."""
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if a.device.type != _CUDA or b.device.type != _CUDA:
+        raise RuntimeError("vulkan_sigmoid_mul requires GPU tensors")
+
+    inst = _init()
+    dt = a.dtype
+    af = a.detach().float().contiguous()
+    bf = b.detach().float().contiguous()
+    n = af.numel()
+
+    ah = _as_host_array(af)
+    bh = _as_host_array(bf)
+
+    pa = inst.malloc(ah.nbytes)
+    pb = inst.malloc(bh.nbytes)
+    pout = inst.malloc(ah.nbytes)
+    try:
+        inst.memcpy_h2d(pa, ah.ctypes.data, ah.nbytes)
+        inst.memcpy_h2d(pb, bh.ctypes.data, bh.nbytes)
+        if not inst._funcs.tllm_vulkan_sigmoid_mul(pa, pb, pout, n):
+            raise RuntimeError("tllm_vulkan_sigmoid_mul dispatch failed")
+        oh = np.empty(ah.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, ah.nbytes)
+    finally:
+        _free(inst, pa, pb, pout)
+
+    out = torch.from_numpy(oh).to(device=a.device, dtype=dt)
+    return out
+
+
+def vulkan_elementwise_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Elementwise multiply: out = a * b via Vulkan compute shader."""
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if a.device.type != _CUDA or b.device.type != _CUDA:
+        raise RuntimeError("vulkan_elementwise_mul requires GPU tensors")
+
+    inst = _init()
+    dt = a.dtype
+    af = a.detach().float().contiguous()
+    bf = b.detach().float().contiguous()
+    n = af.numel()
+
+    ah = _as_host_array(af)
+    bh = _as_host_array(bf)
+
+    pa = inst.malloc(ah.nbytes)
+    pb = inst.malloc(bh.nbytes)
+    pout = inst.malloc(ah.nbytes)
+    try:
+        inst.memcpy_h2d(pa, ah.ctypes.data, ah.nbytes)
+        inst.memcpy_h2d(pb, bh.ctypes.data, bh.nbytes)
+        if not inst._funcs.tllm_vulkan_elementwise_mul(pa, pb, pout, n):
+            raise RuntimeError("tllm_vulkan_elementwise_mul dispatch failed")
+        oh = np.empty(ah.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, ah.nbytes)
+    finally:
+        _free(inst, pa, pb, pout)
+
+    out = torch.from_numpy(oh).to(device=a.device, dtype=dt)
+    return out
+
+
+def vulkan_scale_rows(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Row-wise scale broadcast: out[i,j] = in[i,j] * scale[i] via Vulkan."""
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if input.device.type != _CUDA or scale.device.type != _CUDA:
+        raise RuntimeError("vulkan_scale_rows requires GPU tensors")
+
+    inst = _init()
+    dt = input.dtype
+    inf = input.detach().float().contiguous()
+    sf = scale.detach().float().contiguous()
+    rows, cols = inf.shape[0], inf.shape[1]
+
+    ih = _as_host_array(inf)
+    sh = _as_host_array(sf)
+
+    pin = inst.malloc(ih.nbytes)
+    pscale = inst.malloc(sh.nbytes)
+    pout = inst.malloc(ih.nbytes)
+    try:
+        inst.memcpy_h2d(pin, ih.ctypes.data, ih.nbytes)
+        inst.memcpy_h2d(pscale, sh.ctypes.data, sh.nbytes)
+        if not inst._funcs.tllm_vulkan_scale_rows(pin, pscale, pout, rows, cols):
+            raise RuntimeError("tllm_vulkan_scale_rows dispatch failed")
+        oh = np.empty(ih.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, ih.nbytes)
+    finally:
+        _free(inst, pin, pscale, pout)
+
+    out = torch.from_numpy(oh).to(device=input.device, dtype=dt)
+    return out
+
+
+def vulkan_cast(x: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
+    """Type conversion via Vulkan compute shader."""
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+    if x.device.type != _CUDA:
+        raise RuntimeError("vulkan_cast requires GPU tensors")
+
+    inst = _init()
+    xf = x.detach().float().contiguous()
+    n = xf.numel()
+    xh = _as_host_array(xf)
+
+    dtype_map = {
+        torch.float32: 0,
+        torch.float16: 1,
+        torch.bfloat16: 2,
+    }
+    td = dtype_map.get(target_dtype, 0)
+
+    pin = inst.malloc(xh.nbytes)
+    pout = inst.malloc(xh.nbytes)
+    try:
+        inst.memcpy_h2d(pin, xh.ctypes.data, xh.nbytes)
+        if not inst._funcs.tllm_vulkan_cast(pin, pout, n, td):
+            raise RuntimeError("tllm_vulkan_cast dispatch failed")
+        oh = np.empty(xh.shape, dtype=np.float32)
+        inst.memcpy_d2h(oh.ctypes.data, pout, xh.nbytes)
+    finally:
+        _free(inst, pin, pout)
+
+    out = torch.from_numpy(oh).to(device=x.device, dtype=target_dtype)
+    return out
+
+
+def vulkan_index_add(output: torch.Tensor, indices: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """IndexAdd: output[indices] += values via Vulkan compute shader.
+
+    Note: requires indices to be unique per row (no concurrent writes).
+    """
+    if not is_available():
+        raise RuntimeError("vulkan_backend shared library is not available")
+
+    inst = _init()
+    dt = output.dtype
+    of = output.detach().float().contiguous()
+    vf = values.detach().float().contiguous()
+    indf = indices.detach().long().contiguous().cpu()
+
+    rows_o = of.shape[0]
+    rows_v = vf.shape[0]
+    cols = vf.shape[1] if vf.dim() > 1 else 1
+
+    oh = _as_host_array(of)
+    vh = _as_host_array(vf)
+    ih = indf.numpy().astype(np.uint32)
+
+    pout = inst.malloc(oh.nbytes)
+    pidx = inst.malloc(ih.nbytes)
+    pval = inst.malloc(vh.nbytes)
+    try:
+        inst.memcpy_h2d(pout, oh.ctypes.data, oh.nbytes)
+        inst.memcpy_h2d(pidx, ih.ctypes.data, ih.nbytes)
+        inst.memcpy_h2d(pval, vh.ctypes.data, vh.nbytes)
+        if not inst._funcs.tllm_vulkan_index_add(pout, pidx, pval, rows_o, rows_v, cols):
+            raise RuntimeError("tllm_vulkan_index_add dispatch failed")
+        inst.memcpy_d2h(oh.ctypes.data, pout, oh.nbytes)
+    finally:
+        _free(inst, pout, pidx, pval)
+
+    result = torch.from_numpy(oh).to(device=indices.device, dtype=dt).reshape_as(of)
+    return result

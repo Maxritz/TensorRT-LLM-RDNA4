@@ -380,6 +380,76 @@ bool VulkanKernelRegistry::initialize()
         registerKernel(desc);
     }
 
+    {
+        KernelDescriptor desc;
+        desc.name = "sigmoid_mul";
+        desc.shaderPath = "sigmoid_mul.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 3; // input_a, input_b, output
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "elementwise_mul";
+        desc.shaderPath = "elementwise_mul.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 3; // input_a, input_b, output
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "scale_rows";
+        desc.shaderPath = "scale_rows.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 3; // input, scale, output
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "cast";
+        desc.shaderPath = "cast.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 2; // input, output
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "index_add";
+        desc.shaderPath = "index_add.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 3; // output, indices, values
+        registerKernel(desc);
+    }
+
     return true;
 }
 
@@ -2600,6 +2670,343 @@ VulkanResult VulkanKernelDispatcher::dispatchTopKGeneral(
 
     (void)blockSize;
     vkCmdDispatch(cmdBuf, rows, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchSigmoidMul(
+    void* a, void* b, void* output,
+    size_t elementCount, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (elementCount == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("sigmoid_mul");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(a),
+                          reinterpret_cast<VkBuffer>(b),
+                          reinterpret_cast<VkBuffer>(output)};
+    VkDeviceSize range = static_cast<VkDeviceSize>(elementCount) * sizeof(float);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[3]{};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].range = range;
+        bufInfos[i].offset = 0;
+    }
+
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 3, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants { uint32_t N; } pc{};
+    pc.N = static_cast<uint32_t>(elementCount);
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t workGroupsX = (static_cast<uint32_t>(elementCount) + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchElementwiseMul(
+    void* a, void* b, void* output,
+    size_t elementCount, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (elementCount == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("elementwise_mul");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(a),
+                          reinterpret_cast<VkBuffer>(b),
+                          reinterpret_cast<VkBuffer>(output)};
+    VkDeviceSize range = static_cast<VkDeviceSize>(elementCount) * sizeof(float);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[3]{};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].range = range;
+        bufInfos[i].offset = 0;
+    }
+
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 3, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants { uint32_t N; } pc{};
+    pc.N = static_cast<uint32_t>(elementCount);
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t workGroupsX = (static_cast<uint32_t>(elementCount) + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchScaleRows(
+    void* input, void* scale, void* output,
+    uint32_t rows, uint32_t cols, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (rows == 0 || cols == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("scale_rows");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(input),
+                          reinterpret_cast<VkBuffer>(scale),
+                          reinterpret_cast<VkBuffer>(output)};
+    VkDeviceSize inRange = static_cast<VkDeviceSize>(rows) * cols * sizeof(float);
+    VkDeviceSize scaleRange = static_cast<VkDeviceSize>(rows) * sizeof(float);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[3]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].range = inRange;  bufInfos[0].offset = 0;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].range = scaleRange; bufInfos[1].offset = 0;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].range = inRange;  bufInfos[2].offset = 0;
+
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 3, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants { uint32_t rows; uint32_t cols; } pc{};
+    pc.rows = rows;
+    pc.cols = cols;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t totalElems = rows * cols;
+    uint32_t workGroupsX = (totalElems + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchCast(
+    void* input, void* output,
+    size_t elementCount, int32_t targetDtype, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (elementCount == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("cast");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(input),
+                          reinterpret_cast<VkBuffer>(output)};
+    VkDeviceSize range = static_cast<VkDeviceSize>(elementCount) * sizeof(float);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[2]{};
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].range = range;
+        bufInfos[i].offset = 0;
+    }
+
+    VkWriteDescriptorSet writes[2]{};
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 2, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants { uint32_t N; int32_t dtype; } pc{};
+    pc.N = static_cast<uint32_t>(elementCount);
+    pc.dtype = targetDtype;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t workGroupsX = (static_cast<uint32_t>(elementCount) + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchIndexAdd(
+    void* output, void* indices, void* values,
+    uint32_t outputRows, uint32_t valueRows, uint32_t cols, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (valueRows == 0 || outputRows == 0 || cols == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("index_add");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(output),
+                          reinterpret_cast<VkBuffer>(indices),
+                          reinterpret_cast<VkBuffer>(values)};
+    VkDeviceSize outRange = static_cast<VkDeviceSize>(outputRows) * cols * sizeof(float);
+    VkDeviceSize idxRange = static_cast<VkDeviceSize>(valueRows) * sizeof(uint32_t);
+    VkDeviceSize valRange = static_cast<VkDeviceSize>(valueRows) * cols * sizeof(float);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[3]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].range = outRange; bufInfos[0].offset = 0;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].range = idxRange; bufInfos[1].offset = 0;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].range = valRange; bufInfos[2].offset = 0;
+
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 3, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants { uint32_t rows; uint32_t cols; } pc{};
+    pc.rows = valueRows;
+    pc.cols = cols;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    uint32_t totalElems = valueRows * cols;
+    uint32_t workGroupsX = (totalElems + 255u) / 256u;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
 
     submitAndFree(cmdBuf);
     freeDescriptorSet(set);

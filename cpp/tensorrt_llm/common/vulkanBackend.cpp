@@ -399,6 +399,114 @@ bool VulkanBackend::launchSwiglu(void* input, void* output,
     return true;
 }
 
+bool VulkanBackend::launchSigmoidMul(void* a, void* b, void* output,
+                                     size_t elementCount, void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchSigmoidMul(
+        a, b, output, elementCount);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("SigmoidMul launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchElementwiseMul(void* a, void* b, void* output,
+                                         size_t elementCount, void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchElementwiseMul(
+        a, b, output, elementCount);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("ElementwiseMul launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchScaleRows(void* input, void* scale, void* output,
+                                    uint32_t rows, uint32_t cols,
+                                    void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchScaleRows(
+        input, scale, output, rows, cols);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("ScaleRows launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchCast(void* input, void* output,
+                               size_t elementCount, int32_t targetDtype,
+                               void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchCast(
+        input, output, elementCount, targetDtype);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("Cast launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanBackend::launchIndexAdd(void* output, void* indices, void* values,
+                                   uint32_t outputRows, uint32_t valueRows,
+                                   uint32_t cols, void* /*stream*/)
+{
+    auto backend = getInstance();
+    if (!backend->mActive || !backend->mDispatcher)
+    {
+        return false;
+    }
+
+    VulkanResult result = backend->mDispatcher->dispatchIndexAdd(
+        output, indices, values, outputRows, valueRows, cols);
+
+    if (result != VulkanResult::SUCCESS)
+    {
+        backend->mLastError = std::string("IndexAdd launch failed: ") + VulkanContext::getErrorString(result);
+        return false;
+    }
+
+    return true;
+}
+
 bool VulkanBackend::launchTopKGeneral(void* input, void* outputIndices,
                                       void* outputValues,
                                       uint32_t rows, uint32_t cols, uint32_t topk,

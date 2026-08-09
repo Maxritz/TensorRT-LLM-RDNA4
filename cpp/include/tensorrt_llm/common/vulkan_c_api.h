@@ -314,6 +314,73 @@ extern "C" int32_t tllm_vulkan_topk_general(
     }
 }
 
+extern "C" int32_t tllm_vulkan_sigmoid_mul(
+    void* a, void* b, void* output, size_t elementCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchSigmoidMul(a, b, output, elementCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_elementwise_mul(
+    void* a, void* b, void* output, size_t elementCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchElementwiseMul(a, b, output, elementCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_scale_rows(
+    void* input, void* scale, void* output,
+    uint32_t rows, uint32_t cols)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchScaleRows(input, scale, output, rows, cols);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_cast(
+    void* input, void* output, size_t elementCount, int32_t targetDtype)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchCast(input, output, elementCount, targetDtype);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_index_add(
+    void* output, void* indices, void* values,
+    uint32_t outputRows, uint32_t valueRows, uint32_t cols)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchIndexAdd(output, indices, values, outputRows, valueRows, cols);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 extern "C" int32_t tllm_vulkan_relu(
     void* input, void* output, size_t elementCount)
 {

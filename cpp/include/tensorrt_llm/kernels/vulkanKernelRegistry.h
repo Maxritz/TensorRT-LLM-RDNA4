@@ -306,6 +306,37 @@ public:
         uint32_t hiddenDim, uint32_t tokenCount,
         uint32_t blockSize = 256);
 
+    // Fused sigmoid+mul: out = a * sigmoid(b), elementwise
+    common::VulkanResult dispatchSigmoidMul(
+        void* a, void* b, void* output,
+        size_t elementCount,
+        uint32_t blockSize = 256);
+
+    // Elementwise multiply: out = a * b, elementwise
+    common::VulkanResult dispatchElementwiseMul(
+        void* a, void* b, void* output,
+        size_t elementCount,
+        uint32_t blockSize = 256);
+
+    // Row-wise scale: out[i,j] = in[i,j] * scale[i]
+    common::VulkanResult dispatchScaleRows(
+        void* input, void* scale, void* output,
+        uint32_t rows, uint32_t cols,
+        uint32_t blockSize = 256);
+
+    // Cast: out = (targetDtype)in, elementwise type conversion
+    // targetDtype: 0=fp32 (no-op), 1=fp16, 2=bf16
+    common::VulkanResult dispatchCast(
+        void* input, void* output,
+        size_t elementCount, int32_t targetDtype,
+        uint32_t blockSize = 256);
+
+    // IndexAdd: output[indices[i]] += values[i], with atomic adds
+    common::VulkanResult dispatchIndexAdd(
+        void* output, void* indices, void* values,
+        uint32_t outputRows, uint32_t valueRows, uint32_t cols,
+        uint32_t blockSize = 256);
+
     // Top-K per row (general purpose): input [rows, cols], output indices [rows, topk]
     common::VulkanResult dispatchTopKGeneral(
         void* input, void* outputIndices, void* outputValues,

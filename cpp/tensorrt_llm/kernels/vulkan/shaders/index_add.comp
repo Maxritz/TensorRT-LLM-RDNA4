@@ -1,0 +1,51 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint rows;  // number of index entries
+    uint cols;  // width of each row
+} pc;
+
+// IndexAdd: output[indices[i]] += values[i], one thread per output element
+// Note: indices within a single call are expected to be unique per row,
+// so no atomics are needed. Callers should ensure non-overlapping indices.
+layout(std430, binding = 0) buffer BufOutput  { float out_[]; };
+layout(std430, binding = 1) restrict readonly buffer BufIndices { uint  idx_[]; };
+layout(std430, binding = 2) restrict readonly buffer BufValues  { float val_[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint total = pc.rows * pc.cols;
+    if (tid >= total) return;
+
+    uint row = tid / pc.cols;
+    uint col = tid % pc.cols;
+
+    uint target_row = idx_[row];
+    uint output_idx = target_row * pc.cols + col;
+
+    float current = out_[output_idx];
+    float val = val_[tid];
+    out_[output_idx] = current + val;
+}

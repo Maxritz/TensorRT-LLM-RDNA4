@@ -163,15 +163,14 @@ class _VulkanGenMoERunner:
                 gate_out = vulkan_elementwise_add(gate_out, fc1_expert_biases[e].expand_as(gate_out))
             if self.activation_type == ActivationType.Swiglu:
                 up, gate = gate_out.chunk(2, dim=-1)
-                from ..vulkan_backend.torch_bridge import vulkan_sigmoid
-                gate_out = up * vulkan_sigmoid(gate)
+                gate_out = vulkan_sigmoid_mul(up, gate)
             else:
                 from ..vulkan_backend.torch_bridge import vulkan_relu
                 gate_out = vulkan_relu(gate_out)
             fc2_out = vulkan_gemm(gate_out, w2)
             if fc2_expert_biases is not None:
                 fc2_out = vulkan_elementwise_add(fc2_out, fc2_expert_biases[e].expand_as(fc2_out))
-            results = results + fc2_out
+            results = vulkan_elementwise_add(results, fc2_out)
         return [results]
 
     def run_moe(self,
@@ -191,7 +190,9 @@ class _VulkanGenMoERunner:
 
         num_tokens, hidden = hidden_states.shape
         from ..vulkan_backend.torch_bridge import (
-            vulkan_gemm, vulkan_softmax, vulkan_topk_general)
+            vulkan_gemm, vulkan_softmax, vulkan_topk_general,
+            vulkan_elementwise_add, vulkan_sigmoid_mul, vulkan_scale_rows,
+            vulkan_index_add, vulkan_cast)
 
         if output is None:
             output = torch.zeros(num_tokens, hidden, dtype=hidden_states.dtype,
@@ -201,7 +202,7 @@ class _VulkanGenMoERunner:
             if routing_logits is not None:
                 routing_scores = vulkan_gemm(routing_logits, gemm1_weights[0].T.contiguous())
                 if routing_bias is not None:
-                    routing_scores = routing_scores + routing_bias
+                    routing_scores = vulkan_elementwise_add(routing_scores, routing_bias)
                 routing_scores = vulkan_softmax(routing_scores)
                 topk_ids, topk_weights = vulkan_topk_general(routing_scores, top_k)
             else:
@@ -225,16 +226,17 @@ class _VulkanGenMoERunner:
                 fc1_out = vulkan_elementwise_add(fc1_out, gemm1_bias[e].expand_as(fc1_out))
 
             up, gate = fc1_out.chunk(2, dim=-1)
-            from ..vulkan_backend.torch_bridge import vulkan_sigmoid
-            act_out = up * vulkan_sigmoid(gate)
+            act_out = vulkan_sigmoid_mul(up, gate)
 
             w2 = gemm2_weights[e + local_expert_offset]
             fc2_out = vulkan_gemm(act_out, w2)
             if gemm2_bias is not None:
                 fc2_out = vulkan_elementwise_add(fc2_out, gemm2_bias[e].expand_as(fc2_out))
 
-            scaled = fc2_out * scales.unsqueeze(-1)
-            output.index_add_(0, token_indices, scaled.to(output.dtype))
+            scaled = vulkan_scale_rows(fc2_out, scales)
+            if scaled.dtype != output.dtype:
+                scaled = vulkan_cast(scaled, output.dtype)
+            output = vulkan_index_add(output, token_indices, scaled)
 
         return output
 
@@ -426,15 +428,15 @@ class _VulkanMoERunner:
                 hidden = self.unpadded_hidden_size
                 up = x[..., :hidden]
                 gate = x[..., hidden:hidden * 2]
-                gate = vulkan_sigmoid(gate)
-                return up * gate
+                return vulkan_sigmoid_mul(up, gate)
             else:
                 return vulkan_swiglu(x)
         elif activation_type == ActivationType.Relu:
             return vulkan_relu(x)
         elif activation_type == ActivationType.Relu2:
             r = vulkan_relu(x)
-            return r * r
+            from ..vulkan_backend.torch_bridge import vulkan_elementwise_mul
+            return vulkan_elementwise_mul(r, r)
         return x
 
     def run_gemm_profile(self,
@@ -473,7 +475,8 @@ class _VulkanMoERunner:
             fc2_out = vulkan_gemm(act_out, w2.T.contiguous())
             if fc2_expert_biases is not None:
                 fc2_out = vulkan_elementwise_add(fc2_out, fc2_expert_biases[e].expand_as(fc2_out))
-            results = results + fc2_out
+            from ..vulkan_backend.torch_bridge import vulkan_elementwise_add as _vw_add
+            results = _vw_add(results, fc2_out)
 
         return [results]
 
@@ -510,7 +513,7 @@ class _VulkanMoERunner:
             output = torch.zeros(num_tokens, hidden,
                                  dtype=self.output_dtype, device=input.device)
 
-        from ..vulkan_backend.torch_bridge import vulkan_gemm, vulkan_elementwise_add
+        from ..vulkan_backend.torch_bridge import vulkan_gemm, vulkan_elementwise_add, vulkan_sigmoid_mul, vulkan_scale_rows, vulkan_index_add, vulkan_cast
 
         num_experts = fc1_expert_weights.shape[0]
 
@@ -538,9 +541,7 @@ class _VulkanMoERunner:
             else:
                 up, gate = fc1_out.chunk(2, dim=-1)
 
-            from ..vulkan_backend.torch_bridge import vulkan_sigmoid
-            gate = vulkan_sigmoid(gate)
-            act_out = up * gate  # SwiGLU
+            act_out = vulkan_sigmoid_mul(up, gate)  # SwiGLU
 
             w2 = fc2_expert_weights[e]  # [hidden, intermediate]
             fc2_out = vulkan_gemm(act_out, w2.T.contiguous())
@@ -549,8 +550,10 @@ class _VulkanMoERunner:
                 bias = fc2_expert_biases[e].expand_as(fc2_out)
                 fc2_out = vulkan_elementwise_add(fc2_out, bias)
 
-            scaled = fc2_out * scales.unsqueeze(-1)
-            output.index_add_(0, token_indices, scaled.to(output.dtype))
+            scaled = vulkan_scale_rows(fc2_out, scales)
+            if scaled.dtype != output.dtype:
+                scaled = vulkan_cast(scaled, output.dtype)
+            output = vulkan_index_add(output, token_indices, scaled)
 
         return output
 

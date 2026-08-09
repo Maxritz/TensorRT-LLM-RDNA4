@@ -101,6 +101,24 @@ public:
                              uint32_t hiddenDim, uint32_t tokenCount,
                              void* stream = nullptr);
 
+    static bool launchSigmoidMul(void* a, void* b, void* output,
+                                size_t elementCount, void* stream = nullptr);
+
+    static bool launchElementwiseMul(void* a, void* b, void* output,
+                                    size_t elementCount, void* stream = nullptr);
+
+    static bool launchScaleRows(void* input, void* scale, void* output,
+                                uint32_t rows, uint32_t cols,
+                                void* stream = nullptr);
+
+    static bool launchCast(void* input, void* output,
+                           size_t elementCount, int32_t targetDtype,
+                           void* stream = nullptr);
+
+    static bool launchIndexAdd(void* output, void* indices, void* values,
+                               uint32_t outputRows, uint32_t valueRows,
+                               uint32_t cols, void* stream = nullptr);
+
     static bool launchTopKGeneral(void* input, void* outputIndices,
                                   void* outputValues,
                                   uint32_t rows, uint32_t cols, uint32_t topk,
