@@ -113,6 +113,134 @@ def _vk_call(fn_name: str, *args) -> object:
     return getattr(_VK_COMPUTE, fn_name)(*args)
 
 
+class _VulkanGenMoERunner:
+    """Vulkan MoE fallback for trtllm_gen_custom_ops quantization-aware runners.
+
+    Handles the FP4/FP8/MXFP4 block-scale MoE ``run_moe`` signature used by
+    the code-generated custom ops (different from the fused_moe path).
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._workspace_ptr = None
+
+    def get_num_configs(self) -> int:
+        return 1
+
+    def get_valid_configs(self, *args, **kwargs) -> List[int]:
+        return [0]
+
+    def clear_workspaces(self):
+        self._workspace_ptr = None
+
+    def get_tactic_num(self, gemm_idx: int) -> int:
+        return 1
+
+    def run_gemm_profile(self,
+                         x, fc1_expert_weights, fc1_expert_biases,
+                         fc2_expert_weights, fc2_expert_biases,
+                         top_k, tp_size, tp_rank,
+                         ep_size, ep_rank, cluster_size, cluster_rank,
+                         enable_alltoall, min_latency_mode,
+                         gemm_idx, tactic, do_preparation,
+                         activation_type, unpadded_hidden_size):
+        if not do_preparation:
+            self.activation_type = ActivationType(activation_type) if isinstance(activation_type, int) else activation_type
+            self.unpadded_hidden_size = unpadded_hidden_size
+
+        from ..vulkan_backend.torch_bridge import vulkan_gemm
+        num_tokens = x.shape[0]
+        hidden = x.shape[1]
+        fc1_weight = fc1_expert_weights
+        fc2_weight = fc2_expert_weights
+        num_experts = fc1_weight.shape[0]
+        results = torch.zeros(num_tokens, hidden, dtype=x.dtype, device=x.device)
+        for e in range(num_experts):
+            w1 = fc1_weight[e]
+            w2 = fc2_weight[e]
+            gate_out = vulkan_gemm(x, w1)
+            if fc1_expert_biases is not None:
+                from ..vulkan_backend.torch_bridge import vulkan_elementwise_add
+                gate_out = vulkan_elementwise_add(gate_out, fc1_expert_biases[e].expand_as(gate_out))
+            if self.activation_type == ActivationType.Swiglu:
+                up, gate = gate_out.chunk(2, dim=-1)
+                gate_out = up * torch.sigmoid(gate)
+            else:
+                gate_out = torch.relu(gate_out)
+            fc2_out = vulkan_gemm(gate_out, w2)
+            if fc2_expert_biases is not None:
+                fc2_out = vulkan_elementwise_add(fc2_out, fc2_expert_biases[e].expand_as(fc2_out))
+            results = results + fc2_out
+        return [results]
+
+    def run_moe(self,
+                routing_logits=None, routing_bias=None, hidden_states=None,
+                hidden_states_scale=None, gemm1_weights=None,
+                gemm1_weights_scale=None, gemm1_bias=None,
+                gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None,
+                gemm2_weights=None, gemm2_weights_scale=None, gemm2_bias=None,
+                output1_scale_scalar=None, output1_scale_gate_scalar=None,
+                output2_scale_scalar=None, num_experts=None, top_k=None,
+                n_group=None, topk_group=None, intermediate_size=None,
+                local_expert_offset=None, local_num_experts=None,
+                routed_scaling_factor=None, routing_method_type=None,
+                do_finalize=None, tactic=None, topk_weights=None,
+                topk_ids=None, output=None):
+        from ..vulkan_backend.torch_bridge import vulkan_gemm, vulkan_softmax
+
+        num_tokens, hidden = hidden_states.shape
+        if output is None:
+            output = torch.zeros(num_tokens, hidden, dtype=hidden_states.dtype,
+                                 device=hidden_states.device)
+
+        # Compute routing
+        if routing_logits is not None:
+            routing_scores = torch.matmul(routing_logits, gemm1_weights[0])
+            if routing_bias is not None:
+                routing_scores = routing_scores + routing_bias
+            routing_scores = vulkan_softmax(routing_scores)
+            if routing_method_type == 0:
+                topk_val, topk_ids = torch.topk(routing_scores, top_k, dim=-1)
+            else:
+                topk_val, topk_ids = torch.topk(routing_scores, top_k, dim=-1)
+            topk_weights = topk_val
+
+        topk_ids = topk_ids if topk_ids is not None else token_selected_experts
+        topk_weights = topk_weights if topk_weights is not None else token_final_scales
+
+        for e in range(num_experts):
+            mask = (topk_ids == e)
+            if not mask.any():
+                continue
+
+            token_indices = mask.nonzero(as_tuple=True)[0]
+            expert_tokens = hidden_states[token_indices]
+            scales = topk_weights[token_indices]
+
+            w1 = gemm1_weights[e + local_expert_offset]
+            fc1_out = vulkan_gemm(expert_tokens, w1)
+            if gemm1_bias is not None:
+                fc1_out = vulkan_elementwise_add(fc1_out, gemm1_bias[e].expand_as(fc1_out))
+
+            up, gate = fc1_out.chunk(2, dim=-1)
+            act_out = up * torch.sigmoid(gate)
+
+            w2 = gemm2_weights[e + local_expert_offset]
+            fc2_out = vulkan_gemm(act_out, w2)
+            if gemm2_bias is not None:
+                fc2_out = vulkan_elementwise_add(fc2_out, gemm2_bias[e].expand_as(fc2_out))
+
+            scaled = fc2_out * scales.unsqueeze(-1)
+            output.index_add_(0, token_indices, scaled.to(output.dtype))
+
+        return output
+
+    def run_moe_min_latency(self, *args, **kwargs):
+        return self.run_moe(*args, **kwargs)
+
+    def clear_cache(self):
+        pass
+
+
 class _VulkanGemmFallback:
     """Vulkan GEMM fallback for when C++ runners are unavailable.
 
@@ -214,6 +342,17 @@ class _VulkanGemmRunner:
             output = vulkan_elementwise_add(output, bias)
         return [output.to(output_dtype)]
 
+    def run_batched_gemm(self, mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c, tactic):
+        from ..vulkan_backend.torch_bridge import vulkan_gemm
+        output = vulkan_gemm(mat1, mat2)
+        return [output.to(self.output_dtype)]
+
+    def get_valid_configs(self, b: int, m: int, n: int, k: int) -> List[int]:
+        return [0]
+
+    def get_num_heuristic_algos(self, b: int, m: int, n: int, k: int) -> int:
+        return 1
+
     def clear_cache(self):
         pass
 
@@ -245,15 +384,22 @@ class _VulkanMoERunner:
     Raises RuntimeError if Vulkan compute is not available.
     """
 
-    def __init__(self, x_dtype, weight_dtype, output_dtype,
-                 use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                 use_int8_woq_per_channel, use_mxfp8_act_scaling,
-                 use_mxfp8_weight_scaling, use_fused_finalize):
-        self.x_dtype = x_dtype
-        self.weight_dtype = weight_dtype
-        self.output_dtype = output_dtype
+    def __init__(self, x_dtype=None, weight_dtype=None, output_dtype=None,
+                 use_deepseek_fp8_block_scale=None, use_w4_group_scaling=None,
+                 use_int8_woq_per_channel=None, use_mxfp8_act_scaling=None,
+                 use_mxfp8_weight_scaling=None, use_fused_finalize=None,
+                 *args, **kwargs):
+        self.x_dtype = x_dtype if x_dtype is not None else torch.float16
+        self.weight_dtype = weight_dtype if weight_dtype is not None else torch.float16
+        self.output_dtype = output_dtype if output_dtype is not None else torch.float16
         self.activation_type = ActivationType.Swiglu
         self._workspace_ptr = None
+        self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale or False
+        self.use_w4_group_scaling = use_w4_group_scaling or False
+        self.use_int8_woq_per_channel = use_int8_woq_per_channel or False
+        self.use_mxfp8_act_scaling = use_mxfp8_act_scaling or False
+        self.use_mxfp8_weight_scaling = use_mxfp8_weight_scaling or False
+        self.unpadded_hidden_size = 0
 
     def get_tactic_num(self, gemm_idx: int) -> int:
         return 1
@@ -336,6 +482,82 @@ class _VulkanMoERunner:
 
     def clear_cache(self):
         pass
+
+    def run_moe(self,
+                input, token_selected_experts, token_final_scales,
+                fc1_expert_weights, fc1_expert_biases,
+                fc2_expert_weights, fc2_expert_biases,
+                quant_scales, input_sf, swizzled_input_sf,
+                swiglu_alpha, swiglu_beta, swiglu_limit,
+                tp_size, tp_rank, ep_size, ep_rank,
+                cluster_size, cluster_rank,
+                enable_alltoall, min_latency_mode,
+                gemm_tactics, activation_type,
+                unpadded_hidden_size, tuner_num_tokens,
+                out_tensor, use_dynamic_fc2_scale,
+                fc1_lora_ranks, fc1_lora_weight_ptrs,
+                fc2_lora_ranks, fc2_lora_weight_ptrs,
+                gated_lora_ranks, gated_lora_weight_ptrs,
+                host_request_types, host_context_lengths,
+                lora_max_low_rank,
+                fc1_slot_lora_ranks, fc1_slot_lora_weight_ptrs,
+                fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
+                gated_slot_lora_ranks, gated_slot_lora_weight_ptrs,
+                token_to_slot=None):
+        num_tokens = input.shape[0]
+        hidden = input.shape[1]
+        if out_tensor is not None:
+            out_tensor.zero_()
+            output = out_tensor
+        else:
+            output = torch.zeros(num_tokens, hidden,
+                                 dtype=self.output_dtype, device=input.device)
+
+        from ..vulkan_backend.torch_bridge import vulkan_gemm, vulkan_elementwise_add
+
+        num_experts = fc1_expert_weights.shape[0]
+
+        for e in range(num_experts):
+            mask = token_selected_experts == e  # [num_tokens, top_k]
+            if not mask.any():
+                continue
+
+            token_indices, k_indices = mask.nonzero(as_tuple=True)
+            expert_tokens = input[token_indices]  # [num_expert_tokens, hidden]
+            scales = token_final_scales[token_indices, k_indices]  # [num_expert_tokens]
+
+            w1 = fc1_expert_weights[e]  # [2*intermediate, hidden]
+            fc1_out = vulkan_gemm(expert_tokens, w1.T.contiguous())
+
+            if fc1_expert_biases is not None:
+                bias = fc1_expert_biases[e].expand_as(fc1_out)
+                fc1_out = vulkan_elementwise_add(fc1_out, bias)
+
+            intermediate = fc1_out.shape[-1]
+            if self.unpadded_hidden_size and self.unpadded_hidden_size > 0:
+                hidden_act = self.unpadded_hidden_size
+                up = fc1_out[..., :hidden_act]
+                gate = fc1_out[..., hidden_act:hidden_act * 2]
+            else:
+                up, gate = fc1_out.chunk(2, dim=-1)
+
+            gate = torch.sigmoid(gate)
+            act_out = up * gate  # SwiGLU
+
+            w2 = fc2_expert_weights[e]  # [hidden, intermediate]
+            fc2_out = vulkan_gemm(act_out, w2.T.contiguous())
+
+            if fc2_expert_biases is not None:
+                bias = fc2_expert_biases[e].expand_as(fc2_out)
+                fc2_out = vulkan_elementwise_add(fc2_out, bias)
+
+            scaled = fc2_out * scales.unsqueeze(-1)
+            output.index_add_(0, token_indices, scaled.to(output.dtype))
+
+        return output
+
+    def run_moe_min_latency(self, *args, **kwargs):
+        return self.run_moe(*args, **kwargs)
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.

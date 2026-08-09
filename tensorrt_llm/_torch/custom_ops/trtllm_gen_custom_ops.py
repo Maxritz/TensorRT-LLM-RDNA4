@@ -493,8 +493,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             if _TLLM_CPP_AVAILABLE:
                 FP4BlockScaleMoERunner.runner_dict[instance_key] = torch.classes.trtllm.FP4BlockScaleMoERunner(self.act_type)
             else:
-                from .torch_custom_ops import _VulkanMoERunner
-                FP4BlockScaleMoERunner.runner_dict[instance_key] = _VulkanMoERunner(self.act_type)
+                from .torch_custom_ops import _VulkanGenMoERunner
+                FP4BlockScaleMoERunner.runner_dict[instance_key] = _VulkanGenMoERunner(self.act_type)
         return FP4BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
@@ -915,8 +915,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
             if _TLLM_CPP_AVAILABLE:
                 FP8BlockScaleMoERunner.runner_dict[instance_key] = torch.classes.trtllm.FP8BlockScaleMoERunner()
             else:
-                from .torch_custom_ops import _VulkanMoERunner
-                FP8BlockScaleMoERunner.runner_dict[instance_key] = _VulkanMoERunner(torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e4m3fn, False, False, False, False, False, False)
+                from .torch_custom_ops import _VulkanGenMoERunner
+                FP8BlockScaleMoERunner.runner_dict[instance_key] = _VulkanGenMoERunner()
         return FP8BlockScaleMoERunner.runner_dict[instance_key]
 
     def get_fallback_tactic(self, hidden_size: int,
@@ -1283,8 +1283,8 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             if _TLLM_CPP_AVAILABLE:
                 MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(self.act_type, True)
             else:
-                from .torch_custom_ops import _VulkanMoERunner
-                MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = _VulkanMoERunner(torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e4m3fn, False, False, False, False, False, False)
+                from .torch_custom_ops import _VulkanGenMoERunner
+                MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = _VulkanGenMoERunner(self.act_type, True)
         return MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
@@ -1626,8 +1626,8 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             if _TLLM_CPP_AVAILABLE:
                 E4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(self.act_type, False)
             else:
-                from .torch_custom_ops import _VulkanMoERunner
-                E4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = _VulkanMoERunner(torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e4m3fn, False, False, False, False, False, False)
+                from .torch_custom_ops import _VulkanGenMoERunner
+                E4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = _VulkanGenMoERunner(self.act_type, False)
         return E4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
@@ -1951,8 +1951,8 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             if _TLLM_CPP_AVAILABLE:
                 Bf16MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = torch.classes.trtllm.Bf16MxE2m1BlockScaleMoERunner(self.act_type)
             else:
-                from .torch_custom_ops import _VulkanMoERunner
-                Bf16MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = _VulkanMoERunner(torch.bfloat16, torch.bfloat16, torch.bfloat16, False, False, False, False, False, False)
+                from .torch_custom_ops import _VulkanGenMoERunner
+                Bf16MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = _VulkanGenMoERunner(self.act_type)
         return Bf16MxE2m1BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
@@ -2263,8 +2263,8 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             if _TLLM_CPP_AVAILABLE:
                 FP8FP4BlockScaleMoERunner.runner_dict[instance_key] = torch.classes.trtllm.FP8FP4BlockScaleMoERunner(self.act_type)
             else:
-                from .torch_custom_ops import _VulkanMoERunner
-                FP8FP4BlockScaleMoERunner.runner_dict[instance_key] = _VulkanMoERunner(torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e4m3fn, False, False, False, False, False, False)
+                from .torch_custom_ops import _VulkanGenMoERunner
+                FP8FP4BlockScaleMoERunner.runner_dict[instance_key] = _VulkanGenMoERunner(self.act_type)
         return FP8FP4BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
