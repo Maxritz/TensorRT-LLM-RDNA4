@@ -140,3 +140,5 @@ tensorrt_llm/_torch/vulkan_backend/*.so
 .claude/settings.json
 
 .plans/
+.venv/
+
