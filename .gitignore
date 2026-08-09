@@ -130,6 +130,10 @@ graphify-out/
 # Vulkan build directory (out-of-tree CMake)
 build_vulkan/
 
+# Staged Vulkan backend shared library (built by scripts/build_vulkan_backend.py)
+tensorrt_llm/_torch/vulkan_backend/*.dll
+tensorrt_llm/_torch/vulkan_backend/*.so
+
 # Compiled shader binaries
 *.spv
 .claude/agent-tests/perf-test-sync/results.json
