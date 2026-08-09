@@ -153,6 +153,14 @@ class _VulkanCompute:
         ]
         lib.tllm_vulkan_topk.restype = ctypes.c_int32
 
+        # tllm_vulkan_q8_0_gemm(void* weight, void* activation, void* output,
+        #                       uint32_t M, uint32_t N, uint32_t K, uint32_t blocksPerRow)
+        lib.tllm_vulkan_q8_0_gemm.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ]
+        lib.tllm_vulkan_q8_0_gemm.restype = ctypes.c_int32
+
         # tllm_vulkan_kv_cache_update_2d(...)
         lib.tllm_vulkan_kv_cache_update_2d.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p,   # kv_cache_k, kv_cache_v
@@ -232,10 +240,14 @@ class _VulkanCompute:
     def attention(self, q, k, v, output, batch_size, num_heads, seq_len_q, seq_len_k, head_dim, causal):
         return self._funcs.tllm_vulkan_attention(q, k, v, output,
             batch_size, num_heads, seq_len_q, seq_len_k, head_dim, causal)
-
-    def topk(self, scores, input_offsets, output_offsets, topk_indices, topk, num_heads, batch_size, total_tokens, total_output_tokens):
+    def topk(self, scores, input_offsets, output_offsets, topk_indices,
+             topk, num_heads, batch_size, total_tokens, total_output_tokens):
         return self._funcs.tllm_vulkan_topk(scores, input_offsets, output_offsets, topk_indices,
             topk, num_heads, batch_size, total_tokens, total_output_tokens)
+
+    def q8_0_gemm(self, weight, activation, output, M, N, K, blocks_per_row):
+        return self._funcs.tllm_vulkan_q8_0_gemm(weight, activation, output,
+            M, N, K, blocks_per_row)
 
     def kv_cache_update_2d(self, *args):
         return self._funcs.tllm_vulkan_kv_cache_update_2d(*args)
@@ -289,6 +301,7 @@ tllm_vulkan_rms_norm = _vk.rms_norm if is_available() else None
 tllm_vulkan_elementwise_add = _vk.elementwise_add if is_available() else None
 tllm_vulkan_attention = _vk.attention if is_available() else None
 tllm_vulkan_topk = _vk.topk if is_available() else None
+tllm_vulkan_q8_0_gemm = _vk.q8_0_gemm if is_available() else None
 tllm_vulkan_kv_cache_update_2d = _vk.kv_cache_update_2d if is_available() else None
 tllm_vulkan_tree_spec_build = _vk.tree_spec_build if is_available() else None
 tllm_vulkan_tree_spec_rejection = _vk.tree_spec_rejection if is_available() else None

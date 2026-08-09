@@ -225,6 +225,29 @@ extern "C" int32_t tllm_vulkan_topk(
 }
 
 /* ------------------------------------------------------------------ */
+/* Q8_0 (block-quantized) GEMM                                         */
+/* ------------------------------------------------------------------ */
+
+// Dequantized matmul: C[M,N] = A[M,K] * W_dequant[N,K]^T, one thread per
+// output element. Weights use the GGML block_q8_0 layout: each 36-byte block
+// is one fp32 scale followed by 32 signed int8 weights (shared scale per
+// block). K must be a multiple of 32; blocksPerRow = K / 32. Mirrors
+// q8_0_gemm.comp and VulkanBackend::launchQ8_0Gemm.
+extern "C" int32_t tllm_vulkan_q8_0_gemm(
+    void* weight, void* activation, void* output,
+    uint32_t M, uint32_t N, uint32_t K, uint32_t blocksPerRow)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchQ8_0Gemm(weight, activation, output, M, N, K, blocksPerRow);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* KV Cache Update (2D) — post speculative decode                      */
 /* ------------------------------------------------------------------ */
 

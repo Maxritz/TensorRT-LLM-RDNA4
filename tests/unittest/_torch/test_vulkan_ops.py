@@ -138,6 +138,44 @@ def test_elementwise_add_fp32_matches_python(vk):
     assert np.max(np.abs(out - ref)) <= 1e-4
 
 
+def _pack_q8_0(W_float):
+    """Pack [N, K] fp32 weights (K % 32 == 0) to GGML block_q8_0 bytes and
+    reconstruct the dequantized float32 matrix from the SAME bytes so the CPU
+    reference and the GPU kernel use identical scales/quantization."""
+    N, K = W_float.shape
+    B = K // 32
+    raw = np.empty((N, B, 36), dtype=np.uint8)
+    W_dq = np.zeros((N, K), dtype=np.float64)
+    for n in range(N):
+        for b in range(B):
+            block = W_float[n, b * 32:(b + 1) * 32].astype(np.float64)
+            amax = float(np.max(np.abs(block))) if block.size else 0.0
+            scale = (amax / 127.0) if amax > 0.0 else 1.0
+            q = np.round(block / scale).astype(np.int8)
+            raw[n, b, 0:4] = np.frombuffer(np.float32(scale).tobytes(), dtype=np.uint8)
+            raw[n, b, 4:36] = np.frombuffer(q.tobytes(), dtype=np.uint8)
+            W_dq[n, b * 32:(b + 1) * 32] = q.astype(np.float64) * scale
+    return raw.reshape(-1), W_dq
+
+
+# ---------------------------------------------------------------------------
+# Q8_0 (block-quantized) GEMM: C[M,N] = sum_k A[m,k] * (int8_w * scale).
+# ---------------------------------------------------------------------------
+def test_q8_0_gemm_dequant_matches_numpy(vk):
+    M, N, K = 4, 6, 32  # one q8_0 block per weight row -> blocksPerRow = 1
+    A = np.random.randn(M, K).astype(FTY)
+    W = (np.random.randn(N, K) * 2.0).astype(FTY)
+    weight_bytes, W_dq = _pack_q8_0(W)
+    C_ref = (A.astype(np.float64) @ W_dq.T).astype(FTY)
+    pA, pW, pC = _h2d(vk, A), _h2d(vk, weight_bytes), vk.malloc(C_ref.nbytes)
+    try:
+        assert vk.q8_0_gemm(pW, pA, pC, M, N, K, K // 32), "q8_0_gemm launch failed"
+        C = _d2h(vk, pC, C_ref.nbytes, C_ref.shape)
+    finally:
+        _free(vk, pA, pW, pC)
+    assert np.allclose(C, C_ref, rtol=1e-2, atol=1e-2), np.max(np.abs(C - C_ref))
+
+
 # ---------------------------------------------------------------------------
 # Attention: O = softmax((Q K^T)/sqrt(headDim)) V, optional causal mask.
 # Q/K/V/O fp32 laid out [batch, numHeads, seq, headDim] (row-major).
