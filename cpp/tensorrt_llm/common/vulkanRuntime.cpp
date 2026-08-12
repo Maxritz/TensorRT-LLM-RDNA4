@@ -559,7 +559,15 @@ VulkanResult VulkanRuntime::streamSynchronize(VkCommandPool pool)
         return VulkanResult::INITIALIZATION_FAILED;
     }
 
-    // Wait for all command buffers in this pool to complete
+    // Use bounded fence-based wait instead of vkQueueWaitIdle to avoid permanent hangs.
+    const uint64_t timeoutNs = 10'000'000'000ULL; // 10s
+
+    if (mFencePool)
+    {
+        return mFencePool->synchronizeAll(timeoutNs);
+    }
+
+    // Fallback: if no fence pool, use queue wait idle (no timeout possible)
     VkResult result = vkQueueWaitIdle(mContext->getComputeQueue(0));
     if (result != VK_SUCCESS)
     {
@@ -576,10 +584,24 @@ VulkanResult VulkanRuntime::deviceSynchronize()
         return VulkanResult::INITIALIZATION_FAILED;
     }
 
-    VkResult result = vkDeviceWaitIdle(mContext->getDevice());
-    if (result != VK_SUCCESS)
+    const uint64_t timeoutNs = 10'000'000'000ULL; // 10s
+
+    if (mFencePool)
     {
-        return translateVkResult(result);
+        VulkanResult result = mFencePool->waitIdle(timeoutNs);
+        if (result != VulkanResult::SUCCESS)
+        {
+            return result;
+        }
+    }
+    else
+    {
+        // No fence pool, use device wait idle (no timeout)
+        VkResult result = vkDeviceWaitIdle(mContext->getDevice());
+        if (result != VK_SUCCESS)
+        {
+            return translateVkResult(result);
+        }
     }
 
     return VulkanResult::SUCCESS;

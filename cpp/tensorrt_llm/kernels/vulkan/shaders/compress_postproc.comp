@@ -1,0 +1,540 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// ============================================================================
+// KV Cache Compression — Postprocess + Scatter (Vulkan port of postProcessScatterKernel)
+// ============================================================================
+// Pipeline: load compressed token → RMSNorm → RoPE → Hadamard butterfly →
+//           paged cache scatter (with quantization). All in fp32 registers.
+// One workgroup per compressed token (blockIdx.x = token_idx).
+// Uses GL_KHR_shader_subgroup for native warp shuffles on subgroup-capable HW.
+// ============================================================================
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup : require
+
+layout(push_constant, std430) uniform Push {
+    int   total_tokens;
+    int   batch_size;
+    int   head_dim;
+    int   tokens_per_block;
+    int   elem_bytes;          // 2=bf16, 4=fp32
+    int   cache_scale_type;    // 0=kNone, 1=fp8_pertensor, 2=fp8_blockwise, 3=mxfp4
+    int   max_blocks;
+    int   nope_dim;
+    int   rope_dim;
+    float rms_eps;
+    int   rotate_activation;   // 1=true, 0=false
+} pc;
+
+// Bindings (matches VulkanKernelDispatcher::dispatchCompressPostproc)
+layout(std430, binding = 0) buffer BufKvComp    { uint data[]; } kvComp;
+layout(std430, binding = 1) buffer BufRmsW      { uint data[]; } rmsW;
+layout(std430, binding = 2) buffer BufCosSin     { float data[]; } cosSin;
+layout(std430, binding = 3) buffer BufPosIds     { int data[]; } posIds;
+layout(std430, binding = 4) buffer BufKvCache       { uint8_t data[]; } kvCache;
+layout(std430, binding = 5) buffer BufNumOut     { int data[]; } numOut;
+layout(std430, binding = 6) buffer BufCuKvComp   { int data[]; } cuKvComp;
+layout(std430, binding = 7) buffer BufStartPos   { int data[]; } startPos;
+layout(std430, binding = 8) buffer BufBlkOff     { int data[]; } blkOff;
+layout(std430, binding = 9) buffer BufMask       { uint8_t data[]; } mask;
+layout(std430, binding = 10) buffer BufQuantOut    { uint8_t data[]; } quantOut;
+layout(std430, binding = 11) buffer BufScaleOut    { uint8_t data[]; } scaleOut;
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// ── Element helpers ──────────────────────────────────────────────────────────
+float loadElem(uint const buf[], uint idx, int eb)
+{
+    if (eb == 4)
+        return uintBitsToFloat(buf[idx]);
+    else
+    {
+        uint packed = buf[idx >> 1u];
+        uint half = (idx & 1u) == 0u ? (packed & 0xFFFFu) : (packed >> 16u);
+        return uintBitsToFloat(half << 16u);
+    }
+}
+
+uint fp32ToBf16(float f)
+{
+    uint bits = floatBitsToUint(f);
+    uint const rounding = ((bits >> 16u) & 1u) + 0x7FFFu;
+    return ((bits + rounding) >> 16u) & 0xFFFFu;
+}
+
+uint floatBitsToUint8(float f, int byte_idx)
+{
+    uint bits = floatBitsToUint(f);
+    return (bits >> (byte_idx * 8u)) & 0xFFu;
+}
+
+// ── FP8 E4M3 (NVIDIA format, max=448.0) ──────────────────────────────────────
+// ponytail: manual fp32→fp8e4m3 conversion without subnormal support.
+// Correct for finite training-range inputs; upgrade path: GL_EXT_shader_fp8 if
+// the target AMD/NVIDIA driver supports native fp8 casts.
+uint fp32ToFp8e4m3(float v)
+{
+    uint bits = floatBitsToUint(v);
+    uint sign = (bits >> 31u) & 0x1u;
+    uint abs_bits = bits & 0x7FFFFFFu;
+    uint exp32 = (abs_bits >> 23u) & 0xFFu;
+    uint mant32 = abs_bits & 0x7FFFFFu;
+
+    if (exp32 == 0u) return 0u;
+
+    int exp8 = int(exp32) - 127 + 7;
+    uint mant3 = mant32 >> 20u;
+    uint rem = mant32 & 0xFFFFFu;
+    uint round_bit = (mant32 >> 19u) & 1u;
+    uint sticky = mant32 & 0x7FFFFu;
+
+    if (round_bit == 1u && (sticky > 0u || (mant3 & 1u) == 1u))
+    {
+        mant3++;
+        if (mant3 > 7u) { mant3 = 0u; exp8++; }
+    }
+
+    if (exp8 >= 15) { exp8 = 15; mant3 = 6u; }
+    if (exp8 < 1) exp8 = 0;
+
+    return (sign << 7u) | (uint(exp8) << 3u) | mant3;
+}
+
+// ── UE8M0 (power-of-2 exponent byte for MXFP4 scales) ─────────────────────────
+uint toUE8M0(float v)
+{
+    if (v <= 0.0) return 0u;
+    uint bits = floatBitsToUint(v);
+    int exp = int((bits >> 23u) & 0xFFu) - 127;
+    return uint(exp + 127);
+}
+
+// ── E2M1 (signed FP4, NVIDIA format: levels {0,0.5,1,1.5,2,3,4,6}) ───────────
+// ponytail: threshold-based round-to-nearest. Differs from CUDA's
+// cvt.rn.satfinite.e2m1x2.f32 (round-to-nearest-even) only at exact midpoints
+// (e.g. 0.25), which are measure-zero for quantized activations. Acceptable.
+uint floatToE2M1(float v)
+{
+    float a = abs(v);
+    uint sign = (floatBitsToUint(v) >> 31u) & 0x1u;
+    uint code;
+    if (a < 0.25f) code = 0u;
+    else if (a < 0.75f) code = 1u;
+    else if (a < 1.25f) code = 2u;
+    else if (a < 1.75f) code = 3u;
+    else if (a < 2.5f) code = 4u;
+    else if (a < 3.5f) code = 5u;
+    else if (a < 5.0f) code = 6u;
+    else code = 7u;
+    return (sign << 3u) | code;
+}
+
+uint packE2M1x2(float lo, float hi)
+{
+    return (floatToE2M1(lo) << 4u) | floatToE2M1(hi);
+}
+
+// ── Rounded power-of-2 scale (matches CUDA roundedPow2Scale) ─────────────────
+float roundedPow2Scale(float amax, float max_inv, float min_amax)
+{
+    float ca = max(amax, min_amax);
+    float x = ca * max_inv;
+    uint bits = floatBitsToUint(x);
+    int exp = int((bits >> 23u) & 0xFFu) - 127;
+    uint mant = bits & 0x7FFFFFu;
+    if (mant != 0u) exp++;
+    return uintBitsToFloat(uint(exp + 127) << 23u);
+}
+
+void main()
+{
+    uint token_idx = gl_WorkGroupID.x;
+    if (token_idx >= uint(pc.total_tokens)) return;
+
+    // ── Step 0: Binary search batch index ──────────────────────────────────
+    int batch_idx, local_output_idx;
+    if (pc.batch_size <= 1)
+    {
+        batch_idx = 0;
+        local_output_idx = int(token_idx);
+    }
+    else
+    {
+        int lo = 0, hi = pc.batch_size;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >> 1;
+            if (cuKvComp.data[mid + 1] <= int(token_idx))
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        batch_idx = lo;
+        if (batch_idx >= pc.batch_size) return;
+        local_output_idx = int(token_idx) - cuKvComp.data[batch_idx];
+    }
+
+    if (mask.data[token_idx] == 0u) return;
+    if (local_output_idx >= numOut.data[batch_idx]) return;
+
+    // ── Compute threading params ───────────────────────────────────────────
+    int const HEAD_DIM = pc.head_dim;
+    int const ELEM_BYTES = pc.elem_bytes;
+    int const MAX_VEC = 16 / ELEM_BYTES;
+    int const VEC = (HEAD_DIM / MAX_VEC >= 32) ? MAX_VEC : (HEAD_DIM / 32);
+    int const VEC_CLAMPED = max(VEC, 4);
+    int const NTHRD = HEAD_DIM / VEC_CLAMPED;
+
+    uint tid = gl_LocalInvocationID.x;
+    if (tid >= uint(NTHRD)) return;
+
+    int const warp_id = int(tid) / 32;
+    int const lane_id = int(tid) % 32;
+    int const NUM_WARPS = (NTHRD + 31) / 32;
+
+    // ── Step 1: Load from kv_comp ──────────────────────────────────────────
+    float v[8];
+    for (int i = 0; i < VEC_CLAMPED; i++)
+    {
+        int d = int(tid) * VEC_CLAMPED + i;
+        if (d >= HEAD_DIM) { v[i] = 0.0f; continue; }
+        v[i] = loadElem(kvComp.data, token_idx * uint(HEAD_DIM) + uint(d), ELEM_BYTES);
+    }
+
+    // ── Step 2: RMSNorm ────────────────────────────────────────────────────
+    float local_sq = 0.0f;
+    for (int i = 0; i < VEC_CLAMPED; i++)
+        local_sq += v[i] * v[i];
+
+    // Subgroup reduce to warp level
+    float warp_sum = subgroupAdd(local_sq);
+
+    shared float s_scratch[512];
+    if (lane_id == 0)
+        s_scratch[warp_id] = warp_sum;
+    barrier();
+
+    // First warp reduces all warp sums
+    if (warp_id == 0)
+    {
+        float s = (lane_id < NUM_WARPS) ? s_scratch[lane_id] : 0.0f;
+        s = subgroupAdd(s);
+        if (lane_id == 0)
+            s_scratch[0] = s;
+    }
+    barrier();
+
+    float rms_scale;
+    if (tid == 0)
+        s_scratch[0] = rsqrt(s_scratch[0] / float(HEAD_DIM) + pc.rms_eps);
+    barrier();
+    float rms_scale_b = subgroupBroadcast(s_scratch[0], 0u);
+
+    // ── Step 3: Apply RMSNorm ──────────────────────────────────────────────
+    for (int i = 0; i < VEC_CLAMPED; i++)
+        v[i] = v[i] * rms_scale_b * loadElem(rmsW.data, tid * uint(VEC_CLAMPED) + uint(i), ELEM_BYTES);
+
+    // ── Step 4: RoPE ──────────────────────────────────────────────────────
+    int const half_rope = pc.rope_dim / 2;
+    int const pos_id = posIds.data[token_idx];
+
+    for (int i = 0; i < VEC_CLAMPED; i += 2)
+    {
+        int elem_idx = int(tid) * VEC_CLAMPED + i;
+        if (elem_idx >= pc.nope_dim)
+        {
+            int rope_idx = elem_idx - pc.nope_dim;
+            int d = rope_idx >> 1;
+            float cos_v = cosSin.data[pos_id * pc.rope_dim + d];
+            float sin_v = cosSin.data[pos_id * pc.rope_dim + half_rope + d];
+            float x_even = v[i];
+            float x_odd = v[i + 1];
+            v[i] = x_even * cos_v - x_odd * sin_v;
+            v[i + 1] = x_odd * cos_v + x_even * sin_v;
+        }
+    }
+
+    // ── Step 5: Hadamard butterfly ────────────────────────────────────────
+    if (pc.rotate_activation != 0)
+    {
+        // Phase A: local butterfly (strides 1..VEC/2 within thread registers)
+        for (int stride = 1; stride < VEC_CLAMPED; stride <<= 1)
+        {
+            for (int i = 0; i < VEC_CLAMPED; i++)
+            {
+                if ((i & stride) == 0)
+                {
+                    float a = v[i], b = v[i ^ stride];
+                    v[i] = a + b;
+                    v[i ^ stride] = a - b;
+                }
+            }
+        }
+
+        // Phase B: cross-thread butterfly within subgroup
+        // CUDA uses __shfl_xor_sync(v[i], ts) where ts=1,2,4,8,16.
+        // GLSL subgroupShuffle gets v[i] from absolute lane (lane_id ^ ts).
+        for (int ts = 1; ts < 32; ts <<= 1)
+        {
+            int stride = ts * VEC_CLAMPED;
+            for (int i = 0; i < VEC_CLAMPED; i++)
+            {
+                int partner_lane = lane_id ^ ts;
+                if (uint(partner_lane) < 32u)
+                {
+                    float partner = subgroupShuffle(v[i], uint(partner_lane));
+                    int elem_idx = int(tid) * VEC_CLAMPED + i;
+                    if (elem_idx & stride)
+                        v[i] = partner - v[i];
+                    else
+                        v[i] = v[i] + partner;
+                }
+            }
+        }
+
+        // Phase C: cross-warp butterfly via shared memory (strides >= 32*VEC)
+        // Only needed when NTHRD > 32 (e.g., HEAD_DIM=512, VEC=8 -> 64 threads)
+        if (NTHRD > 32)
+        {
+        shared float s_had[1024];
+
+        // Write with XOR-swizzle (bank-conflict-free)
+        for (int i = 0; i < VEC_CLAMPED; i++)
+        {
+            int idx = int(tid) * VEC_CLAMPED + i;
+            int swizzled = idx ^ ((idx >> 3) & 0x1F);
+            if (idx < HEAD_DIM && swizzled < 1024)
+                s_had[swizzled] = v[i];
+        }
+        barrier();
+
+        for (int stride = 32 * VEC_CLAMPED; stride < HEAD_DIM; stride <<= 1)
+        {
+            // Phase C, iteration N-1: compute result into v[i]
+            for (int i = 0; i < VEC_CLAMPED; i++)
+            {
+                int idx = int(tid) * VEC_CLAMPED + i;
+
+                int swizzled = idx ^ ((idx >> 3) & 0x1F);
+                int partner_idx = idx ^ stride;
+                int partner_swizzled = partner_idx ^ ((partner_idx >> 3) & 0x1F);
+
+                if (partner_idx < HEAD_DIM && partner_swizzled < 1024)
+                {
+                    float a = s_had[swizzled];
+                    float b = s_had[partner_swizzled];
+                    v[i] = (idx & stride) ? (b - a) : (a + b);
+                }
+                else
+                {
+                    float a = s_had[swizzled];
+                    v[i] = (idx & stride) ? (0.0f - a) : a;
+                }
+            }
+            barrier();
+
+            // Write back for next iteration
+            for (int i = 0; i < VEC_CLAMPED; i++)
+            {
+                int idx = int(tid) * VEC_CLAMPED + i;
+                if (idx >= HEAD_DIM) break;
+                int swizzled = idx ^ ((idx >> 3) & 0x1F);
+                if (swizzled < 1024)
+                    s_had[swizzled] = v[i];
+            }
+            barrier();
+        }
+
+        // Read final result
+        for (int i = 0; i < VEC_CLAMPED; i++)
+        {
+            int idx = int(tid) * VEC_CLAMPED + i;
+            if (idx >= HEAD_DIM) break;
+            int swizzled = idx ^ ((idx >> 3) & 0x1F);
+            v[i] = s_had[swizzled];
+        }
+        } // end if (NTHRD > 32)
+
+        // Step 6: Scale by 1/sqrt(HEAD_DIM)
+        float const had_scale = rsqrt(float(HEAD_DIM));
+        for (int i = 0; i < VEC_CLAMPED; i++)
+            v[i] *= had_scale;
+    }
+
+    // ── Step 9: Compute paged cache destination ────────────────────────────
+    int const start_pos = startPos.data[batch_idx];
+    int const cache_pos = start_pos + local_output_idx;
+    int const logical_block = cache_pos / pc.tokens_per_block;
+    int const token_offset = cache_pos % pc.tokens_per_block;
+    int const phys_block = blkOff.data[batch_idx * pc.max_blocks + logical_block];
+
+    int const cst = pc.cache_scale_type;
+
+    // ── Step 11: Store to cache ────────────────────────────────────────────
+    if (cst == 0) // kNone: bf16 or fp32
+    {
+        int const data_stride = pc.tokens_per_block * HEAD_DIM * ELEM_BYTES;
+        uint const block_base = uint(phys_block) * uint(data_stride);
+        uint const row_base = block_base + uint(token_offset) * uint(HEAD_DIM) * uint(ELEM_BYTES);
+
+        for (int i = 0; i < VEC_CLAMPED; i++)
+        {
+            int d = int(tid) * VEC_CLAMPED + i;
+            if (d >= HEAD_DIM) break;
+
+            if (ELEM_BYTES == 4)
+            {
+                uint bits = floatBitsToUint(v[i]);
+                kvCache.data[row_base + uint(d) * 4u + 0u] = uint8_t(bits & 0xFFu);
+                kvCache.data[row_base + uint(d) * 4u + 1u] = uint8_t((bits >> 8u) & 0xFFu);
+                kvCache.data[row_base + uint(d) * 4u + 2u] = uint8_t((bits >> 16u) & 0xFFu);
+                kvCache.data[row_base + uint(d) * 4u + 3u] = uint8_t((bits >> 24u) & 0xFFu);
+            }
+            else
+            {
+                uint bf = fp32ToBf16(v[i]);
+                uint byte_idx = uint(d) * 2u;
+                uint existing = uint(kvCache.data[row_base + byte_idx]) | (uint(kvCache.data[row_base + byte_idx + 1u]) << 8u);
+                existing = (existing & 0xFFFF0000u) | bf;
+                kvCache.data[row_base + byte_idx] = uint8_t(existing & 0xFFu);
+                kvCache.data[row_base + byte_idx + 1u] = uint8_t((existing >> 8u) & 0xFFu);
+            }
+        }
+    }
+    else if (cst == 1) // kFP8PerTensor
+    {
+        int const data_stride = pc.tokens_per_block * HEAD_DIM;
+        uint const block_base = uint(phys_block) * uint(data_stride);
+        uint const row_base = block_base + uint(token_offset) * uint(HEAD_DIM);
+
+        for (int i = 0; i < VEC_CLAMPED; i++)
+        {
+            int d = int(tid) * VEC_CLAMPED + i;
+            if (d >= HEAD_DIM) break;
+            uint fp8 = fp32ToFp8e4m3(v[i]);
+            kvCache.data[row_base + uint(d)] = uint8_t(fp8 & 0xFFu);
+        }
+    }
+    else if (cst == 2) // kFP8Blockwise
+    {
+        int const num_scale_blocks = HEAD_DIM / 128;
+        int const fsz_per_blk = pc.tokens_per_block * HEAD_DIM;
+        int const scz_per_blk = pc.tokens_per_block * num_scale_blocks * 4;
+        int const data_stride = fsz_per_blk + scz_per_blk;
+        uint const block_base = uint(phys_block) * uint(data_stride);
+        uint const data_base = block_base + uint(token_offset) * uint(HEAD_DIM);
+        int const group_size = 128 / VEC_CLAMPED;
+
+        // amax reduction
+        float local_amax = 0.0f;
+        for (int i = 0; i < VEC_CLAMPED; i++)
+            local_amax = max(local_amax, abs(v[i]));
+        float warp_amax = subgroupMax(local_amax);
+        if (lane_id == 0) s_scratch[warp_id] = warp_amax;
+        barrier();
+
+        if (warp_id == 0 && lane_id < NUM_WARPS)
+        {
+            float a = s_scratch[lane_id];
+            a = subgroupMax(a);
+            if (lane_id == 0) s_scratch[0] = a;
+        }
+        barrier();
+
+        float scale;
+        if (tid == 0)
+        {
+            float amax = s_scratch[0];
+            scale = (amax > 0.0f) ? (448.0f / amax) : 1.0f;
+            s_scratch[0] = scale;
+        }
+        barrier();
+        scale = s_scratch[0];
+
+        for (int i = 0; i < VEC_CLAMPED; i++)
+        {
+            int d = int(tid) * VEC_CLAMPED + i;
+            if (d >= HEAD_DIM) break;
+            uint fp8 = fp32ToFp8e4m3(v[i] * scale);
+            kvCache.data[data_base + uint(d)] = uint8_t(fp8 & 0xFFu);
+        }
+
+        if (int(tid) % group_size == 0 && int(tid) / group_size < num_scale_blocks)
+        {
+            int scale_idx = int(tid) / group_size;
+            uint so = block_base + uint(fsz_per_blk) + uint(token_offset) * uint(num_scale_blocks) * 4u + uint(scale_idx) * 4u;
+            float store_scale = amax / 448.0f;
+            uint sb = floatBitsToUint(store_scale);
+            kvCache.data[so] = uint8_t(sb & 0xFFu);
+            kvCache.data[so + 1u] = uint8_t((sb >> 8u) & 0xFFu);
+            kvCache.data[so + 2u] = uint8_t((sb >> 16u) & 0xFFu);
+            kvCache.data[so + 3u] = uint8_t((sb >> 24u) & 0xFFu);
+        }
+    }
+    else if (cst == 3) // kMXFP4Blockwise
+    {
+        int const num_scale_blocks = HEAD_DIM / 32;
+        int const packed_head_dim = HEAD_DIM / 2;
+        int const fsz_per_blk = pc.tokens_per_block * packed_head_dim;
+        int const scz_per_blk = pc.tokens_per_block * num_scale_blocks;
+        int const data_stride = fsz_per_blk + scz_per_blk;
+        uint const block_base = uint(phys_block) * uint(data_stride);
+        uint const data_base = block_base + uint(token_offset) * uint(packed_head_dim);
+        int const group_size = 32 / VEC_CLAMPED;
+
+        float local_amax = 0.0f;
+        for (int i = 0; i < VEC_CLAMPED; i++)
+            local_amax = max(local_amax, abs(v[i]));
+        float warp_amax = subgroupMax(local_amax);
+        if (lane_id == 0) s_scratch[warp_id] = warp_amax;
+        barrier();
+
+        if (warp_id == 0 && lane_id < NUM_WARPS)
+        {
+            float a = s_scratch[lane_id];
+            a = subgroupMax(a);
+            if (lane_id == 0) s_scratch[0] = a;
+        }
+        barrier();
+
+        float scale;
+        if (tid == 0)
+        {
+            float amax = s_scratch[0];
+            float const kFp4Max = 6.0f;
+            scale = roundedPow2Scale(amax, 1.0f / kFp4Max, kFp4Max * 1.1754943508222875e-38f);
+            s_scratch[0] = scale;
+        }
+        barrier();
+        scale = s_scratch[0];
+
+        for (int i = 0; i < VEC_CLAMPED; i += 2)
+        {
+            int d = int(tid) * VEC_CLAMPED + i;
+            if (d >= HEAD_DIM) break;
+            uint packed = packE2M1x2(v[i] / scale, v[i + 1] / scale);
+            kvCache.data[data_base + uint(d) / 2u] = uint8_t(packed & 0xFFu);
+        }
+
+        if (int(tid) % group_size == 0 && int(tid) / group_size < num_scale_blocks)
+        {
+            int scale_idx = int(tid) / group_size;
+            uint so = block_base + uint(fsz_per_blk) + uint(token_offset) * uint(num_scale_blocks) + uint(scale_idx);
+            kvCache.data[so] = uint8_t(toUE8M0(scale) & 0xFFu);
+        }
+    }
+}

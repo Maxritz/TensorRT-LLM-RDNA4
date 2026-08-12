@@ -1,0 +1,89 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Paged KV cache append.
+// Appends (append_key, append_value) tokens into a paged KV cache layout.
+//
+// Parameters:
+//   append_key:    [n_tokens, num_kv_heads, head_dim] float
+//   append_value:  [n_tokens, num_kv_heads, head_dim] float
+//   batch_indices: [n_tokens] uint
+//   positions:     [n_tokens] uint
+//   kv_cache_k:    [batch, max_pages, num_kv_heads, page_size, head_dim] float
+//   kv_cache_v:    [batch, max_pages, num_kv_heads, page_size, head_dim] float
+//   kv_indices:    [total_pages] uint (page index mapping)
+//   kv_indptr:     [batch + 1] uint (per-batch page start offset)
+//   kv_last_page_len: [batch] uint (valid entries in last page per batch)
+//
+// Each thread handles one (token, head, dim) triple.
+
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint n_tokens;
+    uint num_kv_heads;
+    uint head_dim;
+    uint page_size;
+    uint max_pages;
+    uint batch_size;
+} pc;
+
+layout(std430, binding = 0) restrict readonly buffer BufKey    { float append_key[]; };
+layout(std430, binding = 1) restrict readonly buffer BufVal     { float append_value[]; };
+layout(std430, binding = 2) restrict readonly buffer BufBatch  { uint batch_indices[]; };
+layout(std430, binding = 3) restrict readonly buffer BufPos    { uint positions[]; };
+layout(std430, binding = 4) restrict buffer BufKCache { float kv_cache_k[]; };
+layout(std430, binding = 5) restrict buffer BufVCache { float kv_cache_v[]; };
+layout(std430, binding = 6) restrict readonly buffer BufIdx    { uint kv_indices[]; };
+layout(std430, binding = 7) restrict readonly buffer BufIndptr  { uint kv_indptr[]; };
+layout(std430, binding = 8) restrict readonly buffer BufLastLen { uint kv_last_page_len[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint totalWork = pc.n_tokens * pc.num_kv_heads * pc.head_dim;
+    if (tid >= totalWork) return;
+
+    uint t = tid / (pc.num_kv_heads * pc.head_dim);
+    uint rest = tid % (pc.num_kv_heads * pc.head_dim);
+    uint h = rest / pc.head_dim;
+    uint d = rest % pc.head_dim;
+
+    if (t >= pc.n_tokens) return;
+
+    uint b = batch_indices[t];
+    uint pos = positions[t];
+    uint page_idx = pos / pc.page_size;
+    uint page_offset = pos % pc.page_size;
+
+    uint seq_start = kv_indptr[b];
+    uint local_page = seq_start + page_idx;
+
+    float k_elem = append_key[t * pc.num_kv_heads * pc.head_dim + h * pc.head_dim + d];
+    float v_elem = append_value[t * pc.num_kv_heads * pc.head_dim + h * pc.head_dim + d];
+
+    uint flat_idx = (b * pc.max_pages * pc.num_kv_heads * pc.page_size * pc.head_dim +
+                     local_page * pc.num_kv_heads * pc.page_size * pc.head_dim +
+                     h * pc.page_size * pc.head_dim +
+                     page_offset * pc.head_dim +
+                     d);
+
+    kv_cache_k[flat_idx] = k_elem;
+    kv_cache_v[flat_idx] = v_elem;
+}

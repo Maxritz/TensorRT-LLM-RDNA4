@@ -377,6 +377,15 @@ The telemetry collection code is fully open source and auditable at
 reference of exactly what is collected, see the
 [schema documentation](./tensorrt_llm/usage/schemas/README.md).
 
+## Third-Party References
+
+This repository includes a Vulkan compute backend for AMD GPU inference on Windows.
+During development, the [VAiSt (Vulkan AI Stack)](https://github.com/Maxritz/VAiSt)
+repository was used as a read-only reference for GLSL compute shader patterns and
+Vulkan dispatch conventions (softmax, RMSNorm, GEMM tiling, elementwise ops).
+VAiSt's shader source files under `shaders/vkmath/` and `shaders/vkblas/` provided
+algorithm reference for the ported kernels.
+
 ## Useful Links
 - [Quantized models on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4): A growing collection of quantized (e.g., FP8, FP4) and optimized LLMs, including [DeepSeek FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4), ready for fast inference with TensorRT LLM.
 - [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo): A datacenter scale distributed inference serving framework that works seamlessly with TensorRT LLM.

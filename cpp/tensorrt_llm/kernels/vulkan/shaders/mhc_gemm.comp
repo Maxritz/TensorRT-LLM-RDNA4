@@ -1,0 +1,204 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// MHC GEMM + SQRSum: Vulkan port of mhcGemmSqrsumFmaKernel (mhcKernels.cu).
+//
+// Computes:  Y[m, n] = dot(X[m, :], W_T[n, :])     for each (m, n)
+//            R[m]    = sum_k X[m, k]^2              (sqrsum, only for n_start==0)
+//
+// Grid:   (M, ceil(N / tileN))
+// Block:  256 threads
+//
+// CUDA notes: uses PTX prmt for bf16→fp32, ld.global.cs/evict_last cache hints,
+// warp shuffle reductions. GLSL has no shuffle but we use shared memory reduction
+// (pattern from VAiSt softmax_f32.comp).
+//
+// Layout: X is row-major fp16 (uint16), W_T is row-major fp32, Y is fp32, R is fp32.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint M;          // batch rows
+    uint N;          // output neurons (hidden_size)
+    uint K;          // input dimension
+    uint tileN;      // neurons per tile (block in Y)
+    uint padSlotId;
+} pc;
+
+// binding 0: X       [M * K]          (fp16 as uint16)
+// binding 1: W_T     [N * K]          (fp32)
+// binding 2: Y       [M * N]          (fp32, output)
+// binding 3: R       [M]              (fp32, sqrsum output)
+layout(std430, binding = 0) uniform  BufX   { uint16_t x_[];    };
+layout(std430, binding = 1) uniform  BufWT  { float    wT[];   };
+layout(std430, binding = 2) buffer  BufY   { float    y_[];   };
+layout(std430, binding = 3) buffer  BufR   { float    r_[];   };
+
+float unpackFp16(uint16_t h)
+{
+    if (h == 0u) return 0.0;
+    uint bits = uint(h);
+    uint sign = (bits >> 15u) & 1u;
+    uint exp = (bits >> 10u) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u)
+    {
+        if (mant == 0u) return sign == 1u ? -0.0 : 0.0;
+        float val = ldexp(float(mant) / 1024.0, -14);
+        return sign == 1u ? -val : val;
+    }
+    if (exp == 31u)
+    {
+        if (mant == 0u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+        return 0.0;
+    }
+    float val = ldexp(float(mant) / 1024.0 + 1.0, int(exp) - 15);
+    return sign == 1u ? -val : val;
+}
+
+#define WARP_SIZE 32
+#define NUM_WARPS 8
+#define K_VEC 4
+#define K_STEP (256 * K_VEC)   // 1024
+
+shared float s_warp[8][9];     // [warp_id][col + sqrsum_slot]
+
+float butterflyReduceW(float val)
+{
+    // GLSL has no __shfl_xor — emulate with shared memory or just return (single thread)
+    // For correctness: each thread contributes one value, but we use shared mem reduction
+    return val;
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint warp_id = tid / WARP_SIZE;
+    uint lane = tid % WARP_SIZE;
+    uint row = gl_WorkGroupID.x;
+    uint n_start = gl_WorkGroupID.y * pc.tileN;
+
+    if (row >= pc.M || n_start >= pc.N)
+        return;
+
+    uint colsThisTile = min(pc.tileN, pc.N - n_start);
+    bool do_sqr = (n_start == 0u);
+
+    // Each thread accumulates NUM_WARPS columns (8 columns, one per warp)
+    float acc[8];
+    for (uint i = 0u; i < 8; i++) acc[i] = 0.0;
+    float sqr = 0.0;
+
+    // Main K loop: process K in chunks of K_STEP (1024 elements)
+    for (uint k_base = 0u; k_base + K_STEP <= pc.K; k_base += K_STEP)
+    {
+        uint my_k = k_base + tid * uint(K_VEC);
+
+        // Load 4 fp16 from X
+        float4 xv;
+        xv.x = unpackFp16(x_[row * pc.K + my_k + 0u]);
+        xv.y = unpackFp16(x_[row * pc.K + my_k + 1u]);
+        xv.z = unpackFp16(x_[row * pc.K + my_k + 2u]);
+        xv.w = unpackFp16(x_[row * pc.K + my_k + 3u]);
+
+        if (do_sqr)
+        {
+            sqr += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+        }
+
+        // Dot product: acc[n] += X[k:k+4] * W_T[n][k:k+4] for each n
+        for (uint n = 0u; n < colsThisTile; n++)
+        {
+            uint wIdx = (n_start + n) * pc.K + my_k;
+            float4 wv;
+            wv.x = wT[wIdx + 0u];
+            wv.y = wT[wIdx + 1u];
+            wv.z = wT[wIdx + 2u];
+            wv.w = wT[wIdx + 3u];
+            acc[n] = fma(xv.x, wv.x, acc[n]);
+            acc[n] = fma(xv.y, wv.y, acc[n]);
+            acc[n] = fma(xv.z, wv.z, acc[n]);
+            acc[n] = fma(xv.w, wv.w, acc[n]);
+        }
+    }
+
+    // Tail: handle remaining K elements
+    uint tail_start = pc.K - (pc.K % K_STEP);
+    for (uint kk = tail_start + tid; kk < pc.K; kk += 256u)
+    {
+        float xv = unpackFp16(x_[row * pc.K + kk]);
+        if (do_sqr)
+            sqr += xv * xv;
+        for (uint n = 0u; n < colsThisTile; n++)
+        {
+            float wv = wT[(n_start + n) * pc.K + kk];
+            acc[n] = fma(xv, wv, acc[n]);
+        }
+    }
+
+    // Cross-warp reduction: NUM_WARPS warps, each handles one column
+    // Group colsThisTile into chunks of NUM_WARPS (8)
+    uint n_groups = (colsThisTile + uint(NUM_WARPS) - 1u) / uint(NUM_WARPS);
+    uint sqrsum_slot = uint(NUM_WARPS);
+
+    for (uint g = 0u; g < n_groups; g++)
+    {
+        uint g_cols = (g == n_groups - 1u) ? (colsThisTile - g * uint(NUM_WARPS)) : uint(NUM_WARPS);
+
+        // Intra-warp reduction via shared memory (GLSL has no shuffle)
+        // Store partial sums to shared memory
+        if (warp_id < g_cols)
+        {
+            s_warp[warp_id][g] = acc[g * uint(NUM_WARPS) + warp_id];
+        }
+        if (do_sqr && g == 0u)
+        {
+            s_warp[warp_id][sqrsum_slot] = sqr;
+        }
+        barrier();
+
+        // Warp 0 reduces across g_cols warps
+        if (warp_id == 0u)
+        {
+            // Reduce each column
+            for (uint w = 1u; w < g_cols; w++)
+            {
+                s_warp[0][g] += s_warp[w][g];
+            }
+            if (do_sqr)
+            {
+                for (uint w = 1u; w < NUM_WARPS; w++)
+                    s_warp[0][sqrsum_slot] += s_warp[w][sqrsum_slot];
+            }
+        }
+        barrier();
+
+        // Output results
+        if (warp_id < g_cols && lane == 0u)
+        {
+            uint col = g * uint(NUM_WARPS) + warp_id;
+            y_[row * pc.N + n_start + col] = s_warp[0][g];
+        }
+        if (do_sqr && g == 0u && warp_id == 0u && lane == 0u)
+        {
+            r_[row] = s_warp[0][sqrsum_slot];
+        }
+        barrier();
+    }
+}

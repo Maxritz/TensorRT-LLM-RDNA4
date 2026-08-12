@@ -29,7 +29,11 @@ from typing import (TYPE_CHECKING, Annotated, Any, ClassVar, Dict, List,
                     Literal, Optional, Set, Tuple, Type, TypeAlias, TypeVar,
                     Union, get_args, get_origin)
 
-import torch
+import os as _os
+if _os.environ.get("TLLM_VULKAN_BACKEND", "0") != "1":
+    import torch
+else:
+    import numpy as _np_internal  # noqa: F401 – placeholder for non-torch path
 import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField

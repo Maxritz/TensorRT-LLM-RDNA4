@@ -21,7 +21,7 @@ if(NIXL_FOUND)
   return()
 endif()
 
-find_package(ucx REQUIRED)
+find_package(ucx QUIET)
 
 # Set default NIXL_ROOT if not provided
 if(NOT NIXL_ROOT)

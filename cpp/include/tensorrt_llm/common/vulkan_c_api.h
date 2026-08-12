@@ -28,6 +28,7 @@
  */
 
 #include "tensorrt_llm/common/vulkanBackend.h"
+#include "tensorrt_llm/common/vulkanMoERunner.h"
 #include "tensorrt_llm/kernels/vulkanKernelRegistry.h"
 
 #include <cstdint>
@@ -122,8 +123,23 @@ extern "C" int32_t tllm_vulkan_softmax(
     }
 }
 
+extern "C" int32_t tllm_vulkan_layer_norm(
+    void* input, void* gamma, void* beta, void* output,
+    float eps, size_t hidden_dim, size_t token_count)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchLayerNorm(input, gamma, beta, output, eps, hidden_dim, token_count);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Core compute ops (GEMM, RMS norm, elementwise)                      */
+/* ------------------------------------------------------------------ */
 /* ------------------------------------------------------------------ */
 
 // FP16/FP32 GEMM: C[M,N] = A[M,K] * B[K,N], row-major, non-transposed.
@@ -394,6 +410,45 @@ extern "C" int32_t tllm_vulkan_relu(
     }
 }
 
+extern "C" int32_t tllm_vulkan_gather(
+    void* src, void* indices, void* output, size_t numIndices)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchGather(src, indices, output, numIndices);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_fill(
+    void* output, float value, size_t elementCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchFill(output, value, elementCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t tllm_vulkan_compare_eq(
+    void* input, void* output, float threshold, size_t elementCount)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchCompareEq(input, output, threshold, elementCount);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* KV Cache Update (2D) — post speculative decode                      */
 /* ------------------------------------------------------------------ */
@@ -479,8 +534,90 @@ extern "C" int32_t tllm_vulkan_tree_spec_rejection(
 }
 
 /* ------------------------------------------------------------------ */
-/* Spec-decode accept                                                  */
+/* MoE Runner C API                                                    */
 /* ------------------------------------------------------------------ */
+
+// Create a VulkanMoERunner with the given config.
+// Returns an opaque handle (pointer) on success, nullptr on failure.
+extern "C" void* tllm_vulkan_moe_runner_create(
+    uint32_t num_experts, uint32_t top_k, uint32_t hidden_size,
+    uint32_t intermediate_size, uint32_t flags)
+{
+    try {
+        auto backend = getBackend();
+        if (!backend->isActive()) return nullptr;
+
+        auto runner = new VulkanMoERunner(
+            VulkanMoERunner::MoEConfig{
+                num_experts, top_k, hidden_size, intermediate_size,
+                (flags & 1) != 0,   // swiglu_activation
+                (flags & 2) != 0,   // has_fc1_bias
+                (flags & 4) != 0,   // has_fc2_bias
+            });
+        return static_cast<void*>(runner);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// Destroy a VulkanMoERunner created by tllm_vulkan_moe_runner_create.
+extern "C" void tllm_vulkan_moe_runner_destroy(void* runner)
+{
+    delete static_cast<VulkanMoERunner*>(runner);
+}
+
+// Run the full MoE forward pass.
+// hidden_states: [num_tokens, hidden_size] host fp32
+// routing_logits: [num_tokens, num_experts] host fp32
+// gemm1_weights: array of num_experts pointers, each [intermediate_size*2, hidden_size]
+// gemm2_weights: array of num_experts pointers, each [hidden_size, intermediate_size]
+// fc1_biases: array of num_experts pointers (may contain nullptrs), each [intermediate_size*2]
+// fc2_biases: array of num_experts pointers (may contain nullptrs), each [hidden_size]
+// output: [num_tokens, hidden_size] host fp32 (caller-allocated)
+extern "C" int32_t tllm_vulkan_moe_runner_run(
+    void* runner,
+    const float* hidden_states,
+    const float* routing_logits,
+    const float* const* gemm1_weights,
+    const float* const* gemm2_weights,
+    const float* const* fc1_biases,
+    const float* const* fc2_biases,
+    uint32_t num_tokens,
+    float* output)
+{
+    try {
+        auto r = static_cast<VulkanMoERunner*>(runner);
+        r->run_moe(hidden_states, routing_logits,
+                   gemm1_weights, gemm2_weights,
+                   fc1_biases, fc2_biases,
+                   num_tokens, output);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Run GEMM profile (single forward through all experts, no routing).
+extern "C" int32_t tllm_vulkan_moe_runner_gemm_profile(
+    void* runner,
+    const float* x,
+    const float* const* fc1_expert_weights,
+    const float* const* fc1_expert_biases,
+    const float* const* fc2_expert_weights,
+    const float* const* fc2_expert_biases,
+    uint32_t num_tokens,
+    float* output)
+{
+    try {
+        auto r = static_cast<VulkanMoERunner*>(runner);
+        r->run_gemm_profile(x, fc1_expert_weights, fc1_expert_biases,
+                            fc2_expert_weights, fc2_expert_biases,
+                            num_tokens, output);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
 
 extern "C" int32_t tllm_vulkan_spec_accept(
     void* target_logits, void* draft_logits, void* uniform_rng,
@@ -496,6 +633,33 @@ extern "C" int32_t tllm_vulkan_spec_accept(
             accept_count, accepted_tokens, resample_probs,
             batch_size, draft_len, vocab_size,
             temperature, accept_prob_floor);
+        backend->streamSynchronize();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Paged KV Cache Append                                                */
+/* ------------------------------------------------------------------ */
+
+extern "C" int32_t tllm_vulkan_append_paged_kv_cache(
+    void* append_key, void* append_value,
+    void* batch_indices, void* positions,
+    void* kv_cache_k, void* kv_cache_v,
+    void* kv_indices, void* kv_indptr, void* kv_last_page_len,
+    uint32_t page_size, uint32_t num_kv_heads, uint32_t head_dim,
+    uint32_t n_tokens, uint32_t batch_size)
+{
+    try {
+        auto backend = getBackend();
+        backend->launchAppendPagedKVCache(
+            append_key, append_value,
+            batch_indices, positions,
+            kv_cache_k, kv_cache_v,
+            kv_indices, kv_indptr, kv_last_page_len,
+            page_size, num_kv_heads, head_dim, n_tokens, batch_size);
         backend->streamSynchronize();
         return 1;
     } catch (...) {

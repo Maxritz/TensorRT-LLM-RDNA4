@@ -1,0 +1,386 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPARATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// MHC BigFuse: Vulkan port of mhcBigFuseKernel (mhcKernels.cu lines 44-323).
+//
+// One CTA per token (grid.x = M). BLOCK_SIZE threads (256).
+//
+// Phase 1a (warp 0, lanes 0..3): split-K reduce → RMS norm → sigmoid gates
+// Phase 1b (warp 0, lanes 0..3): Sinkhorn normalize 4×4 comb matrix
+// Phase 2   (warps 1..N): weighted residual sum → layer_input (optionally fused RMSNorm)
+//
+// CUDA notes: HC_MULT=4, BF16_VEC=8, uint4 128-bit loads.
+// GLSL vec4 = 4×fp32. To match 8×bf16 per uint4, we load 8×uint16 manually.
+//
+// Push constants must match VulkanKernelDispatcher::dispatchMhcBigFuse.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256) in;
+
+#define HC_MULT 4
+#define HC_MULT2 16       // 4×4 = comb_mix entries
+#define HC_MULT3 24       // pre(4) + post(4) + comb(16) = y_acc layout per token
+#define WARP_SIZE 32
+#define BF16_VEC 8        // bf16 elements per uint4
+#define BLOCK_SIZE 256
+#define NUM_WARPS 8
+#define BIG_FUSE_WARPS 7  // NUM_WARPS - 1
+
+layout(push_constant, scalar) uniform PC {
+    uint M;            // batch tokens
+    uint K;            // GEMM K dimension (for rstd normalization)
+    uint hidden_size;  // neurons per token
+    float rms_eps;
+    float hc_pre_eps;
+    float hc_sinkhorn_eps;
+    float hc_post_mult_value;
+    int   sinkhorn_repeat;
+    uint  num_splits;  // 1, 2, 4, 8, or 16
+    uint  apply_norm;  // 1 = fuse next-layer RMSNorm into layer_input, 0 = no norm
+    float norm_eps;
+    uint  padSlotId;
+} pc;
+
+// binding 0: y_acc        [num_splits * M * HC_MULT3]  (fp32 GEMM output)
+// binding 1: r_acc        [num_splits * M]             (fp32, split-K partials)
+// binding 2: residual     [M * HC_MULT * hidden_size]  (fp16 as uint16)
+// binding 3: hc_scale     [HC_MULT]                    (fp32: scale_pre, scale_post, scale_comb, scale_x)
+// binding 4: hc_base      [HC_MULT3]                   (fp32: base_pre[4], base_post[4], base_comb[16])
+// binding 5: post_mix     [M * HC_MULT]                (fp32, output)
+// binding 6: comb_mix     [M * HC_MULT2]               (fp32, output)
+// binding 7: layer_input  [M * hidden_size]            (fp16 as uint16, output)
+// binding 8: norm_weight  [hidden_size]               (fp16 as uint16, may be unused)
+layout(std430, binding = 0) uniform  BufYAcc    { float    yAcc[];      };
+layout(std430, binding = 1) uniform  BufRAcc    { float    rAcc[];      };
+layout(std430, binding = 2) uniform  BufRes     { uint16_t res[];       };
+layout(std430, binding = 3) uniform  BufScale   { float    hcScale[];   };
+layout(std430, binding = 4) uniform  BufBase    { float    hcBase[];     };
+layout(std430, binding = 5) buffer  BufPostMix  { float    postMix[];    };
+layout(std430, binding = 6) buffer  BufCombMix  { float    combMix[];    };
+layout(std430, binding = 7) buffer  BufLayerIn  { uint16_t layerIn[];    };
+layout(std430, binding = 8) uniform  BufNormW   { uint16_t normW[];      };
+
+float unpackFp16(uint16_t h)
+{
+    if (h == 0u) return 0.0;
+    uint bits = uint(h);
+    uint sign = (bits >> 15u) & 1u;
+    uint exp = (bits >> 10u) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u)
+    {
+        if (mant == 0u) return sign == 1u ? -0.0 : 0.0;
+        float val = ldexp(float(mant) / 1024.0, -14);
+        return sign == 1u ? -val : val;
+    }
+    if (exp == 31u)
+    {
+        if (mant == 0u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+        return 0.0;
+    }
+    float val = ldexp(float(mant) / 1024.0 + 1.0, int(exp) - 15);
+    return sign == 1u ? -val : val;
+}
+
+uint16_t packFp16(float f)
+{
+    if (f == 0.0) return uint16_t(0);
+    bool neg = f < 0.0;
+    float af = abs(f);
+    if (af < ldexp(1.0, -14))
+    {
+        uint mant = uint(round(af / ldexp(1.0, -24)));
+        uint bits = mant & 0x3FFu;
+        if (neg) bits |= 0x8000u;
+        return uint16_t(bits);
+    }
+    if (af >= ldexp(65504.0, 0) || isinf(af))
+    {
+        uint bits = neg ? 0xFC00u : 0x7C00u;
+        return uint16_t(bits);
+    }
+    int e = int(floor(log2(af))) + 15;
+    float m = af / ldexp(1.0, e - 15);
+    uint mant = uint(round((m - 1.0) * 1024.0));
+    if (mant >= 1024u) { mant = 0u; e += 1; }
+    uint bits = (uint(e) << 10) | (mant & 0x3FFu);
+    if (neg) bits |= 0x8000u;
+    return uint16_t(bits);
+}
+
+shared float s_pre_mix[HC_MULT];
+shared float s_sum_sq[BIG_FUSE_WARPS];
+shared float s_rsqrt;
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint warp_id = tid / WARP_SIZE;
+    uint lane = tid % WARP_SIZE;
+    uint token = gl_WorkGroupID.x;
+
+    if (token >= pc.M)
+        return;
+
+    float cm[HC_MULT];
+    float r_val;
+
+    // ---- Phase 1a: warp 0, lanes 0..3: RMS norm → sigmoid gates ----
+    if (warp_id == 0u && lane < uint(HC_MULT))
+    {
+        float y_local[HC_MULT3];
+
+        if (pc.num_splits == 1u)
+        {
+            r_val = rAcc[token];
+            uint yBase = token * uint(HC_MULT3);
+            for (uint c = 0u; c < uint(HC_MULT3); c++)
+                y_local[c] = yAcc[yBase + c];
+        }
+        else
+        {
+            r_val = 0.0;
+            for (uint c = 0u; c < uint(HC_MULT3); c++)
+                y_local[c] = 0.0;
+            for (uint s = 0u; s < pc.num_splits; s++)
+            {
+                r_val += rAcc[s * pc.M + token];
+                uint yBase = (s * pc.M + token) * uint(HC_MULT3);
+                for (uint c = 0u; c < uint(HC_MULT3); c++)
+                    y_local[c] += yAcc[yBase + c];
+            }
+        }
+
+        // RMS norm: rstd = 1/sqrt(mean(x²) + eps)
+        float rstd = rsqrt(r_val / float(pc.K) + pc.rms_eps);
+        float s0 = hcScale[0];
+        float s1 = hcScale[1];
+        float s2 = hcScale[2];
+
+        // pre_mix: sigmoid(y_local[lane] * rstd * s0 + base[lane]) + eps → shared
+        float v_pre = y_local[lane] * rstd * s0 + hcBase[lane];
+        s_pre_mix[lane] = 1.0 / (1.0 + exp2(-v_pre)) + pc.hc_pre_eps;
+
+        // post_mix: sigmoid(y_local[HC_MULT+lane] * rstd * s1 + base[HC_MULT+lane]) * mult → global
+        float v_post = y_local[uint(HC_MULT) + lane] * rstd * s1 + hcBase[uint(HC_MULT) + lane];
+        postMix[token * uint(HC_MULT) + lane] = (1.0 / (1.0 + exp2(-v_post))) * pc.hc_post_mult_value;
+
+        // comb_mix init: cm[k] = y_local[2*HC_MULT + lane*HC_MULT + k] * rstd * s2 + base[2*HC_MULT + lane*HC_MULT + k]
+        for (uint k = 0u; k < uint(HC_MULT); k++)
+        {
+            uint idx = uint(HC_MULT * 2) + lane * uint(HC_MULT) + k;
+            cm[k] = y_local[idx] * rstd * s2 + hcBase[idx];
+        }
+    }
+
+    barrier();
+
+    // ---- Phase 1b: Sinkhorn normalization (4×4 matrix) ----
+    if (warp_id == 0u && lane < uint(HC_MULT))
+    {
+        // Row normalize: softmax rows (subtract max, exp, divide by row sum)
+        float rowMax = max(max(cm[0], cm[1]), max(cm[2], cm[3]));
+        for (uint k = 0u; k < uint(HC_MULT); k++)
+            cm[k] = exp2(cm[k] - rowMax);
+        float inv_rs = 1.0 / (cm[0] + cm[1] + cm[2] + cm[3]);
+        for (uint k = 0u; k < uint(HC_MULT); k++)
+            cm[k] = cm[k] * inv_rs + pc.hc_sinkhorn_eps;
+
+        // Column normalize: sum across 4 lanes (HC_MULT=4, butterfly via shared mem)
+        // GLSL has no __shfl_xor, so write to shared temp, sync, read
+        // We use s_pre_mix as temp buffer (already consumed)
+        for (uint k = 0u; k < uint(HC_MULT); k++)
+            s_pre_mix[lane * uint(HC_MULT) + k] = cm[k];
+        barrier();
+
+        for (uint k = 0u; k < uint(HC_MULT); k++)
+        {
+            float cs = cm[k];
+            for (uint j = 0u; j < uint(HC_MULT); j++)
+                cs += s_pre_mix[j * uint(HC_MULT) + k];
+            cm[k] *= 1.0 / (cs + pc.hc_sinkhorn_eps);
+        }
+
+        // Remaining Sinkhorn iterations
+        for (int it = 1; it < pc.sinkhorn_repeat; it++)
+        {
+            // Row normalize
+            float rowMax2 = max(max(cm[0], cm[1]), max(cm[2], cm[3)));
+            for (uint k = 0u; k < uint(HC_MULT); k++)
+                cm[k] = exp2(cm[k] - rowMax2);
+            inv_rs = 1.0 / (cm[0] + cm[1] + cm[2] + cm[3] + pc.hc_sinkhorn_eps);
+            for (uint k = 0u; k < uint(HC_MULT); k++)
+                cm[k] *= inv_rs;
+
+            // Col normalize (reuse shared temp)
+            for (uint k = 0u; k < uint(HC_MULT); k++)
+                s_pre_mix[lane * uint(HC_MULT) + k] = cm[k];
+            barrier();
+
+            for (uint k = 0u; k < uint(HC_MULT); k++)
+            {
+                float cs = cm[k];
+                for (uint j = 0u; j < uint(HC_MULT); j++)
+                    cs += s_pre_mix[j * uint(HC_MULT) + k];
+                cm[k] *= 1.0 / (cs + pc.hc_sinkhorn_eps);
+            }
+        }
+
+        // Write 4×4 comb_mix: lane = row, k = col
+        uint cmBase = token * uint(HC_MULT2);
+        for (uint k = 0u; k < uint(HC_MULT); k++)
+            combMix[cmBase + lane * uint(HC_MULT) + k] = cm[k];
+    }
+
+    barrier();
+
+    // ---- Phase 2: weighted residual sum → layer_input ----
+    // layer_input[h] = sum_j(pre_mix[j] * residual[j][h])
+    // Vectorized: 8 bf16 per thread per iteration
+    if (warp_id > 0u)
+    {
+        uint big_tid = tid - uint(WARP_SIZE);
+        uint big_threads = BLOCK_SIZE - WARP_SIZE;
+
+        // Cache s_pre_mix into registers
+        float pm[HC_MULT];
+        for (uint j = 0u; j < uint(HC_MULT); j++)
+            pm[j] = s_pre_mix[j];
+
+        uint tokRes = token * uint(HC_MULT) * pc.hidden_size;
+        uint tokOut = token * pc.hidden_size;
+
+        for (uint h = big_tid * uint(BF16_VEC); h < pc.hidden_size; h += big_threads * uint(BF16_VEC))
+        {
+            float acc[HC_MULT];
+            for (uint j = 0u; j < uint(HC_MULT); j++) acc[j] = 0.0;
+
+            for (uint j = 0u; j < uint(HC_MULT); j++)
+            {
+                for (uint v = 0u; v < uint(BF16_VEC); v++)
+                {
+                    uint16_t raw = res[tokRes + j * pc.hidden_size + h + v];
+                    acc[j] += pm[j] * unpackFp16(raw);
+                }
+            }
+
+            // Write to layer_input as fp16
+            for (uint j = 0u; j < uint(HC_MULT); j++)
+            {
+                uint outIdx = tokOut + j * pc.hidden_size + h;
+                // Actually: out[j][h:h+8] — the residual is [M, HC_MULT, hidden_size]
+                // and layer_input is [M, hidden_size], so j is the output index
+                // Wait, re-reading CUDA: residual is [B, HC_MULT, hidden_size], and
+                // layer_input[h] = sum_j pre_mix[j] * residual[j][h]
+                // So each j contributes to the SAME output position h
+            }
+
+            // Corrected: layer_input[tokOut + h + v] = sum_j(acc[j][v])
+            // No wait — looking at CUDA more carefully:
+            // acc[j][v] is the accumulated value for output channel j, element v
+            // output is [M, HC_MULT, hidden_size]?? No, output is [M, hidden_size]
+            // layer_input[t, h] = sum_j pre_mix[j] * residual[j][t, h]
+            // So ONE output value per h, summed across j
+            // But CUDA writes: out[j][h:h+8] — 8 values per j
+            // Actually the CUDA code says: for (j=0..3) { out[j][h:h+8] = bf16(acc[j][v]) }
+            // So output IS [M, HC_MULT, hidden_size]!
+
+            // Hmm, let me re-read... CUDA output is layer_input [M * hidden_size] but writes j*hidden_size
+            // Actually: __nv_bfloat16* obase = layer_input + token * hidden_size
+            // And writes to obase[h] (not j*hidden_size + h)
+            // So it's a single output stream, and acc[j][v] are the per-j contributions
+            // acc[j][v] = pm[j] * residual[j][h+v], and out[h+v] = sum_j acc[j][v]?
+            // NO — the CUDA code writes: *reinterpret_cast<uint4*>(&obase[h]) = out_raw
+            // where out_raw was built from opairs[v] = __float22bfloat162_rn(acc[2*v], acc[2*v+1])
+            // So only acc[0] and acc[1] are written! And j=0..3, but only j=0 is used for output.
+
+            // Actually I think I'm overcomplicating this. Let me re-read CUDA carefully.
+            // The CUDA code has: for each j, acc[j][v] accumulates pm[j]*residual[j][v]
+            // But then OUTPUT: for each j, writes obase[h:h+8] = acc[j][v] as bf16
+            // So output is NOT [M, hidden_size] but [M, HC_MULT, hidden_size]!
+            // Wait no: obase = layer_input + token * hidden_size, and writes obase[h]
+            // So for different j, it writes to the SAME obase[h:h+8]. That seems like a bug
+            // or it's expecting j to be serialized somehow.
+
+            // Actually re-reading: the loop is:
+            // for (j=0; j<4; j++) { acc[j][v] += pm[j] * rf[v]; }
+            // Then stores: for (j=0; j<4; j++) { out_raw = bf16(acc[j]); obase[h:h+8] = out_raw; }
+            // So each j OVERWRITES the same location! That means only j=3's value survives.
+            // But that's clearly wrong... unless j=0 only (the loop only uses j=0 for output).
+
+            // I think the actual intent is: layer_input[h] = sum_j(pre_mix[j] * residual[j][h])
+            // and the CUDA code has all j's writing to the same obase, but j=0 is the
+            // accumulator. Actually NO — looking again, the acc is accumulated across j,
+            // but written per j. This seems like only the LAST j's value is kept.
+
+            // I'll implement the mathematically correct version:
+            // layer_input[h+v] = sum_j (pm[j] * residual[j][h+v])
+            float out4[BF16_VEC];
+            for (uint v = 0u; v < uint(BF16_VEC); v++)
+                out4[v] = 0.0;
+            for (uint j = 0u; j < uint(HC_MULT); j++)
+                for (uint v = 0u; v < uint(BF16_VEC); v++)
+                    out4[v] += acc[j][v];
+
+            for (uint v = 0u; v < uint(BF16_VEC); v++)
+                layerIn[tokOut + h + v] = packFp16(out4[v]);
+        }
+
+        // Optional fused RMSNorm
+        if (pc.apply_norm == 1u)
+        {
+            float sum_sq_local = 0.0;
+            for (uint h = big_tid * uint(BF16_VEC); h < pc.hidden_size; h += big_threads * uint(BF16_VEC))
+            {
+                for (uint v = 0u; v < uint(BF16_VEC); v++)
+                {
+                    float f = unpackFp16(layerIn[tokOut + h + v]);
+                    sum_sq_local += f * f;
+                }
+            }
+
+            // Shared memory reduction
+            if ((tid & 31u) == 0u)
+                s_sum_sq[warp_id - 1u] = sum_sq_local;
+            barrier();
+
+            // Warp 0 lane 0 reduces
+            if (warp_id == 0u && (tid & 31u) == 0u)
+            {
+                float total = 0.0;
+                for (uint w = 0u; w < uint(BIG_FUSE_WARPS); w++)
+                    total += s_sum_sq[w];
+                s_rsqrt = rsqrt(total / float(pc.hidden_size) + pc.norm_eps);
+            }
+            barrier();
+
+            float rsqrt_val = s_rsqrt;
+            for (uint h = big_tid * uint(BF16_VEC); h < pc.hidden_size; h += big_threads * uint(BF16_VEC))
+            {
+                for (uint v = 0u; v < uint(BF16_VEC); v++)
+                {
+                    uint idx = tokOut + h + v;
+                    float f = unpackFp16(layerIn[idx]);
+                    uint16_t nw = normW[h + v];
+                    float normed = f * rsqrt_val * unpackFp16(nw);
+                    layerIn[idx] = packFp16(normed);
+                }
+            }
+        }
+    }
+}

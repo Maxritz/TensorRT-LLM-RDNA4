@@ -152,6 +152,11 @@ public:
         float eps, size_t hiddenDim, size_t tokenCount,
         uint32_t blockSize = 256);
 
+    common::VulkanResult dispatchLayerNorm(
+        void* input, void* gamma, void* beta, void* output,
+        float eps, size_t hiddenDim, size_t tokenCount,
+        uint32_t blockSize = 256);
+
     // ==================== GEMM Operations ====================
     // Mirrors CUDA fpA_intB_gemm, groupGemm, etc.
     common::VulkanResult dispatchFp16Gemm(
@@ -165,6 +170,28 @@ public:
         uint32_t M, uint32_t N, uint32_t K,
         uint32_t blocksPerRow = 0,
         uint32_t blockSize = 128);
+
+    // Quantized GEMM (weight-only) for additional Q4_0/Q4_K/Q5_K/Q6_K formats.
+    // Mirrors VAiT vkblas_qgemm_{q4_0,q4k,q5k,q6k}_f32 dispatch signature.
+    common::VulkanResult dispatchQ4_0Gemm(
+        void* weight, void* activation, void* output,
+        uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+        uint32_t ldw, uint32_t ldx, uint32_t ldy);
+
+    common::VulkanResult dispatchQ4_KGemm(
+        void* weight, void* activation, void* output,
+        uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+        uint32_t ldw, uint32_t ldx, uint32_t ldy);
+
+    common::VulkanResult dispatchQ5_KGemm(
+        void* weight, void* activation, void* output,
+        uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+        uint32_t ldw, uint32_t ldx, uint32_t ldy);
+
+    common::VulkanResult dispatchQ6_KGemm(
+        void* weight, void* activation, void* output,
+        uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+        uint32_t ldw, uint32_t ldx, uint32_t ldy);
 
     // ==================== Attention Operations ====================
     // Mirrors CUDA attention kernels
@@ -337,13 +364,180 @@ public:
         uint32_t outputRows, uint32_t valueRows, uint32_t cols,
         uint32_t blockSize = 256);
 
-    // Top-K per row (general purpose): input [rows, cols], output indices [rows, topk]
+    // Gather: out[i] = src[indices[i]]
+    common::VulkanResult dispatchGather(
+        void* src, void* indices, void* output,
+        uint32_t numIndices,
+        uint32_t blockSize = 256);
+
+    // Compare EQ: out[i] = (in[i] == threshold) ? 1u : 0u
+    common::VulkanResult dispatchCompareEq(
+        void* input, void* output,
+        float threshold, size_t elementCount,
+        uint32_t blockSize = 256);
     common::VulkanResult dispatchTopKGeneral(
         void* input, void* outputIndices, void* outputValues,
         uint32_t rows, uint32_t cols, uint32_t topk,
         uint32_t blockSize = 64);
 
+    common::VulkanResult dispatchAppendPagedKVCache(
+        void* append_key, void* append_value,
+        void* batch_indices, void* positions,
+        void* kv_cache_k, void* kv_cache_v,
+        void* kv_indices, void* kv_indptr, void* kv_last_page_len,
+        uint32_t page_size, uint32_t num_kv_heads, uint32_t head_dim,
+        uint32_t n_tokens, uint32_t batch_size, uint32_t max_pages,
+         uint32_t blockSize = 64);
+
+    // ==================== Mamba Operations ====================
+    // Vulkan port of causalConv1dKernels.cu: causal 1D convolution (decode phase).
+    // input:  [batchSize * dim]
+    // weight: [dim * width]
+    // bias:   [dim] (may be null, pass nullptr)
+    // convState: [batchSize * convStateLen * dim] (ring buffer)
+    // output: [batchSize * dim]
+    common::VulkanResult dispatchCausalConv1d(
+        void* input, void* weight, void* bias,
+        void* convState, void* output,
+        uint32_t batchSize, uint32_t dim, uint32_t width,
+        uint32_t convStateLen, bool silu, bool circular,
+        uint32_t cacheSeqLen, uint32_t blockSize = 64);
+
+    // Vulkan port of selective_scan_update_kernel (selectiveScan.cu).
+    // Decode-phase Mamba state-space update: exp(A*dt)*state + B*x, accumulate C*state.
+    // state:      [numSlots * dim * dstate]  (ring buffer)
+    // u/x:        [batchSize * xDim]
+    // delta:      [batchSize * dtDim]
+    // A:          [dstate * dim] (mamba1) or [nheads] (mamba2)
+    // BC:         [batchSize * (2*dstate + dtRank)]
+    // D:          [dim] (optional, pass nullptr if absent)
+    // z:          [dim] (optional, pass nullptr if absent)
+    // slotMap:    [batchSize] (optional, pass nullptr if absent)
+    // out:        [batchSize * dim]
+    common::VulkanResult dispatchSelectiveScan(
+        void* out,
+        void* state, void* x, void* delta,
+        void* A, void* BC, void* D, void* z, void* slotMap,
+        uint32_t batchSize, uint32_t dim, uint32_t dstate,
+        uint32_t nheads, uint32_t ngroups, uint32_t dtRank,
+        bool isMamba2, bool dtSoftplus,
+        bool hasD, bool hasZ, bool slotMapEnabled,
+        int32_t padSlotId, uint32_t blockSize = 128);
+
+    // Vulkan port of MXFP4 block-scale MoE gate+up projection (decode phase).
+    // Dequantizes FP4 weights (E2M1) using per-block float32 scales, performs GEMV.
+    // input:        [batchSize * hiddenSize]         (float)
+    // weights:      [numBytes]                       (uint8_t, 2 FP4 codes per byte)
+    // weightScales: [intermediateSize * (hiddenSize/32)] (float, per-32-input block)
+    // expertIds:    [batchSize * topK]               (uint, expert per token)
+    // expertOffsets:[numExperts+1]                  (uint, byte offsets into weights/scales)
+    // bias:         [intermediateSize]               (float, optional)
+    // out:          [batchSize * intermediateSize]  (float, gate+up output)
+    common::VulkanResult dispatchFp4Moe(
+        void* input, void* weights, void* weightScales,
+        void* expertIds, void* expertOffsets,
+        void* bias, void* output,
+        uint32_t batchSize, uint32_t hiddenSize, uint32_t intermediateSize,
+        uint32_t topK, uint32_t padSlotId, uint32_t blockSize = 256);
+
+    // ==================== MHC Operations ====================
+    // MHC GEMM + sqrsum: Y[m,n] = dot(X[m,:], W_T[n,:]), R[m] = sum(X[m,:]^2).
+    // Grid: (M, ceil(N/tileN)). 256-thread blocks.
+    common::VulkanResult dispatchMhcGemm(
+        void* x, void* wT, void* y, void* r,
+        uint32_t M, uint32_t N, uint32_t K, uint32_t tileN,
+        uint32_t blockSize = 256);
+
+    // MHC BigFuse: Sinkhorn + weighted residual + optional fused RMSNorm.
+    // One CTA per token. See mhc_fuse.comp for full parameter documentation.
+    common::VulkanResult dispatchMhcFuse(
+        void* yAcc, void* rAcc, void* residual,
+        void* hcScale, void* hcBase,
+        void* postMix, void* combMix, void* layerInput, void* normW,
+        uint32_t M, uint32_t K, uint32_t hiddenSize,
+        float rmsEps, float hcPreEps, float hcSinkhornEps, float hcPostMultValue,
+        int32_t sinkhornRepeat, uint32_t numSplits, bool applyNorm, float normEps,
+        uint32_t blockSize = 256);
+
+    // ==================== Mamba2 MTP SSM Cache ====================
+    // Vulkan port of mamba2MTPSSMCacheKernel (mamba2MTPSSMCacheKernel.cuh).
+    // Multi-token prediction state-space cache update over cache_steps.
+    common::VulkanResult dispatchMtpSSMCache(
+        void* state, void* x, void* dt, void* A,
+        void* B, void* C, void* out, void* intermediateStates,
+        void* D, void* z, void* dtBias,
+        void* ssmBatchIndices, void* interSsmBatchIndices, void* retrieveParentToken,
+        uint32_t bs, uint32_t nheads, uint32_t headDim, uint32_t ssmDim, uint32_t ngroups,
+        int cacheSteps, int padSlotId, bool disableStateUpdate,
+        bool hasD, bool hasZ, bool hasDtBias,
+        bool hasSsmBatchIndices, bool hasInterSsmBatchIndices, bool hasParentToken,
+        bool dtSoftplus,
+        uint32_t strideNheadsHdimSsmDim, uint32_t strideHdimSsmDim,
+        uint32_t strideCacheNheadsHdim, uint32_t strideNheadsHdim,
+        uint32_t strideCacheNgroupsSsmDim, uint32_t strideNgroupsSsmDim,
+        uint32_t blockSize = 128);
+
+    // ==================== KV Cache Compression (DeepSeek-V4) ====================
+    // Vulkan ports of compressorKernels.cu. Three kernels:
+    //   1. dispatchCompressDecode      — pagedKvCompressKernel (decode path)
+    //   2. dispatchCompressPrefill     — prefillReductionKernel (prefill path)
+    //   3. dispatchCompressPostproc    — postProcessScatterKernel (RMSNorm+RoPE+Hadamard+scatter)
+
+    // Decode path: write NEXT_N tokens to paged cache + conditional online softmax.
+    // Grid: (batch_size, head_blocks). Mirrors pagedKvCompressLaunch signature.
+    common::VulkanResult dispatchCompressDecode(
+        void* kvScore, void* ape, void* pagedKv, void* pagedScore,
+        void* blockTableKv, void* blockTableScore, void* output,
+        void* kvLens, void* cuSeqLens, void* cuKvComp,
+        uint32_t batchSize, uint32_t pageSize, uint32_t maxBlocks,
+        uint32_t headDim, uint32_t compressRatio, uint32_t nextN,
+        uint32_t kvScoreElemBytes, uint32_t stateElemBytes, uint32_t outElemBytes,
+        uint32_t blockSize = 256);
+
+    // Prefill path: bulk compression with state update to paged cache.
+    // Grid: (batch_size, max_outputs, head_blocks).
+    common::VulkanResult dispatchCompressPrefill(
+        void* kvScore, void* ape, void* pagedKv, void* pagedScore,
+        void* blockTableKv, void* blockTableScore, void* output,
+        void* kvLens, void* startPos, void* cuSeqLens, void* cuKvComp,
+        uint32_t batchSize, uint32_t pageSize, uint32_t maxBlocks,
+        uint32_t headDim, uint32_t compressRatio, uint32_t maxOutputs,
+        uint32_t kvScoreElemBytes, uint32_t stateElemBytes, uint32_t outElemBytes,
+        uint32_t blockSize = 256);
+
+    // Postprocess: RMSNorm + RoPE + Hadamard + paged cache scatter.
+    // Grid: (totalTokens, 1, 1). One block per compressed token.
+    common::VulkanResult dispatchCompressPostproc(
+        void* kvComp, void* rmsWeight, float rmsEps,
+        void* cosSinTable, void* positionIds,
+        int32_t nopeDim, int32_t ropeDim,
+        void* kvCache,
+        void* numOutputs, void* cuKvComp, void* startPos, void* blockOffsets,
+        void* compressedMask,
+        uint32_t batchSize, uint32_t tokensPerBlock, uint32_t headDim,
+        uint32_t maxBlocksPerSeq, uint32_t elemBytes, uint32_t totalTokens,
+        int32_t cacheScaleType, bool rotateActivation,
+        void* quantOutput, void* scaleOutput,
+        uint32_t blockSize = 256);
+
+    // ==================== FLA Gated Delta Rule ====================
+    // Grid: (N * HV * V + 255) / 256. Each invocation = (n, hv, v).
+    common::VulkanResult dispatchGatedDeltaRule(
+        void* aLog, void* dtBias, void* a, void* b,
+        void* q, void* k, void* v,
+        void* initialState, void* initIndices, void* output,
+        uint32_t N, uint32_t T, uint32_t H, uint32_t HV, uint32_t V, uint32_t K,
+        bool hasInitialState, bool disableStateUpdate,
+        float scale, float softplusBeta, float softplusThreshold, bool useL2Norm,
+        uint32_t blockSize = 256);
+
 private:
+    // Friend declaration for the QGEMM dispatch helper defined in the .cpp.
+    // It accesses private members to set up descriptor sets and command buffers.
+    friend common::VulkanResult dispatchQGEMM(VulkanKernelDispatcher* self, const char* kernelName,
+        void* weight, void* activation, void* output,
+        uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+        uint32_t ldw, uint32_t ldx, uint32_t ldy);
     std::shared_ptr<common::VulkanContext> mContext;
     std::shared_ptr<common::VulkanShaderCompiler> mCompiler;
     std::shared_ptr<VulkanKernelRegistry> mKernelRegistry;

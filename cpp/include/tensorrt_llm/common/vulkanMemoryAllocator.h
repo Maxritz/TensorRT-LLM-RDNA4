@@ -169,6 +169,7 @@ private:
     std::shared_ptr<VulkanContext> mContext;
     std::unique_ptr<VulkanMemoryPool> mDevicePool;
     std::unique_ptr<VulkanMemoryPool> mHostVisiblePool;
+    uint32_t mHostVisibleDeviceLocalType = UINT32_MAX; // ReBAR / unified memory type
 
     // Track all allocations by pointer for easy lookup
     struct PtrInfo

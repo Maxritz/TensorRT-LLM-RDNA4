@@ -1,0 +1,538 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// ============================================================================
+// KV Cache Compression — Prefill Path (Vulkan port of prefillReductionKernel)
+// ============================================================================
+// Algorithm:
+//   Phase 1a: Write each block's full chunk (new tokens only) to paged cache.
+//             APE bias fused into score during store.
+//   Phase 1b: Last block also writes remainder tokens (those past the last
+//             complete window) to paged cache.
+//   Phase 2: Online softmax reduction over COMPRESS_RATIO positions.
+//             In overlap mode (CR=4): combines prev window (col 0) + curr window
+//             (col HEAD_DIM). In non-overlap: reduces from kv_score directly.
+//             New tokens read from kv_score with live APE; paged tokens use
+//             pre-fused score.
+//
+// Grid:  (batch_size, max_outputs_per_batch, head_blocks)
+// Block: (NTHRD_INNER * NUM_RED_WARPS)
+// ============================================================================
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_gpu_shader5 : require
+
+layout(push_constant, std430) uniform Push {
+    int   batch_size;
+    int   page_size;
+    int   head_dim;
+    int   compress_ratio;
+    int   max_outputs;
+    int   kv_score_elem_bytes;
+    int   state_elem_bytes;
+    int   out_elem_bytes;
+    int   max_blocks;
+} pc;
+
+// Binding 0: kv_score      [total_tokens, 2*state_dim] (bf16 or fp32)
+layout(std430, binding = 0) buffer BufKvScore    { uint data[]; } kvScore;
+// Binding 1: ape           [compress_ratio, state_dim] (fp32)
+layout(std430, binding = 1) buffer BufApe          { float data[]; } ape;
+// Binding 2: paged_kv      [num_blocks, page_size, state_dim] (bf16 or fp32)
+layout(std430, binding = 2) buffer BufPagedKv         { uint data[]; } pagedKv;
+// Binding 3: paged_score   [num_blocks, page_size, state_dim] (bf16 or fp32)
+layout(std430, binding = 3) buffer BufPagedScore       { uint data[]; } pagedScore;
+// Binding 4: block_table_kv    [bsz, max_blocks] (int32)
+layout(std430, binding = 4) buffer BufBlockTableKv   { int data[]; } blockTableKv;
+// Binding 5: block_table_score [bsz, max_blocks] (int32)
+layout(std430, binding = 5) buffer BufBlockTableScore { int data[]; } blockTableScore;
+// Binding 6: output       [total_outputs, head_dim] (bf16 or fp32)
+layout(std430, binding = 6) buffer BufOutput           { uint data[]; } output;
+// Binding 7: kv_lens      [bsz] (int32)
+layout(std430, binding = 7) buffer BufKvLens         { int data[]; } kvLens;
+// Binding 8: start_pos    [bsz] (int32)
+layout(std430, binding = 8) buffer BufStartPos       { int data[]; } startPos;
+// Binding 9: cu_seq_lens  [bsz+1] (int32)
+layout(std430, binding = 9) buffer BufCuSeqLens      { int data[]; } cuSeqLens;
+// Binding 10: cu_kv_comp  [bsz+1] (int32)
+layout(std430, binding = 10) buffer BufCuKvComp       { int data[]; } cuKvComp;
+
+#define MAX_BLOCK 256
+layout(local_size_x = MAX_BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+// ── Element conversion helpers ────────────────────────────────────────────────
+float loadBf16(uint u)
+{
+    return uintBitsToFloat((u & 0xFFFFu) << 16u);
+}
+
+uint toBf16Bits(float f)
+{
+    return floatBitsToUint(f) >> 16;
+}
+
+float loadElem(uint const buf[], uint idx, int elem_bytes)
+{
+    if (elem_bytes == 4)
+        return uintBitsToFloat(buf[idx]);
+    else
+    {
+        uint packed = buf[idx >> 1];
+        uint half = (idx & 1u) == 0u ? (packed & 0xFFFFu) : (packed >> 16u);
+        return uintBitsToFloat(half << 16u);
+    }
+}
+
+void storeElem(uint buf[], uint idx, float val, int elem_bytes)
+{
+    if (elem_bytes == 4)
+        buf[idx] = floatBitsToUint(val);
+    else
+    {
+        uint packed = buf[idx >> 1];
+        uint bf = toBf16Bits(val);
+        packed = (idx & 1u) == 0u ? ((packed & 0xFFFF0000u) | bf) : ((packed & 0x0000FFFFu) | (bf << 16));
+        buf[idx >> 1] = packed;
+    }
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint batch_idx = gl_WorkGroupID.x;
+    uint local_output_idx = gl_WorkGroupID.y;
+    uint head_blk = gl_WorkGroupID.z;
+
+    if (batch_idx >= uint(pc.batch_size))
+        return;
+
+    int const HEAD_DIM = pc.head_dim;
+    int const CR = pc.compress_ratio;
+    int const KV_EB = pc.kv_score_elem_bytes;
+    int const STATE_EB = pc.state_elem_bytes;
+
+    bool const IS_OVERLAP = (CR == 4);
+    int const COFF = IS_OVERLAP ? 2 : 1;
+    int const STATE_DIM = COFF * HEAD_DIM;
+    uint const two_sd = uint(2) * uint(STATE_DIM);
+    uint const page_sd = uint(pc.page_size) * uint(STATE_DIM);
+
+    // ── Compute runtime threading params ──────────────────────────────────
+    int const elem_bytes_for_vec = max(KV_EB, STATE_EB);
+    int const max_vec = 16 / elem_bytes_for_vec;
+    int const vec_raw = (HEAD_DIM / max_vec >= 32) ? max_vec : (HEAD_DIM / 32);
+    int const VEC = (vec_raw < 4) ? 4 : vec_raw;
+    int const nthrd_base = HEAD_DIM / VEC;
+
+    bool const use_multi_warp = (CR == 128);
+    int const head_blocks = (use_multi_warp && nthrd_base > 32) ? (nthrd_base / 32) : 1;
+    int const nthrd_inner = nthrd_base / head_blocks;
+    int const num_red_warps = use_multi_warp ? 4 : 1;
+    int const nthreads = nthrd_inner * num_red_warps;
+    int const elem_per_block = nthrd_inner * VEC;
+
+    if (head_blk >= uint(head_blocks))
+        return;
+    if (tid >= uint(nthreads))
+        return;
+
+    int const tid_inner = int(tid) % nthrd_inner;
+    int const red_warp = (num_red_warps == 1) ? 0 : (int(tid) / nthrd_inner);
+    int const eff_tid = int(head_blk) * nthrd_inner + tid_inner;
+
+    int const sp = startPos.data[int(batch_idx)];
+    int const kv_len = kvLens.data[int(batch_idx)];
+    int const input_offset = cuSeqLens.data[int(batch_idx)];
+    int const output_offset = cuKvComp.data[int(batch_idx)];
+
+    // ── Determine output range ────────────────────────────────────────────
+    int const first_abs_idx = sp / CR;
+    int const last_abs_idx = kv_len / CR; // exclusive
+    int const actual_num_outputs = last_abs_idx - first_abs_idx;
+    int const num_outputs = max(actual_num_outputs, 1);
+
+    if (int(local_output_idx) >= num_outputs)
+        return;
+
+    bool const should_compress = (int(local_output_idx) < actual_num_outputs);
+
+    int const abs_idx = first_abs_idx + int(local_output_idx);
+    int const win_start = abs_idx * CR;
+
+    // ── Phase 1: State update (write new tokens to paged cache) ────────────
+    // 1a: Full chunk for this output block (only if should_compress)
+    // 1b: Remainder tokens (last block only)
+    {
+        // Helper lambda for writing to paged cache
+        // Processes range [range_start, range_end) starting at write_r_start
+        // (positions before write_r_start are already paged from prior calls)
+        // For non-overlap mode, also accumulates into rmax/rsum/rwsum
+
+        // Initialize online softmax accumulators for Phase 2
+        float rmax[8] = {-1.0e30f, -1.0e30f, -1.0e30f, -1.0e30f, -1.0e30f, -1.0e30f, -1.0e30f, -1.0e30f};
+        float rsum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float rwsum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+        // 1a: Full chunk
+        if (should_compress)
+        {
+            int const write_r_start = (win_start < sp) ? (sp - win_start) : 0;
+            int const range_end = win_start + CR;
+
+            // Split work among reduction warps
+            int const total_count = range_end - write_r_start;
+            int const r_begin = write_r_start + total_count * red_warp / num_red_warps;
+            int const r_end = write_r_start + total_count * (red_warp + 1) / num_red_warps;
+
+            for (int r = r_begin; r < r_end; r++)
+            {
+                int const pos = win_start + r;
+                int const input_row = pos - sp;
+                int const log_blk = pos / pc.page_size;
+                int const blk_off = pos % pc.page_size;
+                int const phys_kv = blockTableKv.data[int(batch_idx) * pc.max_blocks + log_blk];
+                int const phys_sc = blockTableScore.data[int(batch_idx) * pc.max_blocks + log_blk];
+
+                for (int col_idx = 0; col_idx < COFF; col_idx++)
+                {
+                    int const col = col_idx * HEAD_DIM;
+                    uint const src = uint(input_offset + input_row) * two_sd + uint(col);
+                    uint const dkv = uint(phys_kv) * page_sd + uint(blk_off) * uint(STATE_DIM) + uint(col);
+                    uint const dsc = uint(phys_sc) * page_sd + uint(blk_off) * uint(STATE_DIM) + uint(col);
+
+                    for (int i = 0; i < VEC; i++)
+                    {
+                        int d = eff_tid * VEC + i;
+                        if (d >= HEAD_DIM)
+                            break;
+
+                        // Store KV element
+                        float kv_val = loadElem(kvScore.data, src + uint(d), KV_EB);
+                        storeElem(pagedKv.data, dkv + uint(d), kv_val, STATE_EB);
+
+                        // Store score with APE added
+                        float sc_val = loadElem(kvScore.data, src + uint(STATE_DIM) + uint(d), KV_EB);
+                        float ape_val = ape.data[r * STATE_DIM + col + eff_tid * VEC + i];
+                        float sf = sc_val + ape_val;
+                        storeElem(pagedScore.data, dsc + uint(d), sf, STATE_EB);
+
+                        // For non-overlap, accumulate into online softmax
+                        if (!IS_OVERLAP)
+                        {
+                            float nm = max(rmax[i], sf);
+                            float sc_f = exp(rmax[i] - nm);
+                            float tm = exp(sf - nm);
+                            rsum[i] = rsum[i] * sc_f + tm;
+                            rwsum[i] = rwsum[i] * sc_f + kv_val * tm;
+                            rmax[i] = nm;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1b: Remainder tokens (last block only)
+        if (int(local_output_idx) == num_outputs - 1)
+        {
+            int const rem_start_pos = last_abs_idx * CR;
+            int const rem_count = kv_len - rem_start_pos;
+            int const rem_write_start = (rem_start_pos < sp) ? (sp - rem_start_pos) : 0;
+
+            if (rem_count > rem_write_start)
+            {
+                int const total_count = rem_count - rem_write_start;
+                int const r_begin = rem_write_start + total_count * red_warp / num_red_warps;
+                int const r_end = rem_write_start + total_count * (red_warp + 1) / num_red_warps;
+
+                for (int r = r_begin; r < r_end; r++)
+                {
+                    int const pos = rem_start_pos + r;
+                    int const input_row = pos - sp;
+                    int const log_blk = pos / pc.page_size;
+                    int const blk_off = pos % pc.page_size;
+                    int const phys_kv = blockTableKv.data[int(batch_idx) * pc.max_blocks + log_blk];
+                    int const phys_sc = blockTableScore.data[int(batch_idx) * pc.max_blocks + log_blk];
+
+                    for (int col_idx = 0; col_idx < COFF; col_idx++)
+                    {
+                        int const col = col_idx * HEAD_DIM;
+                        uint const src = uint(input_offset + input_row) * two_sd + uint(col);
+                        uint const dkv = uint(phys_kv) * page_sd + uint(blk_off) * uint(STATE_DIM) + uint(col);
+                        uint const dsc = uint(phys_sc) * page_sd + uint(blk_off) * uint(STATE_DIM) + uint(col);
+
+                        for (int i = 0; i < VEC; i++)
+                        {
+                            int d = eff_tid * VEC + i;
+                            if (d >= HEAD_DIM)
+                                break;
+
+                            float kv_val = loadElem(kvScore.data, src + uint(d), KV_EB);
+                            storeElem(pagedKv.data, dkv + uint(d), kv_val, STATE_EB);
+
+                            float sc_val = loadElem(kvScore.data, src + uint(STATE_DIM) + uint(d), KV_EB);
+                            float ape_val = ape.data[r * STATE_DIM + col + eff_tid * VEC + i];
+                            float sf = sc_val + ape_val;
+                            storeElem(pagedScore.data, dsc + uint(d), sf, STATE_EB);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sync after Phase 1 if multi-warp
+        if (num_red_warps > 1)
+            barrier();
+    }
+
+    // ── Phase 2: Online softmax reduction ────────────────────────────────────
+    // Only when should_compress is true
+    if (!should_compress)
+        return;
+
+    // In overlap mode, init accumulators here (non-overlap already accumulated in Phase 1)
+    if (IS_OVERLAP)
+    {
+        for (int i = 0; i < 8; i++) { rmax[i] = -1.0e30f; rsum[i] = 0.0f; rwsum[i] = 0.0f; }
+    }
+
+    // For non-overlap mode, the accumulators were built during Phase 1 1a
+    // Now we need to also process the paged prefix (positions [win_start, sp))
+
+    int const positions_per_warp = CR / num_red_warps;
+    int const my_r_start = red_warp * positions_per_warp;
+    int const my_r_end = (red_warp == num_red_warps - 1) ? CR : (my_r_start + positions_per_warp);
+
+    if (IS_OVERLAP)
+    {
+        // Overlap mode: combine prev window (col 0) + curr window (col HEAD_DIM)
+        if (abs_idx > 0)
+        {
+            // Read from paged cache: window (abs_idx - 1) * CR, col 0 (first HEAD_DIM)
+            int const prev_win_start = (abs_idx - 1) * CR;
+            int const prev_sp = (prev_win_start < sp) ? sp - prev_win_start : 0;
+            int const paged_r_end = min(prev_sp, my_r_end);
+
+            for (int r = my_r_start; r < paged_r_end; r++)
+            {
+                int const pos = prev_win_start + r;
+                int const log_blk = pos / pc.page_size;
+                int const blk_off = pos % pc.page_size;
+                int const phys_kv = blockTableKv.data[int(batch_idx) * pc.max_blocks + log_blk];
+                int const phys_sc = blockTableScore.data[int(batch_idx) * pc.max_blocks + log_blk];
+
+                uint const base_kv = uint(phys_kv) * page_sd + uint(blk_off) * uint(STATE_DIM);
+                uint const base_sc = uint(phys_sc) * page_sd + uint(blk_off) * uint(STATE_DIM);
+
+                for (int i = 0; i < VEC; i++)
+                {
+                    int d = eff_tid * VEC + i;
+                    if (d >= HEAD_DIM) break;
+
+                    float kf = loadElem(pagedKv.data, base_kv + uint(d), STATE_EB);
+                    float sf = loadElem(pagedScore.data, base_sc + uint(d), STATE_EB);
+
+                    float nm = max(rmax[i], sf);
+                    float sc_f = exp(rmax[i] - nm);
+                    float tm = exp(sf - nm);
+                    rsum[i] = rsum[i] * sc_f + tm;
+                    rwsum[i] = rwsum[i] * sc_f + kf * tm;
+                    rmax[i] = nm;
+                }
+            }
+
+            // New tokens from kv_score
+            int const new_r_start = max(my_r_start, prev_sp);
+            for (int r = new_r_start; r < my_r_end; r++)
+            {
+                int const pos = prev_win_start + r;
+                int const input_row = pos - sp;
+                uint const row = uint(input_offset + input_row) * two_sd;
+
+                for (int i = 0; i < VEC; i++)
+                {
+                    int d = eff_tid * VEC + i;
+                    if (d >= HEAD_DIM) break;
+
+                    float kf = loadElem(kvScore.data, row + uint(d), KV_EB);
+                    float sf = loadElem(kvScore.data, row + uint(STATE_DIM) + uint(d), KV_EB);
+                    float ape_val = ape.data[r * STATE_DIM + eff_tid * VEC + i];
+
+                    float nm = max(rmax[i], sf + ape_val);
+                    float sc_f = exp(rmax[i] - nm);
+                    float tm = exp(sf + ape_val - nm);
+                    rsum[i] = rsum[i] * sc_f + tm;
+                    rwsum[i] = rwsum[i] * sc_f + kf * tm;
+                    rmax[i] = nm;
+                }
+            }
+        }
+
+        // Current window, second half (col HEAD_DIM)
+        {
+            int const new_start = (win_start < sp) ? min(sp - win_start, CR) : 0;
+            int const paged_r_end = min(new_start, my_r_end);
+
+            for (int r = my_r_start; r < paged_r_end; r++)
+            {
+                int const pos = win_start + r;
+                int const log_blk = pos / pc.page_size;
+                int const blk_off = pos % pc.page_size;
+                int const phys_kv = blockTableKv.data[int(batch_idx) * pc.max_blocks + log_blk];
+                int const phys_sc = blockTableScore.data[int(batch_idx) * pc.max_blocks + log_blk];
+
+                uint const base_kv = uint(phys_kv) * page_sd + uint(blk_off) * uint(STATE_DIM) + uint(HEAD_DIM);
+                uint const base_sc = uint(phys_sc) * page_sd + uint(blk_off) * uint(STATE_DIM) + uint(HEAD_DIM);
+
+                for (int i = 0; i < VEC; i++)
+                {
+                    int d = eff_tid * VEC + i;
+                    if (d >= HEAD_DIM) break;
+
+                    float kf = loadElem(pagedKv.data, base_kv + uint(d), STATE_EB);
+                    float sf = loadElem(pagedScore.data, base_sc + uint(d), STATE_EB);
+
+                    float nm = max(rmax[i], sf);
+                    float sc_f = exp(rmax[i] - nm);
+                    float tm = exp(sf - nm);
+                    rsum[i] = rsum[i] * sc_f + tm;
+                    rwsum[i] = rwsum[i] * sc_f + kf * tm;
+                    rmax[i] = nm;
+                }
+            }
+
+            // New tokens from kv_score, second half
+            int const new_r_start2 = max(my_r_start, new_start);
+            for (int r = new_r_start2; r < my_r_end; r++)
+            {
+                int const pos = win_start + r;
+                int const input_row = pos - sp;
+                uint const row = uint(input_offset + input_row) * two_sd;
+
+                for (int i = 0; i < VEC; i++)
+                {
+                    int d = eff_tid * VEC + i;
+                    if (d >= HEAD_DIM) break;
+
+                    float kf = loadElem(kvScore.data, row + uint(HEAD_DIM) + uint(d), KV_EB);
+                    float sf = loadElem(kvScore.data, row + uint(STATE_DIM) + uint(HEAD_DIM) + uint(d), KV_EB);
+                    float ape_val = ape.data[r * STATE_DIM + HEAD_DIM + eff_tid * VEC + i];
+
+                    float nm = max(rmax[i], sf + ape_val);
+                    float sc_f = exp(rmax[i] - nm);
+                    float tm = exp(sf + ape_val - nm);
+                    rsum[i] = rsum[i] * sc_f + tm;
+                    rwsum[i] = rwsum[i] * sc_f + kf * tm;
+                    rmax[i] = nm;
+                }
+            }
+        }
+    }
+    else
+    {
+        // Non-overlap: read from paged cache for prefix tokens, kv_score for new tokens
+        int const new_start = (win_start < sp) ? min(sp - win_start, CR) : 0;
+
+        // Paged portion (APE already fused during Phase 1)
+        int const paged_r_end = min(new_start, my_r_end);
+        for (int r = my_r_start; r < paged_r_end; r++)
+        {
+            int const pos = win_start + r;
+            int const log_blk = pos / pc.page_size;
+            int const blk_off = pos % pc.page_size;
+            int const phys_kv = blockTableKv.data[int(batch_idx) * pc.max_blocks + log_blk];
+            int const phys_sc = blockTableScore.data[int(batch_idx) * pc.max_blocks + log_blk];
+
+            uint const base_kv = uint(phys_kv) * page_sd + uint(blk_off) * uint(STATE_DIM);
+            uint const base_sc = uint(phys_sc) * page_sd + uint(blk_off) * uint(STATE_DIM);
+
+            for (int i = 0; i < VEC; i++)
+            {
+                int d = eff_tid * VEC + i;
+                if (d >= HEAD_DIM) break;
+
+                float kf = loadElem(pagedKv.data, base_kv + uint(d), STATE_EB);
+                float sf = loadElem(pagedScore.data, base_sc + uint(d), STATE_EB);
+
+                float nm = max(rmax[i], sf);
+                float sc_f = exp(rmax[i] - nm);
+                float tm = exp(sf - nm);
+                rsum[i] = rsum[i] * sc_f + tm;
+                rwsum[i] = rwsum[i] * sc_f + kf * tm;
+                rmax[i] = nm;
+            }
+        }
+
+        // Non-overlap mode: new tokens were already accumulated in Phase 1 1a/1b.
+        // Phase 2 only processes paged prefix tokens (positions < sp that were
+        // already paged from prior calls).
+    }
+
+    // ── Multi-warp merge via shared memory ───────────────────────────────────
+    if (num_red_warps > 1)
+    {
+        shared float s_rmax[4 * 256];
+        shared float s_rsum[4 * 256];
+        shared float s_rwsum[4 * 256];
+
+        barrier();
+
+        for (int i = 0; i < VEC; i++)
+        {
+            uint local_elem = uint(tid_inner) * uint(VEC) + uint(i);
+            s_rmax[red_warp * 256 + local_elem] = rmax[i];
+            s_rsum[red_warp * 256 + local_elem] = rsum[i];
+            s_rwsum[red_warp * 256 + local_elem] = rwsum[i];
+        }
+        barrier();
+
+        if (red_warp == 0)
+        {
+            for (int w = 1; w < num_red_warps; w++)
+            {
+                for (int i = 0; i < VEC; i++)
+                {
+                    uint local_elem = uint(tid_inner) * uint(VEC) + uint(i);
+                    float m2 = s_rmax[w * 256 + local_elem];
+                    float s2 = s_rsum[w * 256 + local_elem];
+                    float ws2 = s_rwsum[w * 256 + local_elem];
+
+                    float nm = max(rmax[i], m2);
+                    float sc1 = exp(rmax[i] - nm);
+                    float sc2 = exp(m2 - nm);
+                    rsum[i] = rsum[i] * sc1 + s2 * sc2;
+                    rwsum[i] = rwsum[i] * sc1 + ws2 * sc2;
+                    rmax[i] = nm;
+                }
+            }
+        }
+        barrier();
+    }
+
+    // ── Write output ──────────────────────────────────────────────────────────
+    bool should_write = (num_red_warps == 1) || (red_warp == 0);
+    if (should_write)
+    {
+        uint const out_base = uint(output_offset + int(local_output_idx)) * uint(HEAD_DIM) + uint(eff_tid) * uint(VEC);
+        for (int i = 0; i < VEC; i++)
+        {
+            int d = eff_tid * VEC + i;
+            if (d >= HEAD_DIM)
+                break;
+            float result = rwsum[i] / rsum[i];
+            storeElem(output.data, out_base + uint(i), result, pc.out_elem_bytes);
+        }
+    }
+}

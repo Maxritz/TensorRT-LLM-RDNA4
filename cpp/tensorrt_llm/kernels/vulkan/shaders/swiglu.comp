@@ -37,5 +37,5 @@ void main() {
 
     float up = in_[tid];
     float gate = in_[tid + pc.N];
-    out_[tid] = up * (1.0 / (1.0 + exp2(-gate)));
+    out_[tid] = up * (1.0 / (1.0 + exp(-gate)));
 }

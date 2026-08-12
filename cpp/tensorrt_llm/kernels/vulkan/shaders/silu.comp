@@ -34,5 +34,5 @@ void main() {
     if (tid >= pc.N) return;
 
     float x = in_[tid];
-    out_[tid] = x * (1.0 / (1.0 + exp2(-x)));
+    out_[tid] = x * (1.0 / (1.0 + exp(-x)));
 }

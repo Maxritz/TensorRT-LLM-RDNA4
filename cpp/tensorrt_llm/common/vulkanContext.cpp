@@ -181,19 +181,12 @@ VulkanResult VulkanContext::initialize()
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "TensorRT-LLM";
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.pEngineName = "Vulkan CUDA Emulation Layer";
+    appInfo.pEngineName = "TensorRT-LLM-Vulkan";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.apiVersion = VK_API_VERSION_1_3;
+    appInfo.apiVersion = VK_API_VERSION_1_4;
 
     // Required extensions
     mRequiredExtensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
-    mRequiredExtensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
-
-#ifdef _WIN32
-    mRequiredExtensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
-#else
-    mRequiredExtensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-#endif
 
     // Enable validation layers in debug builds
     std::vector<char const*> enabledLayers;

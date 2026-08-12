@@ -27,6 +27,13 @@ file(GLOB_RECURSE VULKAN_SRCS
     "${TLLM_ROOT}/tensorrt_llm/kernels/vulkanKernelRegistry.cpp"
 )
 
+# Include non-vulkan-prefixed source files needed by the inference runner
+set(VK_INFER_SRCS
+    ${TLLM_ROOT}/tensorrt_llm/common/gguf_loader.cpp
+    ${TLLM_ROOT}/tensorrt_llm/common/safetensors_loader.cpp
+    ${TLLM_ROOT}/tensorrt_llm/common/vulkan_inference.cpp
+)
+
 # Add definitions to avoid CUDA header dependencies
 add_definitions(-DENABLE_VK_EXT -DNOMINMAX)
 
@@ -53,9 +60,35 @@ set_target_properties(vulkan_trace_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# ----------------------------------------------------------------------
+# Vulkan inference executable (standalone, no Python/torch)
+# Full Qwen2 forward pass: GGUF + safetensors model loading,
+# BPE tokenization, transformer blocks, KV cache, sampling.
+# ----------------------------------------------------------------------
+add_executable(vulkan_inference
+    ${TLLM_ROOT}/tests/vulkanInferenceMain.cpp
+    ${VK_INFER_SRCS}
+    ${VULKAN_SRCS}
+)
+target_link_libraries(vulkan_inference PUBLIC ${Vulkan_LIBRARY})
+
+if(MSVC)
+    target_compile_options(vulkan_inference PRIVATE /W4 /wd4201 /wd4459 /wd4100 /wd4127 /wd4505)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(vulkan_inference PRIVATE -Wall -Wno-unused-parameter)
+endif()
+
+target_compile_definitions(vulkan_inference PUBLIC ENABLE_VULKAN=1)
+
+set_target_properties(vulkan_inference PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# ----------------------------------------------------------------------
 # Copy real-valued DeepSeek MLA test-data assets (TEST 12/13) next to the test
 # executable so the real-weights path resolves from the exe directory too, not only
 # when run from cpp/ or via the source-anchored fallback in loadRealMlaData.
+# ----------------------------------------------------------------------
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_real.bin)
     add_custom_command(TARGET vulkan_trace_test POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -68,6 +101,30 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_real_prefill.bin)
             ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_real_prefill.bin
             ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/mla_real_prefill.bin)
 endif()
+
+# ----------------------------------------------------------------------
+# MoE test executable
+# Standalone test for the C++ VulkanMoERunner (no Python/torch dependency).
+# Verifies MoE forward pass correctness against a CPU reference.
+# ----------------------------------------------------------------------
+add_executable(vulkan_moe_test
+    ${TLLM_ROOT}/tests/vulkanMoeTest.cpp
+    ${VULKAN_SRCS}
+)
+target_link_libraries(vulkan_moe_test PUBLIC ${Vulkan_LIBRARY})
+
+if(MSVC)
+    target_compile_options(vulkan_moe_test PRIVATE /W4 /wd4201 /wd4459 /wd4100 /wd4127 /wd4505)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(vulkan_moe_test PRIVATE -Wall -Wno-unused-parameter)
+endif()
+
+target_compile_definitions(vulkan_moe_test PUBLIC ENABLE_VULKAN=1)
+
+# Copy shader files next to the executable so the shader compiler can find them
+set_target_properties(vulkan_moe_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
 
 # ----------------------------------------------------------------------
 # Vulkan backend shared library

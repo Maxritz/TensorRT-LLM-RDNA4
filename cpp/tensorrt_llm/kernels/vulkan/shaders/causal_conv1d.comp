@@ -1,0 +1,143 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Causal 1D convolution (decode phase, seqlen=1) for Mamba-style models.
+// Vulkan port of causal_conv1d_update_kernel_sl1 / causal_conv1d_update_kernel
+// (causalConv1dKernels.cu lines 488-581).
+//
+// For each (batch, channel):
+//   s[w-1] = x[0]  // current input
+//   s[0..w-2] = conv_state[update_idx .. update_idx+w-2]  // prior state (circular)
+//   conv_out = bias + sum(w[i] * s[i])  for i in 0..w-1
+//   out = conv_out * sigmoid(conv_out)   // SiLU (Swish)
+//   // Shift conv_state: drop oldest, append current input at write position.
+//
+// Push constants: matches VulkanKernelDispatcher::dispatchCausalConv1d.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint batchSize;
+    uint dim;          // number of channels (xD world + x_proj output)
+    uint width;        // convolution kernel width (2, 3, or 4)
+    uint convStateLen; // length of conv_state ring buffer (>= width-1)
+    uint silu;         // 1 = apply SiLU (Swish) activation, 0 = linear
+    uint circular;     // 1 = circular buffer, 0 = shift mode
+    uint cacheSeqLen;  // for circular mode: current position in ring (mod convStateLen)
+} pc;
+
+// binding 0: input       [batchSize * dim]                (float)
+// binding 1: weight      [dim * width]                    (float, row-major per channel)
+// binding 2: bias        [dim]                             (float, may be unused)
+// binding 3: conv_state  [batchSize * convStateLen * dim] (float)
+// binding 4: output      [batchSize * dim]                (float)
+layout(std430, binding = 0) uniform  BufIn  { float in_[]; };
+layout(std430, binding = 1) uniform  BufW   { float weight[]; };
+layout(std430, binding = 2) uniform  BufB   { float bias[]; };
+layout(std430, binding = 3) buffer   BufCS  { float convState[]; };
+layout(std430, binding = 4) buffer   BufOut { float out_[]; };
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint b = gl_WorkGroupID.x;
+    uint c = gl_WorkGroupID.y * 64u + tid;
+
+    if (b >= pc.batchSize || c >= pc.dim)
+    {
+        return;
+    }
+
+    uint w = pc.width;
+    if (w < 2u)
+    {
+        return;
+    }
+
+    float inputVal = in_[b * pc.dim + c];
+
+    // Conv state base pointer for this (batch, channel).
+    float* cs = &convState[b * pc.convStateLen * pc.dim + c];
+
+    // Load the w-1 prior elements from conv_state ring buffer.
+    float s[4];
+    uint i;
+
+    if (pc.circular == 1u)
+    {
+        // Circular read: state occupies positions [0, convStateLen).
+        // The window of w-1 prior elements ends at cacheSeqLen-1.
+        uint stateLen = pc.convStateLen;
+        uint base = (pc.cacheSeqLen + stateLen - (w - 1u)) % stateLen;
+        for (i = 0u; i < w - 1u && i < 3u; ++i)
+        {
+            s[i] = cs[(base + i) * pc.dim];
+        }
+    }
+    else
+    {
+        // Shift mode: state occupies [0, convStateLen).
+        // Read the last w-1 elements (sliding window tail).
+        uint stateLen = pc.convStateLen;
+        uint base = stateLen - (w - 1u);
+        for (i = 0u; i < w - 1u && i < 3u; ++i)
+        {
+            s[i] = cs[(base + i) * pc.dim];
+        }
+    }
+
+    // Current input is the last element of the window.
+    s[w - 1u] = inputVal;
+
+    // Compute convolution: out = bias + sum(weight[i] * s[i])
+    float weightBase = float(c) * float(w);
+    float result = (pc.bias != 0u) ? bias[c] : 0.0;
+
+    for (i = 0u; i < w && i < 4u; ++i)
+    {
+        result += weight[uint(weightBase) + i] * s[i];
+    }
+
+    // Apply SiLU: f(x) = x / (1 + exp(-x))
+    if (pc.silu == 1u)
+    {
+        result = result / (1.0 + exp(-result));
+    }
+
+    // Write output.
+    out_[b * pc.dim + c] = result;
+
+    // Update conv_state: shift left, append current input.
+    float inputForState = result;
+    if (pc.circular == 1u)
+    {
+        // Circular write at cacheSeqLen position.
+        cs[(pc.cacheSeqLen % pc.convStateLen) * pc.dim] = inputForState;
+    }
+    else
+    {
+        // Shift mode: shift all left by 1, write new token at end.
+        uint stateLen = pc.convStateLen;
+        for (i = 0u; i < stateLen - 1u; ++i)
+        {
+            cs[i * pc.dim] = cs[(i + 1u) * pc.dim];
+        }
+        cs[(stateLen - 1u) * pc.dim] = inputForState;
+    }
+}

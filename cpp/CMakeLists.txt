@@ -151,11 +151,12 @@ if(INDEX_RANGE_CHECK)
 endif()
 
 # Read the project version
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(TRTLLM_VERSION_DIR ${PROJECT_SOURCE_DIR}/../tensorrt_llm)
 set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS
                                     ${TRTLLM_VERSION_DIR}/version.py)
 execute_process(
-  COMMAND ${Python_EXECUTABLE} -c "import version; print(version.__version__)"
+  COMMAND ${Python3_EXECUTABLE} -c "import version; print(version.__version__)"
   WORKING_DIRECTORY ${TRTLLM_VERSION_DIR}
   OUTPUT_VARIABLE TRTLLM_VERSION
   RESULT_VARIABLE TRTLLM_VERSION_RESULT
@@ -173,17 +174,21 @@ configure_file(
 
 setup_cuda_compiler()
 
-enable_language(C CXX CUDA)
+if(NOT CUDA_FOUND OR NOT CMAKE_CUDA_COMPILER)
+  message(STATUS "CUDA not found - building Vulkan backend only")
+  enable_language(C CXX)
+else()
+  enable_language(C CXX CUDA)
 
-# Configure CUDA Architectures after enabling CUDA.
+  # Configure CUDA Architectures after enabling CUDA.
 
-# Old CMake rejects family conditional architectures during enable_language, But
-# after that CMake handles it just fine.
-setup_cuda_architectures()
+  # Old CMake rejects family conditional architectures during enable_language, But
+  # after that CMake handles it just fine.
+  setup_cuda_architectures()
 
-set(CUDA_DRV_LIB CUDA::cuda_driver)
-set(CUDA_NVML_LIB CUDA::nvml)
-set(CUDA_RT_LIB CUDA::cudart_static)
+  set(CUDA_DRV_LIB CUDA::cuda_driver)
+  set(CUDA_NVML_LIB CUDA::nvml)
+  set(CUDA_RT_LIB CUDA::cudart_static)
 
 set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml)
 
@@ -225,21 +230,19 @@ else()
   list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
 endif()
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+endif() # close if(NOT CUDA_FOUND OR NOT CMAKE_CUDA_COMPILER)
 
-set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
-
-resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
-
-message(STATUS "CUDA library status:")
-message(STATUS "    version: ${CUDAToolkit_VERSION}")
-message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
-message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
-message(STATUS "CUDA_NVML_LIB: ${CUDA_NVML_LIB}")
-
-# Prevent CMake from creating a response file for CUDA compiler, so clangd can
-# pick up on the includes
-set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+if(CMAKE_CUDA_COMPILER)
+  find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+  set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+  resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
+  message(STATUS "CUDA library status:")
+  message(STATUS "    version: ${CUDAToolkit_VERSION}")
+  message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
+  message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
+  message(STATUS "CUDA_NVML_LIB: ${CUDA_NVML_LIB}")
+  set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+endif()
 
 find_library(RT_LIB rt)
 
@@ -296,7 +299,7 @@ include_directories(
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
   ${CMAKE_BINARY_DIR}/_deps/json-src/include)
 
-if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
+if(DEFINED CUDAToolkit_VERSION AND "${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
   message(
     STATUS
@@ -304,7 +307,7 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   )
 endif()
 
-if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11.8")
+if(DEFINED CUDAToolkit_VERSION AND "${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "11.8")
   add_definitions("-DENABLE_FP8")
   message(
     STATUS
@@ -312,7 +315,7 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11.8")
   )
 endif()
 
-if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
+if(DEFINED CUDAToolkit_VERSION AND "${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "12.8")
   add_definitions("-DENABLE_FP4")
   message(
     STATUS
@@ -472,7 +475,7 @@ if((WIN32))
     # more info.
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler  /Zc:__cplusplus")
-  else()
+  elseif(MSVC)
     message(
       FATAL_ERROR
         "Build is only supported with Visual Studio 2017 version 15.7 or higher"
@@ -649,7 +652,7 @@ if(ENABLE_UCX)
     find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build
                  NO_DEFAULT_PATH)
   endif()
-  find_package(NIXL)
+  find_package(NIXL QUIET)
 endif()
 if(ENABLE_UCX)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=1")

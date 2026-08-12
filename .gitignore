@@ -144,3 +144,11 @@ tensorrt_llm/_torch/vulkan_backend/*.so
 .plans/
 .venv/
 
+models_et/stories110m.pte
+
+# Trace build artifacts (CMake generated)
+cpp/trace_build/
+
+# opencode config
+opencode.json
+.opencode/

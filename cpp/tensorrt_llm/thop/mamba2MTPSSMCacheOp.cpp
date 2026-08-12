@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/kernels/mamba2MTPSSMCache/mamba2MTPSSMCache.h"
+#include "tensorrt_llm/common/vulkanBackend.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 namespace th = torch;
@@ -212,7 +213,39 @@ void mamba2_mtp_ssm_cache_update(th::Tensor ssm, th::Tensor x, th::Tensor dt, th
     params.a_dtype = torchToMamba2Dtype(A.scalar_type());
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    tk::invokeMamba2MTPSSMCacheUpdate(params, stream);
+
+    if (TLLM_VULKAN_BACKEND_ACTIVE())
+    {
+        // Vulkan path: dispatch via VulkanBackend
+        uint32_t strideNheadsHdimSsmDim = static_cast<uint32_t>(ssm.stride(1));
+        uint32_t strideHdimSsmDim = static_cast<uint32_t>(ssm.stride(2));
+        uint32_t strideCacheNheadsHdim = static_cast<uint32_t>(x.stride(1));
+        uint32_t strideNheadsHdim = static_cast<uint32_t>(x.stride(2));
+        uint32_t strideCacheNgroupsSsmDim = static_cast<uint32_t>(B.stride(1));
+        uint32_t strideNgroupsSsmDim = static_cast<uint32_t>(B.stride(2));
+
+        tensorrt_llm::common::VulkanBackend::launchMtpSSMCache(
+            ssm.data_ptr(), x.data_ptr(), dt.data_ptr(), A.data_ptr(),
+            B.data_ptr(), C.data_ptr(), out.data_ptr(),
+            intermediate_states.data_ptr(),
+            params.D, params.z, params.dt_bias,
+            params.ssm_batch_indices, params.intermediate_states_indices,
+            params.retrieve_parent_token,
+            bs, nheads, head_dim, ssm_dim, ngroups,
+            cache_steps, pad_slot_id, disable_state_update,
+            params.D != nullptr, params.z != nullptr, params.dt_bias != nullptr,
+            params.ssm_batch_indices != nullptr, params.intermediate_states_indices != nullptr,
+            params.retrieve_parent_token != nullptr,
+            dt_softplus,
+            strideNheadsHdimSsmDim, strideHdimSsmDim,
+            strideCacheNheadsHdim, strideNheadsHdim,
+            strideCacheNgroupsSsmDim, strideNgroupsSsmDim,
+            stream);
+    }
+    else
+    {
+        tk::invokeMamba2MTPSSMCacheUpdate(params, stream);
+    }
 }
 
 } // namespace torch_ext

@@ -1,0 +1,128 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Compute A = beta * K * K^T (lower triangular) per chunk.
+// Port of chunk_scaled_dot_kkt_fwd in chunk_scaled_dot_kkt.py.
+// One work item per (n, t, h) writes A[t] row of the lower-triangular block.
+
+#extension GL_EXT_scalar_block_layout : require
+
+#define MAX_BT 64
+#define MAX_K 128
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC
+{
+    uint N;
+    uint T;
+    uint Hg;
+    uint H;
+    uint K;
+    uint BT;
+}
+pc;
+
+// binding 0: k         [N*T*Hg*K]
+// binding 1: beta      [N*T*H]
+// binding 2: g_cumsum  [N*T*H]  (optional, for decay scaling)
+// binding 3: output    [N*T*H*BT]
+layout(std430, binding = 0) uniform BufK       { float kArr[]; };
+layout(std430, binding = 1) uniform BufBeta   { float betaArr[]; };
+layout(std430, binding = 2) uniform BufGCumsum{ float gCumsumArr[]; };
+layout(std430, binding = 3) buffer BufOut      { float outArr[]; };
+
+void main()
+{
+    uint tid = gl_GlobalInvocationID.x;
+    uint total = pc.N * pc.T * pc.H;
+    if (tid >= total) return;
+
+    uint hIdx = tid % pc.H;
+    uint tIdx = (tid / pc.H) % pc.T;
+    uint nIdx = tid / (pc.T * pc.H);
+
+    uint chunkIdx = tIdx / pc.BT;
+    uint chunkStart = chunkIdx * pc.BT;
+    uint offsetInChunk = tIdx - chunkStart;
+    uint curBT = min(pc.BT, pc.T - chunkStart);
+
+    uint hg = hIdx / (pc.H / pc.Hg);  // Hg >= H assumed
+    // Actually Hg is separate from H — if Hg < H, hg = hIdx, if Hg > H, hg = hIdx // (Hg/H)
+    // Let's follow the source: hg = h // (H // Hg) if H > Hg else h
+    uint hgIdx = (pc.H > pc.Hg) ? (hIdx / (pc.H / pc.Hg)) : hIdx;
+
+    // Load k chunk: [curBT, K]
+    float kChunk[MAX_BT * MAX_K];
+    uint kBase = nIdx * pc.T * pc.Hg * pc.K + chunkStart * pc.Hg * pc.K + hgIdx * pc.K;
+    for (uint i = 0u; i < curBT; ++i)
+    {
+        uint rowBase = kBase + i * pc.Hg * pc.K;
+        for (uint kk = 0u; kk < min(pc.K, uint(MAX_K)); ++kk)
+        {
+            kChunk[i * MAX_K + kk] = kArr[rowBase + kk];
+        }
+    }
+
+    // Load beta for this chunk: [curBT]
+    float betaChunk[MAX_BT];
+    uint betaBase = nIdx * pc.T * pc.H + chunkStart * pc.H + hIdx;
+    for (uint i = 0u; i < curBT; ++i)
+    {
+        betaChunk[i] = betaArr[betaBase + i * pc.H];
+    }
+
+    // Load g_cumsum for this chunk: [curBT]
+    float gChunk[MAX_BT];
+    uint gBase = nIdx * pc.T * pc.H + chunkStart * pc.H + hIdx;
+    for (uint i = 0u; i < curBT; ++i)
+    {
+        gChunk[i] = gCumsumArr[gBase + i * pc.H];
+    }
+
+    // Compute output row: A[offsetInChunk, j] for j = 0..curBT-1
+    // Only lower triangular: j <= offsetInChunk
+    float outBase_idx = nIdx * pc.T * pc.H * pc.BT
+                      + (chunkStart + offsetInChunk) * pc.H * pc.BT
+                      + hIdx * pc.BT;
+
+    for (uint j = 0u; j < curBT; ++j)
+    {
+        if (j > offsetInChunk)
+        {
+            outArr[outBase_idx + j] = 0.0;
+            continue;
+        }
+
+        // A[row, col] = beta[row] * dot(k[row], k[col]) * exp(g[row] - g[col]) if g_cumsum
+        float dot = 0.0;
+        uint kRowBase = offsetInChunk * MAX_K;
+        uint kColBase = j * MAX_K;
+        for (uint kk = 0u; kk < min(pc.K, uint(MAX_K)); ++kk)
+        {
+            dot += kChunk[kRowBase + kk] * kChunk[kColBase + kk];
+        }
+
+        float val = betaChunk[offsetInChunk] * dot;
+
+        // Apply g decay if g_cumsum provided
+        // exp(g_row - g_col) for j <= row (lower triangle)
+        float gDiff = gChunk[offsetInChunk] - gChunk[j];
+        val *= exp(gDiff);  // Note: source uses same_exp for all entries
+
+        outArr[outBase_idx + j] = val;
+    }
+}

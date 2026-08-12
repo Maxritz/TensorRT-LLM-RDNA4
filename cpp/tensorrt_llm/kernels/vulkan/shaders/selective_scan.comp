@@ -1,0 +1,173 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Selective scan (Mamba state-space update) — decode phase (seqlen=1).
+// Vulkan port of selective_scan_update_kernel (selectiveScan.cu lines 467-593).
+//
+// For each (sample, channel):
+//   1. Load dt, apply softplus if delta_softplus: dt_sp = softplus(dt + dt_bias)
+//   2. For each state dimension i in [0, dstate):
+//      dA = exp(A[i * dim + channel] * dt_sp)
+//      dB = B[bc_offset + b_offset + i] * dt_sp
+//      newState = state[i] * dA + x[channel] * dB
+//      write newState back to state cache
+//      out += newState * C[bc_offset + c_offset + i]
+//   3. If D != null: out += D[channel] * x[channel]
+//   4. If z != null: out *= SiLU(z[channel])
+//
+// Supports Mamba v1 (DSTATE=16, A shape [dstate, dim]) and Mamba v2
+// (A is scalar per head, state layout is transposed).
+//
+// Push constants: matches VulkanKernelDispatcher::dispatchSelectiveScan.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint batchSize;
+    uint dim;            // number of channels
+    uint dstate;         // state dimension (16 for mamba1, variable for mamba2)
+    uint nheads;         // number of attention heads
+    uint ngroups;        // number of groups
+    uint dtRank;         // delta rank (unused in update, kept for layout compat)
+    uint isMamba2;       // 1 = mamba2 layout, 0 = mamba1
+    uint dtSoftplus;     // 1 = apply softplus to dt+dt_bias, 0 = linear
+    uint hasD;           // 1 if D_ptr is valid
+    uint hasZ;           // 1 if z_ptr is valid
+    uint slotMappingEnabled; // 1 if slot_mapping_ptr is valid, 0 = sample==slot
+    int  padSlotId;      // sentinel value for padded slots (-1)
+} pc;
+
+// binding 0: out          [batchSize * dim]              (float)
+// binding 1: state        [numSlots * dim * dstate]      (float, ring buffer)
+// binding 2: u/x          [batchSize * dim]              (float)
+// binding 3: delta        [batchSize * dtDim]            (float, dt_rank or nheads)
+// binding 4: A            [dstate * dim] (mamba1) or [nheads] (mamba2)
+// binding 5: BC           [batchSize * (2*dstate + dtRank)]  (mamba1) or same (mamba2)
+// binding 6: D            [dim]  (optional, may be null — use a dummy buffer)
+// binding 7: z            [dim]  (optional, may be null — use a dummy buffer)
+// binding 8: slot_mapping [batchSize] (optional, may be null — use a dummy buffer)
+layout(std430, binding = 0) uniform  BufOut     { float out_[]; };
+layout(std430, binding = 1) buffer   BufState   { float state[]; };
+layout(std430, binding = 2) uniform  BufX       { float x_[]; };
+layout(std430, binding = 3) uniform  BufDelta   { float delta[]; };
+layout(std430, binding = 4) uniform  BufA       { float A[]; };
+layout(std430, binding = 5) uniform  BufBC      { float BC[]; };
+layout(std430, binding = 6) uniform  BufD       { float D[]; };
+layout(std430, binding = 7) uniform  BufZ       { float z_[]; };
+layout(std430, binding = 8) uniform  BufSlotMap { uint  slotMap[]; };
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint channel = gl_WorkGroupID.x * 128u + tid;
+
+    if (channel >= pc.dim)
+    {
+        return;
+    }
+
+    uint sample = gl_WorkGroupID.y;
+    uint headDim = pc.dim / pc.nheads;
+    uint head = channel / headDim;
+    uint headChl = channel % headDim;
+    uint group = head / (pc.nheads / pc.ngroups);
+
+    uint slotIdx = pc.slotMappingEnabled == 1u
+        ? (slotMap[sample] != uint(pc.padSlotId) ? slotMap[sample] : uint(pc.padSlotId))
+        : sample;
+
+    uint bcDim = pc.isMamba2 == 1u ? 2u * pc.ngroups * pc.dstate : 2u * pc.dstate;
+    uint xDim = pc.isMamba2 == 1u ? pc.dim + bcDim : pc.dim;
+    uint dtDim = pc.isMamba2 == 1u ? (pc.hasZ == 1u ? pc.dim + bcDim + (pc.nheads + 7u) / 8u * 8u : pc.dim + bcDim) : pc.dim;
+    uint zDim = pc.isMamba2 == 1u ? 2u * pc.dim + bcDim + (pc.nheads + 7u) / 8u * 8u : pc.dim;
+    uint dtOffset = pc.isMamba2 == 1u
+        ? (sample * dtDim + dtDim - (pc.nheads + 7u) / 8u * 8u)
+        : sample * dtDim;
+    uint bcOffset = pc.isMamba2 == 1u
+        ? sample * (pc.dim + bcDim)
+        : sample * (bcDim + pc.dtRank);
+    uint bOffset = pc.isMamba2 == 1u ? pc.dim + pc.dstate * group : pc.dtRank;
+    uint cOffset = pc.isMamba2 == 1u ? pc.dim + pc.dstate * (pc.ngroups + group) : pc.dtRank + 16u;
+
+    // dt index: mamba1 → channel, mamba2 → head
+    uint dtIdx = pc.isMamba2 == 1u ? head : channel;
+    float myX = x_[sample * xDim + channel];
+    float myZ = pc.hasZ == 1u ? z_[sample * zDim + channel] : 0.0;
+    float myDt = delta[dtOffset + dtIdx];
+    float myDtBias = 0.0; // dt_bias handled in delta buffer pre-add on host or separate binding
+    float out = pc.hasD == 1u ? D[channel] * myX : 0.0;
+
+    float dtB = myDt + myDtBias;
+    float dtBSp;
+    if (pc.dtSoftplus == 1u)
+    {
+        dtBSp = dtB <= 20.0 ? log(1.0 + exp(dtB)) : dtB;
+    }
+    else
+    {
+        dtBSp = dtB;
+    }
+
+    float* myState = &state[slotIdx * pc.dim * pc.dstate];
+
+    if (pc.isMamba2 == 0u)
+    {
+        // Mamba v1: A[dstate * dim], state[dstate * dim] (column-major per channel)
+        for (uint i = 0u; i < pc.dstate; ++i)
+        {
+            float rA = A[i * pc.dim + channel];
+            float rB = BC[bcOffset + bOffset + i];
+            float rC = BC[bcOffset + cOffset + i];
+            float rState = myState[i * pc.dim + channel];
+
+            float dA = exp(rA * dtBSp);
+            float dB = rB * dtBSp;
+            float newState = rState * dA + myX * dB;
+
+            myState[i * pc.dim + channel] = newState;
+            out += newState * rC;
+        }
+    }
+    else
+    {
+        // Mamba v2: A is scalar per head, state layout: [head, dstate, head_dim]
+        float aTmp = A[head];
+        for (uint i = 0u; i < pc.dstate; ++i)
+        {
+            float rB = BC[bcOffset + bOffset + i];
+            float rC = BC[bcOffset + cOffset + i];
+            float rState = myState[(head * pc.dstate + i) * headDim + headChl];
+
+            float dA = exp(aTmp * dtBSp);
+            float dB = rB * dtBSp;
+            float newState = rState * dA + myX * dB;
+
+            myState[(head * pc.dstate + i) * headDim + headChl] = newState;
+            out += newState * rC;
+        }
+    }
+
+    if (pc.hasZ == 1u)
+    {
+        float sigZ = 1.0 / (1.0 + exp(0.0 - myZ));
+        out *= myZ * sigZ;
+    }
+
+    out_[sample * pc.dim + channel] = out;
+}

@@ -90,7 +90,7 @@ public:
     // Mirrors: cuStreamCreate, cuStreamDestroy, cuStreamSynchronize
     VulkanResult createStream(uint32_t flags, VkCommandPool* pPool);
     VulkanResult destroyStream(VkCommandPool pool);
-    VulkanResult streamSynchronize(VkCommandPool pool);
+    VulkanResult streamSynchronize(VkCommandPool pool = VK_NULL_HANDLE);
     VulkanResult deviceSynchronize();
 
     // ==================== Event/Fence Operations ====================

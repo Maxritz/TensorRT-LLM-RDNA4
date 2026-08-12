@@ -1,0 +1,172 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Fused recurrent gated delta rule forward (non-chunked, sequential over T).
+// Mirrors fused_recurrent_gated_delta_rule_fwd in fused_recurrent.py.
+// Each work item handles one (n, hv, v) triple, scanning over T tokens.
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC
+{
+    uint  N;
+    uint  T;
+    uint  H;
+    uint  HV;
+    uint  V;
+    uint  K;
+    uint  hasInitialState;
+    uint  disableStateUpdate;
+    float scale;
+    uint  useL2Norm;
+    uint  useSoftplus;        // if true, g uses softplus on dt; else g is passed directly
+    float softplusBeta;
+    float softplusThreshold;
+}
+pc;
+
+// binding 0: q     [N*T*H*K]   float  (H query heads)
+// binding 1: k     [N*T*H*K]   float
+// binding 2: v     [N*T*HV*V]  float  (HV value heads)
+// binding 3: g     [N*T*HV]    float  (forget gates, log space)
+// binding 4: beta  [N*T*HV]    float
+// binding 5: init_state [N*HV*V*K] float (optional)
+// binding 6: init_idx   [N] int32 (optional)
+// binding 7: output [N*T*HV*V] float
+layout(std430, binding = 0) uniform BufQ     { float qArr[]; };
+layout(std430, binding = 1) uniform BufK     { float kArr[]; };
+layout(std430, binding = 2) uniform BufV     { float vArr[]; };
+layout(std430, binding = 3) uniform BufG     { float gArr[]; };
+layout(std430, binding = 4) uniform BufB     { float betaArr[]; };
+layout(std430, binding = 5) buffer BufInit    { float initState[]; };
+layout(std430, binding = 6) uniform BufIdx    { int  initIndices[]; };
+layout(std430, binding = 7) buffer  BufOut    { float outArr[]; };
+
+#define MAX_K 128
+
+float softplus_fn(float x)
+{
+    if (x > pc.softplusThreshold)
+        return x;
+    if (x < -pc.softplusThreshold)
+        return exp(pc.softplusBeta * x) / pc.softplusBeta;
+    return log(1.0 + exp(pc.softplusBeta * x)) / pc.softplusBeta;
+}
+
+void main()
+{
+    uint tid = gl_GlobalInvocationID.x;
+    uint total = pc.N * pc.HV * pc.V;
+    if (tid >= total)
+        return;
+
+    uint vIdx  = tid % pc.V;
+    uint hvIdx = (tid / pc.V) % pc.HV;
+    uint nIdx  = tid / (pc.V * pc.HV);
+
+    uint ratio = (pc.HV > pc.H) ? (pc.HV / pc.H) : 1u;
+    uint iH    = hvIdx / ratio;
+    uint kMax  = min(pc.K, uint(MAX_K));
+
+    float h[MAX_K];
+    if (pc.hasInitialState == 1u)
+    {
+        int initIdx = initIndices[nIdx];
+        if (initIdx >= 0)
+        {
+            uint base = uint(initIdx) * pc.HV * pc.V * pc.K + hvIdx * pc.V * pc.K + vIdx * pc.K;
+            for (uint kk = 0u; kk < kMax; ++kk)
+                h[kk] = initState[base + kk];
+        }
+        else
+        {
+            for (uint kk = 0u; kk < kMax; ++kk)
+                h[kk] = 0.0;
+        }
+    }
+    else
+    {
+        for (uint kk = 0u; kk < kMax; ++kk)
+            h[kk] = 0.0;
+    }
+
+    for (uint t = 0u; t < pc.T; ++t)
+    {
+        uint baseT = nIdx * pc.T;
+        uint abBase = baseT * pc.HV + t * pc.HV;
+        float gv = gArr[abBase + hvIdx];
+        float gvExp = exp(gv);
+
+        float betaRaw = betaArr[abBase + hvIdx];
+        float beta = 1.0 / (1.0 + exp(-betaRaw));
+
+        uint qkBase = baseT * pc.H * pc.K + t * pc.H * pc.K + iH * pc.K;
+        float kh[MAX_K], qh[MAX_K];
+        for (uint kk = 0u; kk < kMax; ++kk)
+        {
+            kh[kk] = kArr[qkBase + kk];
+            qh[kk] = qArr[qkBase + kk];
+        }
+
+        if (pc.useL2Norm == 1u)
+        {
+            float qn = 0.0, kn = 0.0;
+            for (uint kk = 0u; kk < kMax; ++kk)
+            {
+                qn += qh[kk] * qh[kk];
+                kn += kh[kk] * kh[kk];
+            }
+            qn = sqrt(qn) + 1e-6;
+            kn = sqrt(kn) + 1e-6;
+            for (uint kk = 0u; kk < kMax; ++kk)
+            {
+                qh[kk] /= qn;
+                kh[kk] /= kn;
+            }
+        }
+
+        for (uint kk = 0u; kk < kMax; ++kk)
+            qh[kk] *= pc.scale;
+
+        for (uint kk = 0u; kk < kMax; ++kk)
+            h[kk] *= gvExp;
+
+        uint vBase = baseT * pc.HV * pc.V + t * pc.HV * pc.V + hvIdx * pc.V;
+        float vRow = vArr[vBase + vIdx];
+        vRow -= dot(h, kh);
+        vRow *= beta;
+        for (uint kk = 0u; kk < kMax; ++kk)
+            h[kk] += kh[kk] * vRow;
+
+        float oVal = 0.0;
+        for (uint kk = 0u; kk < kMax; ++kk)
+            oVal += h[kk] * qh[kk];
+        outArr[vBase + vIdx] = oVal;
+    }
+
+    if (pc.hasInitialState == 1u && pc.disableStateUpdate == 0u)
+    {
+        int initIdx = initIndices[nIdx];
+        if (initIdx >= 0)
+        {
+            uint base = uint(initIdx) * pc.HV * pc.V * pc.K + hvIdx * pc.V * pc.K + vIdx * pc.K;
+            for (uint kk = 0u; kk < kMax; ++kk)
+                initState[base + kk] = h[kk];
+        }
+    }
+}

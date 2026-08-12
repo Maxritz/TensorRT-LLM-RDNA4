@@ -37,5 +37,5 @@ void main() {
 
     float av = a_[tid];
     float bv = b_[tid];
-    out_[tid] = av * (1.0 / (1.0 + exp2(-bv)));
+    out_[tid] = av * (1.0 / (1.0 + exp(-bv)));
 }

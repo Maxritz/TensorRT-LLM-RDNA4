@@ -115,9 +115,32 @@ public:
                            size_t elementCount, int32_t targetDtype,
                            void* stream = nullptr);
 
-    static bool launchIndexAdd(void* output, void* indices, void* values,
-                               uint32_t outputRows, uint32_t valueRows,
-                               uint32_t cols, void* stream = nullptr);
+     static bool launchIndexAdd(void* output, void* indices, void* values,
+                                uint32_t outputRows, uint32_t valueRows,
+                                uint32_t cols, void* stream = nullptr);
+
+    static bool launchGather(void* src, void* indices, void* output,
+                             size_t numIndices, void* stream = nullptr);
+
+    static bool launchFill(void* output, float value,
+                           size_t elementCount, void* stream = nullptr);
+
+    static bool launchCompareEq(void* input, void* output,
+                                float threshold, size_t elementCount,
+                                void* stream = nullptr);
+
+     static bool launchLayerNorm(void* input, void* gamma, void* beta, void* output,
+                                 float eps, size_t hiddenDim, size_t tokenCount,
+                                 void* stream = nullptr);
+
+     static bool launchAppendPagedKVCache(
+         void* append_key, void* append_value,
+         void* batch_indices, void* positions,
+         void* kv_cache_k, void* kv_cache_v,
+         void* kv_indices, void* kv_indptr, void* kv_last_page_len,
+         uint32_t page_size, uint32_t num_kv_heads, uint32_t head_dim,
+         uint32_t n_tokens, uint32_t batch_size,
+         void* stream = nullptr);
 
     static bool launchTopKGeneral(void* input, void* outputIndices,
                                   void* outputValues,
@@ -192,6 +215,78 @@ public:
                                      uint32_t slidingWindow = 0, uint32_t storageType = 0,
                                      float kvScale = 1.0f,
                                      void* stream = nullptr);
+
+    // ==================== MHC Operations ====================
+    static bool launchMhcGemm(void* x, void* wT, void* y, void* r,
+                              uint32_t M, uint32_t N, uint32_t K, uint32_t tileN,
+                              void* stream = nullptr);
+
+    static bool launchMhcFuse(void* yAcc, void* rAcc, void* residual,
+                              void* hcScale, void* hcBase,
+                              void* postMix, void* combMix, void* layerInput, void* normW,
+                              uint32_t M, uint32_t K, uint32_t hiddenSize,
+                              float rmsEps, float hcPreEps, float hcSinkhornEps,
+                              float hcPostMultValue, int32_t sinkhornRepeat,
+                              uint32_t numSplits, bool applyNorm, float normEps,
+                              void* stream = nullptr);
+
+    // ==================== Mamba2 MTP SSM Cache ====================
+    static bool launchMtpSSMCache(
+        void* state, void* x, void* dt, void* A,
+        void* B, void* C, void* out, void* intermediateStates,
+        void* D, void* z, void* dtBias,
+        void* ssmBatchIndices, void* interSsmBatchIndices, void* retrieveParentToken,
+        uint32_t bs, uint32_t nheads, uint32_t headDim, uint32_t ssmDim, uint32_t ngroups,
+        int cacheSteps, int padSlotId, bool disableStateUpdate,
+        bool hasD, bool hasZ, bool hasDtBias,
+        bool hasSsmBatchIndices, bool hasInterSsmBatchIndices, bool hasParentToken,
+        bool dtSoftplus,
+        uint32_t strideNheadsHdimSsmDim, uint32_t strideHdimSsmDim,
+        uint32_t strideCacheNheadsHdim, uint32_t strideNheadsHdim,
+        uint32_t strideCacheNgroupsSsmDim, uint32_t strideNgroupsSsmDim,
+        void* stream = nullptr);
+
+    // ==================== KV Cache Compression ====================
+    static bool launchCompressDecode(
+        void* kvScore, void* ape, void* pagedKv, void* pagedScore,
+        void* blockTableKv, void* blockTableScore, void* output,
+        void* kvLens, void* cuSeqLens, void* cuKvComp,
+        uint32_t batchSize, uint32_t pageSize, uint32_t maxBlocks,
+        uint32_t headDim, uint32_t compressRatio, uint32_t nextN,
+        uint32_t kvScoreElemBytes, uint32_t stateElemBytes, uint32_t outElemBytes,
+        void* stream = nullptr);
+
+    static bool launchCompressPrefill(
+        void* kvScore, void* ape, void* pagedKv, void* pagedScore,
+        void* blockTableKv, void* blockTableScore, void* output,
+        void* kvLens, void* startPos, void* cuSeqLens, void* cuKvComp,
+        uint32_t batchSize, uint32_t pageSize, uint32_t maxBlocks,
+        uint32_t headDim, uint32_t compressRatio, uint32_t maxOutputs,
+        uint32_t kvScoreElemBytes, uint32_t stateElemBytes, uint32_t outElemBytes,
+        void* stream = nullptr);
+
+    static bool launchCompressPostproc(
+        void* kvComp, void* rmsWeight, float rmsEps,
+        void* cosSinTable, void* positionIds,
+        int32_t nopeDim, int32_t ropeDim,
+        void* kvCache,
+        void* numOutputs, void* cuKvComp, void* startPos, void* blockOffsets,
+        void* compressedMask,
+        uint32_t batchSize, uint32_t tokensPerBlock, uint32_t headDim,
+        uint32_t maxBlocksPerSeq, uint32_t elemBytes, uint32_t totalTokens,
+        int32_t cacheScaleType, bool rotateActivation,
+        void* quantOutput, void* scaleOutput,
+        void* stream = nullptr);
+
+    // ==================== FLA Gated Delta Rule ====================
+    static bool launchGatedDeltaRule(
+        void* aLog, void* dtBias, void* a, void* b,
+        void* q, void* k, void* v,
+        void* initialState, void* initIndices, void* output,
+        uint32_t N, uint32_t T, uint32_t H, uint32_t HV, uint32_t V, uint32_t K,
+        bool hasInitialState, bool disableStateUpdate,
+        float scale, float softplusBeta, float softplusThreshold, bool useL2Norm,
+        void* stream = nullptr);
 
     // ==================== Synchronization ====================
     static void streamSynchronize(void* stream = nullptr);

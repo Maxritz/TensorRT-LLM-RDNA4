@@ -140,15 +140,11 @@ VulkanResult GPUFence::record(VkQueue queue, uint32_t queueIndex)
     // Reset fence before reuse
     vkResetFences(device, 1, &mFence);
 
-    // Signal the fence when the queue reaches this point
-    VkResult result = vkQueueSubmit(queue, 0, nullptr, mFence);
-    if (result != VK_SUCCESS)
-    {
-        mContext->setLastResult(VulkanResult::UNKNOWN_ERROR);
-        return mContext->getResult();
-    }
-
-    // Signal the semaphore as well for GPU-GPU synchronization
+    // Signal the fence when the queue reaches this point.
+    // Submit a single empty command buffer submission that signals
+    // both the fence (CPU-side) and the semaphore (GPU-GPU side).
+    // Per the Vulkan spec, a fence must not be signaled by two
+    // separate vkQueueSubmit calls without an intervening reset.
     VkSemaphore submitSemaphore = mSemaphore;
     if (mTimelineSemaphore != VK_NULL_HANDLE)
     {
@@ -165,7 +161,7 @@ VulkanResult GPUFence::record(VkQueue queue, uint32_t queueIndex)
         submitInfo.pSignalSemaphores = &submitSemaphore;
     }
 
-    result = vkQueueSubmit(queue, 1, &submitInfo, mFence);
+    VkResult result = vkQueueSubmit(queue, 1, &submitInfo, mFence);
     if (result != VK_SUCCESS)
     {
         mContext->setLastResult(VulkanResult::UNKNOWN_ERROR);
@@ -395,15 +391,12 @@ VulkanResult GPUFencePool::waitIdle(uint64_t timeoutNs)
         return VulkanResult::INITIALIZATION_FAILED;
     }
 
-    // First wait for all used fences
+    // First wait for all used fences (bounded timeout)
     VulkanResult result = synchronizeAll(timeoutNs);
     if (result != VulkanResult::SUCCESS)
     {
         return result;
     }
-
-    // Then wait for all queues to be idle
-    vkDeviceWaitIdle(mContext->getDevice());
 
     mContext->setLastResult(VulkanResult::SUCCESS);
     return VulkanResult::SUCCESS;

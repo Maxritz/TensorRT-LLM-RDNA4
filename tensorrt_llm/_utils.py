@@ -46,7 +46,64 @@ except (RuntimeError, ImportError):
 from typing_extensions import ParamSpec
 
 # isort: off
-import torch
+import os as _os
+if _os.environ.get("TLLM_VULKAN_BACKEND", "0") != "1":
+    import torch
+else:
+    import types as _types
+    torch = _types.SimpleNamespace()  # stub to allow module-level dict creation
+    torch.Tensor = _types.SimpleNamespace  # placeholder for isinstance checks
+    torch.bfloat16 = "bfloat16"
+    torch.float16 = "float16"
+    torch.float32 = "float32"
+    torch.int8 = "int8"
+    torch.int16 = "int16"
+    torch.int32 = "int32"
+    torch.int64 = "int64"
+    torch.uint8 = "uint8"
+    torch.bool = "bool"
+    torch.float8_e4m3fn = "float8_e4m3fn"
+    torch.qint8 = "qint8"
+    torch.float64 = "float64"
+    torch.complex64 = "complex64"
+    torch.complex128 = "complex128"
+    torch.cuda = _types.SimpleNamespace()
+    torch.cuda.is_available = lambda: False
+    torch.cuda.device_count = lambda: 0
+    torch.cuda.current_device = lambda: 0
+    torch.cuda.empty_cache = lambda: None
+    torch.cuda.ipc_collect = lambda: None
+    torch.cuda.get_device_properties = lambda x: _types.SimpleNamespace()
+    torch.from_numpy = lambda x: x
+    torch.tensor = lambda x, dtype=None: x
+    torch.as_tensor = lambda x: x
+    torch.distributed = _types.SimpleNamespace()
+    torch.distributed.get_rank = lambda: 0
+    torch.__version__ = "0.0.0-stub"
+
+class _TorchCompilerStub:
+    def disable(self, *args, **kwargs):
+        def wrapper(fn):
+            return fn
+        return wrapper if not args or not callable(args[0]) else args[0]
+
+    def allow_in_graph(self, fn):
+        return fn
+
+    def assume_constant_result(self, *args, **kwargs):
+        def wrapper(fn):
+            return fn
+        return wrapper if not args or not callable(args[0]) else args[0]
+
+torch.compiler = _TorchCompilerStub()
+
+class _TorchLibraryStub:
+    def custom_op(self, name, *args, **kwargs):
+        def decorator(fn):
+            return fn
+        return decorator
+
+torch.library = _TorchLibraryStub()
 
 try:
     from cuda.bindings import runtime as cudart

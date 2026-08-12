@@ -15,9 +15,11 @@
  */
 
 // General-purpose top-K per row.
-// input:  [rows, cols]  (binding 0)
+// input:          [rows, cols]  (binding 0, read-write)
 // output_indices: [rows, topk] (binding 1)
 // output_values:  [rows, topk] (binding 2)
+// selected:       [rows, cols] (binding 3, read-write, init to 0)
+
 #version 460
 
 #extension GL_EXT_scalar_block_layout : require
@@ -30,22 +32,25 @@ layout(push_constant, scalar) uniform PushConstants {
     uint topk;
 } pc;
 
-layout(std430, binding = 0) restrict readonly buffer BufIn { float in_[]; };
+layout(std430, binding = 0) restrict          buffer BufIn { float in_[]; };
 layout(std430, binding = 1) restrict writeonly buffer BufIdx { uint idx_[]; };
 layout(std430, binding = 2) restrict writeonly buffer BufVal { float val_[]; };
+layout(std430, binding = 3) restrict          buffer BufSel { uint selected[]; };
 
 void main() {
     uint row = gl_WorkGroupID.x * 64 + gl_LocalInvocationID.x;
     if (row >= pc.rows) return;
+
+    uint rowBase = row * pc.cols;
 
     // Linear scan top-k (simple, no shared memory sort)
     for (uint k = 0u; k < pc.topk; ++k) {
         uint best = 0;
         float bestVal = -1e30;
         for (uint c = 0u; c < pc.cols; ++c) {
-            float v = in_[row * pc.cols + c];
-            // Skip already-selected (marked with NaN)
-            if (v != v) continue;
+            uint selIdx = rowBase + c;
+            if (selected[selIdx] != 0u) continue;
+            float v = in_[rowBase + c];
             if (v > bestVal) {
                 bestVal = v;
                 best = c;
@@ -53,7 +58,6 @@ void main() {
         }
         idx_[row * pc.topk + k] = best;
         val_[row * pc.topk + k] = bestVal;
-        // Mark as selected
-        in_[row * pc.cols + best] = sqrt(-1.0); // NaN
+        selected[rowBase + best] = 1u;
     }
 }

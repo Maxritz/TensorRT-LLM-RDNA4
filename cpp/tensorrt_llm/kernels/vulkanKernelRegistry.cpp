@@ -28,6 +28,7 @@
 #include "tensorrt_llm/common/vulkanShaderCompiler.h"
 #include "tensorrt_llm/common/vulkanMemoryAllocator.h"
 #include "tensorrt_llm/common/vulkanFence.h"
+#include "tensorrt_llm/common/vulkanBackend.h"
 
 #include <algorithm>
 #include <cstring>
@@ -125,6 +126,20 @@ bool VulkanKernelRegistry::initialize()
 
     {
         KernelDescriptor desc;
+        desc.name = "layer_norm";
+        desc.shaderPath = "layer_norm.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 256;
+        desc.blockK = 256;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = true;
+        desc.bindingCount = 4; // input, gamma, beta, output
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
         desc.name = "q8_0_gemm";
         desc.shaderPath = "q8_0_gemm.comp";
         desc.entryPoint = "main";
@@ -148,6 +163,70 @@ bool VulkanKernelRegistry::initialize()
         desc.blockK = 256;
         desc.requiresCooperativeMatrix = false;
         desc.requiresFP16 = true;
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "q4_0_gemm";
+        desc.shaderPath = "q4_0_gemm.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = true;
+        desc.isQuantized = true;
+        desc.quantType = 2; // GGML_TYPE_Q4_0
+        desc.bindingCount = 4;
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "q4_k_gemm";
+        desc.shaderPath = "q4_k_gemm.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = true;
+        desc.isQuantized = true;
+        desc.quantType = 12; // GGML_TYPE_Q4_K
+        desc.bindingCount = 4;
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "q5_k_gemm";
+        desc.shaderPath = "q5_k_gemm.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = true;
+        desc.isQuantized = true;
+        desc.quantType = 13; // GGML_TYPE_Q5_K
+        desc.bindingCount = 4;
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "q6_k_gemm";
+        desc.shaderPath = "q6_k_gemm.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = true;
+        desc.isQuantized = true;
+        desc.quantType = 14; // GGML_TYPE_Q6_K
+        desc.bindingCount = 4;
         registerKernel(desc);
     }
 
@@ -376,7 +455,63 @@ bool VulkanKernelRegistry::initialize()
         desc.blockK = 1;
         desc.requiresCooperativeMatrix = false;
         desc.requiresFP16 = false;
-        desc.bindingCount = 3; // input, output_indices, output_values
+        desc.bindingCount = 4; // input, output_indices, output_values, selected_flags
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "causal_conv1d";
+        desc.shaderPath = "causal_conv1d.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 64;    // local_size_x = 64
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 5; // input, weight, bias, conv_state, output
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "selective_scan";
+        desc.shaderPath = "selective_scan.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 128;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 9; // out, state, x, delta, A, BC, D, z, slot_map
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "fp4_moe";
+        desc.shaderPath = "fp4_moe.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 7; // input, weights, weight_scales, expert_ids, expert_offsets, bias, output
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "append_paged_kv_cache";
+        desc.shaderPath = "append_paged_kv_cache.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 64;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 9; // key, value, batch_idx, pos, k_cache, v_cache, kv_indices, indptr, last_page_len
         registerKernel(desc);
     }
 
@@ -447,6 +582,133 @@ bool VulkanKernelRegistry::initialize()
         desc.requiresCooperativeMatrix = false;
         desc.requiresFP16 = false;
         desc.bindingCount = 3; // output, indices, values
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "gather";
+        desc.shaderPath = "gather.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 3; // src, indices, output
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "fill";
+        desc.shaderPath = "fill.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 1; // output only
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "compare_eq";
+        desc.shaderPath = "compare_eq.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 2; // input, output
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "mhc_gemm";
+        desc.shaderPath = "mhc_gemm.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 4; // x, w_t, y, r
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "mhc_fuse";
+        desc.shaderPath = "mhc_fuse.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 9; // y_acc, r_acc, residual, scale, base, post_mix, comb_mix, layer_input, norm_weight
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "ssm_cache";
+        desc.shaderPath = "ssm_cache.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 128;    // MTP_BLOCK_THREADS = 4 warps x 32
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 14; // state, x, dt, A, B, C, out, inter_states, D, z, dt_bias, ssm_idx, inter_idx, parent_token
+        registerKernel(desc);
+    }
+
+    {
+        // Replace old single "compress" kernel with 3-stage compressor pipeline
+        KernelDescriptor desc;
+        desc.name = "compress_decode";
+        desc.shaderPath = "compress_decode.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 128;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 10; // kvScore, ape, pagedKv, pagedScore, blkTblKv, blkTblSc, output, kvLens, cuSeqLens, cuKvComp
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "compress_prefill";
+        desc.shaderPath = "compress_prefill.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 128;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 11; // kvScore, ape, pagedKv, pagedScore, blkTblKv, blkTblSc, output, kvLens, startPos, cuSeqLens, cuKvComp
+        registerKernel(desc);
+    }
+
+    {
+        KernelDescriptor desc;
+        desc.name = "compress_postproc";
+        desc.shaderPath = "compress_postproc.comp";
+        desc.entryPoint = "main";
+        desc.blockM = 256;
+        desc.blockN = 1;
+        desc.blockK = 1;
+        desc.requiresCooperativeMatrix = false;
+        desc.requiresFP16 = false;
+        desc.bindingCount = 12; // kvComp, rmsW, cosSin, posIds, kvCache, numOut, cuKvComp, startPos, blkOff, mask, quantOut, scaleOut
         registerKernel(desc);
     }
 
@@ -923,12 +1185,12 @@ void VulkanKernelDispatcher::submitAndFree(VkCommandBuffer cmdBuf)
     submitInfo.pCommandBuffers = &cmdBuf;
 
     VkFence fence = VK_NULL_HANDLE;
+    std::shared_ptr<GPUFence> fencePtr;
     if (mKernelRegistry)
     {
         auto runtime = VulkanRuntime::getInstance();
         if (runtime)
         {
-            std::shared_ptr<GPUFence> fencePtr;
             runtime->allocateFence(&fencePtr);
             if (fencePtr)
             {
@@ -938,7 +1200,33 @@ void VulkanKernelDispatcher::submitAndFree(VkCommandBuffer cmdBuf)
     }
 
     vkQueueSubmit(mContext->getComputeQueue(0), 1, &submitInfo, fence);
-    vkQueueWaitIdle(mContext->getComputeQueue(0));
+
+    if (fence != VK_NULL_HANDLE)
+    {
+        VkResult waitResult = vkWaitForFences(mContext->getDevice(), 1, &fence, VK_TRUE, 10'000'000'000ULL);
+        if (waitResult == VK_TIMEOUT)
+        {
+            TLLM_LOG_WARNING("Vulkan: queue wait timed out (10s) - possible device hang");
+        }
+        else if (waitResult == VK_ERROR_DEVICE_LOST)
+        {
+            TLLM_LOG_ERROR("Vulkan: device lost detected during fence wait");
+        }
+        // Reset fence so it can be returned to the pool and reused
+        vkResetFences(mContext->getDevice(), 1, &fence);
+        if (fencePtr)
+        {
+            auto runtime = VulkanRuntime::getInstance();
+            if (runtime)
+            {
+                runtime->returnFence(fencePtr);
+            }
+        }
+    }
+    else
+    {
+        vkQueueWaitIdle(mContext->getComputeQueue(0));
+    }
 }
 
 VulkanResult VulkanKernelDispatcher::dispatchElementwiseAdd(
@@ -1108,6 +1396,79 @@ VulkanResult VulkanKernelDispatcher::dispatchRmsNorm(
     return VulkanResult::SUCCESS;
 }
 
+VulkanResult VulkanKernelDispatcher::dispatchLayerNorm(
+    void* input, void* gamma, void* beta, void* output,
+    float eps, size_t hiddenDim, size_t tokenCount, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    auto variant = mKernelRegistry->getBestVariant("layer_norm");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    uint32_t totalElements = static_cast<uint32_t>(hiddenDim * tokenCount);
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(input),
+                          reinterpret_cast<VkBuffer>(gamma),
+                          reinterpret_cast<VkBuffer>(beta),
+                          reinterpret_cast<VkBuffer>(output)};
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[4]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].range = static_cast<VkDeviceSize>(totalElements) * sizeof(float); bufInfos[0].offset = 0;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].range = static_cast<VkDeviceSize>(hiddenDim) * sizeof(float);       bufInfos[1].offset = 0;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].range = static_cast<VkDeviceSize>(hiddenDim) * sizeof(float);       bufInfos[2].offset = 0;
+    bufInfos[3].buffer = buffers[3]; bufInfos[3].range = static_cast<VkDeviceSize>(totalElements) * sizeof(float); bufInfos[3].offset = 0;
+
+    VkWriteDescriptorSet writes[4]{};
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 4, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t hiddenDim;
+        uint32_t totalElements;
+        float eps;
+    } pc{};
+    pc.hiddenDim = static_cast<uint32_t>(hiddenDim);
+    pc.totalElements = totalElements;
+    pc.eps = eps;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t workGroupsX = (totalElements + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
 VulkanResult VulkanKernelDispatcher::dispatchFp16Gemm(
     void* a, void* b, void* output,
     uint32_t M, uint32_t N, uint32_t K,
@@ -1147,11 +1508,12 @@ VulkanResult VulkanKernelDispatcher::dispatchFp16Gemm(
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (!allocateDescriptorSet(variant->setLayout, &set))
     {
+        TLLM_LOG_ERROR("dispatchFp16Gemm: failed to allocate descriptor set");
         submitAndFree(cmdBuf);
         return VulkanResult::UNKNOWN_ERROR;
     }
 
-    // binding 0: A (M*K), binding 1: B (K*N), binding 2: output (M*N)
+     // binding 0: A (M*K), binding 1: B (K*N), binding 2: output (M*N)
     VkDescriptorBufferInfo bufInfos[3]{};
     bufInfos[0].buffer = buffers[0];
     bufInfos[1].buffer = buffers[1];
@@ -2168,25 +2530,6 @@ VulkanResult VulkanKernelDispatcher::dispatchMlaFmhaPrefill(
     return VulkanResult::SUCCESS;
 }
 
-VulkanResult VulkanKernelDispatcher::dispatchFill(
-    void* output, float value, size_t elementCount,
-    uint32_t blockSize)
-{
-    VkCommandBuffer cmdBuf = acquireCommandBuffer();
-    if (cmdBuf == VK_NULL_HANDLE)
-    {
-        return VulkanResult::UNKNOWN_ERROR;
-    }
-
-    // Use vkCmdFillBuffer for filling device memory
-    vkCmdFillBuffer(cmdBuf, (VkBuffer)output, 0, elementCount * sizeof(float),
-        *reinterpret_cast<uint32_t*>(&value));
-
-    submitAndFree(cmdBuf);
-
-    return VulkanResult::SUCCESS;
-}
-
 VulkanResult VulkanKernelDispatcher::dispatchSilu(
     void* input, void* output,
     size_t elementCount,
@@ -2600,14 +2943,130 @@ VulkanResult VulkanKernelDispatcher::dispatchKVCacheUpdate2D(
     vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(PushConstants), &pc);
 
-    (void)blockSize;
-    vkCmdDispatch(cmdBuf, batchSize, numKVHeads, layerCount);
+    uint32_t totalElements = batchSize * maxDraftLen;
+    uint32_t workGroupsX = (totalElements + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
 
     submitAndFree(cmdBuf);
     freeDescriptorSet(set);
 
     return VulkanResult::SUCCESS;
 }
+
+// ==================== Quantized GEMM (Q4_0/Q4_K/Q5_K/Q6_K) ====================
+// Mirrors VAiT vkblas_qgemm_{q4_0,q4k,q5k,q6k}_f32. 4 buffers:
+// binding 0=W (raw quantized bytes), 1=X (input), 2=Y (accumulator/beta term),
+// 3=Z (output). Y unused for LLM decode (beta=0), bound as null.
+
+namespace
+{
+struct QGemmPushConstants
+{
+    uint32_t m, n, k;
+    float alpha, beta;
+    uint32_t lda, ldb, ldc, ldd;
+    int32_t transA, transB;
+    int32_t beta_is_zero;
+    int32_t _pad0;
+    uint32_t strideA, strideB, strideC, strideD;
+    uint32_t batchCount;
+    uint32_t _pad1, _pad2, _pad3;
+};
+} // namespace
+
+VulkanResult dispatchQGEMM(VulkanKernelDispatcher* self, const char* kernelName,
+    void* weight, void* activation, void* output,
+    uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+    uint32_t ldw, uint32_t ldx, uint32_t ldy)
+{
+    auto variant = self->mKernelRegistry->getBestVariant(kernelName);
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = self->acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(weight),
+        reinterpret_cast<VkBuffer>(activation),
+        VK_NULL_HANDLE,
+        reinterpret_cast<VkBuffer>(output),
+    };
+    VkDescriptorSet set;
+    if (!self->allocateDescriptorSet(variant->setLayout, &set))
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkDescriptorBufferInfo bufInfos[4]{};
+    VkWriteDescriptorSet writes[4]{};
+    for (int i = 0; i < 4; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].offset = 0;
+        bufInfos[i].range = VK_WHOLE_SIZE;
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(self->mContext->getDevice(), 4, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    QGemmPushConstants pc{};
+    pc.m = M; pc.n = N; pc.k = K;
+    pc.alpha = alpha; pc.beta = beta;
+    pc.lda = ldw; pc.ldb = ldx; pc.ldc = ldy;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    uint32_t wgX = ((M * N) + 255u) / 256u;
+    vkCmdDispatch(cmdBuf, wgX, 1, 1);
+
+    self->submitAndFree(cmdBuf);
+    self->freeDescriptorSet(set);
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchQ4_0Gemm(
+    void* weight, void* activation, void* output,
+    uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+    uint32_t ldw, uint32_t ldx, uint32_t ldy)
+{
+    return dispatchQGEMM(this, "q4_0_gemm", weight, activation, output,
+                         M, N, K, alpha, beta, ldw, ldx, ldy);
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchQ4_KGemm(
+    void* weight, void* activation, void* output,
+    uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+    uint32_t ldw, uint32_t ldx, uint32_t ldy)
+{
+    return dispatchQGEMM(this, "q4_k_gemm", weight, activation, output,
+                         M, N, K, alpha, beta, ldw, ldx, ldy);
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchQ5_KGemm(
+    void* weight, void* activation, void* output,
+    uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+    uint32_t ldw, uint32_t ldx, uint32_t ldy)
+{
+    return dispatchQGEMM(this, "q5_k_gemm", weight, activation, output,
+                         M, N, K, alpha, beta, ldw, ldx, ldy);
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchQ6_KGemm(
+    void* weight, void* activation, void* output,
+    uint32_t M, uint32_t N, uint32_t K, float alpha, float beta,
+    uint32_t ldw, uint32_t ldx, uint32_t ldy)
+{
+    return dispatchQGEMM(this, "q6_k_gemm", weight, activation, output,
+                         M, N, K, alpha, beta, ldw, ldx, ldy);
+}
+
 
 VulkanResult VulkanKernelDispatcher::dispatchTopKGeneral(
     void* input, void* outputIndices, void* outputValues,
@@ -2633,6 +3092,21 @@ VulkanResult VulkanKernelDispatcher::dispatchTopKGeneral(
     VkDeviceSize idxRange = static_cast<VkDeviceSize>(rows) * topk * sizeof(uint32_t);
     VkDeviceSize valRange = static_cast<VkDeviceSize>(rows) * topk * sizeof(float);
 
+    // Allocate a "selected" flag buffer (rows * cols uint32) on GPU
+    VkDeviceSize selRange = static_cast<VkDeviceSize>(rows) * cols * sizeof(uint32_t);
+    void* selPtr = VulkanBackend::malloc(selRange);
+    if (!selPtr) {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+    VulkanBackend::memset(selPtr, 0, selRange);
+
+    VkBuffer buffersAll[] = {reinterpret_cast<VkBuffer>(input),
+                             reinterpret_cast<VkBuffer>(outputIndices),
+                             reinterpret_cast<VkBuffer>(outputValues),
+                             reinterpret_cast<VkBuffer>(selPtr)};
+    VkDeviceSize ranges[] = {inRange, idxRange, valRange, selRange};
+
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (!allocateDescriptorSet(variant->setLayout, &set))
     {
@@ -2640,13 +3114,15 @@ VulkanResult VulkanKernelDispatcher::dispatchTopKGeneral(
         return VulkanResult::UNKNOWN_ERROR;
     }
 
-    VkDescriptorBufferInfo bufInfos[3]{};
-    bufInfos[0].buffer = buffers[0]; bufInfos[0].range = inRange;  bufInfos[0].offset = 0;
-    bufInfos[1].buffer = buffers[1]; bufInfos[1].range = idxRange; bufInfos[1].offset = 0;
-    bufInfos[2].buffer = buffers[2]; bufInfos[2].range = valRange; bufInfos[2].offset = 0;
+    VkDescriptorBufferInfo bufInfos[4]{};
+    for (int i = 0; i < 4; ++i) {
+        bufInfos[i].buffer = buffersAll[i];
+        bufInfos[i].range = ranges[i];
+        bufInfos[i].offset = 0;
+    }
 
-    VkWriteDescriptorSet writes[3]{};
-    for (uint32_t i = 0; i < 3; ++i)
+    VkWriteDescriptorSet writes[4]{};
+    for (uint32_t i = 0; i < 4; ++i)
     {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = set;
@@ -2656,7 +3132,7 @@ VulkanResult VulkanKernelDispatcher::dispatchTopKGeneral(
         writes[i].pBufferInfo = &bufInfos[i];
     }
 
-    vkUpdateDescriptorSets(mContext->getDevice(), 3, writes, 0, nullptr);
+    vkUpdateDescriptorSets(mContext->getDevice(), 4, writes, 0, nullptr);
     vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
                             variant->pipelineLayout, 0, 1, &set, 0, nullptr);
     vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
@@ -2670,6 +3146,437 @@ VulkanResult VulkanKernelDispatcher::dispatchTopKGeneral(
 
     (void)blockSize;
     vkCmdDispatch(cmdBuf, rows, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchCausalConv1d(
+    void* input, void* weight, void* bias,
+    void* convState, void* output,
+    uint32_t batchSize, uint32_t dim, uint32_t width,
+    uint32_t convStateLen, bool silu, bool circular,
+    uint32_t cacheSeqLen, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    if (batchSize == 0 || dim == 0 || width < 2u || width > 4u || convStateLen < width - 1u)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("causal_conv1d");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(input),
+        reinterpret_cast<VkBuffer>(weight),
+        reinterpret_cast<VkBuffer>(bias),
+        reinterpret_cast<VkBuffer>(convState),
+        reinterpret_cast<VkBuffer>(output)
+    };
+
+    VkDeviceSize inRange     = static_cast<VkDeviceSize>(batchSize) * dim * sizeof(float);
+    VkDeviceSize weightRange = static_cast<VkDeviceSize>(dim) * width * sizeof(float);
+    VkDeviceSize biasRange   = static_cast<VkDeviceSize>(dim) * sizeof(float);
+    VkDeviceSize csRange     = static_cast<VkDeviceSize>(batchSize) * convStateLen * dim * sizeof(float);
+
+    VkDescriptorBufferInfo bufInfos[5]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].offset = 0; bufInfos[0].range = inRange;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].offset = 0; bufInfos[1].range = weightRange;
+    bufInfos[2].buffer = bias ? buffers[2] : VK_NULL_HANDLE; bufInfos[2].offset = 0; bufInfos[2].range = bias ? biasRange : VK_WHOLE_SIZE;
+    bufInfos[3].buffer = buffers[3]; bufInfos[3].offset = 0; bufInfos[3].range = csRange;
+    bufInfos[4].buffer = buffers[4]; bufInfos[4].offset = 0; bufInfos[4].range = inRange;
+
+    VkWriteDescriptorSet writes[5]{};
+    for (uint32_t i = 0; i < 5; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = VK_NULL_HANDLE;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    for (uint32_t i = 0; i < 5; ++i)
+    {
+        writes[i].dstSet = set;
+    }
+    vkUpdateDescriptorSets(mContext->getDevice(), 5, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t batchSize;
+        uint32_t dim;
+        uint32_t width;
+        uint32_t convStateLen;
+        uint32_t silu;
+        uint32_t circular;
+        uint32_t cacheSeqLen;
+    } pc{};
+    pc.batchSize = batchSize;
+    pc.dim = dim;
+    pc.width = width;
+    pc.convStateLen = convStateLen;
+    pc.silu = silu ? 1u : 0u;
+    pc.circular = circular ? 1u : 0u;
+    pc.cacheSeqLen = cacheSeqLen;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    uint32_t workGroupsX = batchSize;
+    uint32_t workGroupsY = (dim + 63u) / 64u;
+    vkCmdDispatch(cmdBuf, workGroupsX, workGroupsY, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchSelectiveScan(
+    void* out,
+    void* state, void* x, void* delta,
+    void* A, void* BC, void* D, void* z, void* slotMap,
+    uint32_t batchSize, uint32_t dim, uint32_t dstate,
+    uint32_t nheads, uint32_t ngroups, uint32_t dtRank,
+    bool isMamba2, bool dtSoftplus,
+    bool hasD, bool hasZ, bool slotMapEnabled,
+    int32_t padSlotId, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    if (batchSize == 0 || dim == 0 || dstate == 0 || nheads == 0 || ngroups == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    if (nheads % ngroups != 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("selective_scan");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    // Dummy null buffers — replace with real buffers if callers pass nullptr.
+    alignas(4) static float dummyFloat[1] = {0.0f};
+    alignas(4) static uint32_t dummyUint[1] = {0u};
+
+    void* DPtr = D ? D : reinterpret_cast<void*>(dummyFloat);
+    void* zPtr = z ? z : reinterpret_cast<void*>(dummyFloat);
+    void* slotMapPtr = slotMap ? slotMap : reinterpret_cast<void*>(dummyUint);
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(out),
+        reinterpret_cast<VkBuffer>(state),
+        reinterpret_cast<VkBuffer>(x),
+        reinterpret_cast<VkBuffer>(delta),
+        reinterpret_cast<VkBuffer>(A),
+        reinterpret_cast<VkBuffer>(BC),
+        reinterpret_cast<VkBuffer>(DPtr),
+        reinterpret_cast<VkBuffer>(zPtr),
+        reinterpret_cast<VkBuffer>(slotMapPtr)
+    };
+
+    // Compute element counts for range sizing.
+    uint32_t headDim = dim / nheads;
+    uint32_t bcDim = isMamba2 ? 2u * ngroups * dstate : 2u * dstate;
+    uint32_t xDim = isMamba2 ? dim + bcDim : dim;
+    uint32_t dtDim = isMamba2 ? (hasZ ? dim + bcDim + ((nheads + 7u) / 8u * 8u) : dim + bcDim) : dim;
+
+    VkDeviceSize ranges[9];
+    ranges[0] = static_cast<VkDeviceSize>(batchSize) * dim * sizeof(float);  // out
+    ranges[1] = static_cast<VkDeviceSize>(batchSize) * dim * dstate * sizeof(float);  // state (simplified: 1 slot)
+    ranges[2] = static_cast<VkDeviceSize>(batchSize) * xDim * sizeof(float);  // x
+    ranges[3] = static_cast<VkDeviceSize>(batchSize) * dtDim * sizeof(float);  // delta
+    ranges[4] = isMamba2
+        ? static_cast<VkDeviceSize>(nheads) * sizeof(float)
+        : static_cast<VkDeviceSize>(dstate) * dim * sizeof(float);  // A
+    ranges[5] = static_cast<VkDeviceSize>(batchSize) * (bcDim + dtRank) * sizeof(float);  // BC
+    ranges[6] = static_cast<VkDeviceSize>(dim) * sizeof(float);  // D (or dummy)
+    ranges[7] = static_cast<VkDeviceSize>(dim) * sizeof(float);  // z (or dummy)
+    ranges[8] = static_cast<VkDeviceSize>(batchSize) * sizeof(uint32_t);  // slot_map (or dummy)
+
+    VkDescriptorBufferInfo bufInfos[9]{};
+    for (uint32_t i = 0; i < 9; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].offset = 0;
+        bufInfos[i].range = (i >= 6 && buffers[i] == reinterpret_cast<VkBuffer>(dummyFloat))
+            ? VK_WHOLE_SIZE : (i == 8 && buffers[i] == reinterpret_cast<VkBuffer>(dummyUint))
+                ? VK_WHOLE_SIZE : ranges[i];
+    }
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkWriteDescriptorSet writes[9]{};
+    for (uint32_t i = 0; i < 9; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 9, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t batchSize;
+        uint32_t dim;
+        uint32_t dstate;
+        uint32_t nheads;
+        uint32_t ngroups;
+        uint32_t dtRank;
+        uint32_t isMamba2;
+        uint32_t dtSoftplus;
+        uint32_t hasD;
+        uint32_t hasZ;
+        uint32_t slotMappingEnabled;
+        int32_t  padSlotId;
+    } pc{};
+    pc.batchSize = batchSize;
+    pc.dim = dim;
+    pc.dstate = dstate;
+    pc.nheads = nheads;
+    pc.ngroups = ngroups;
+    pc.dtRank = dtRank;
+    pc.isMamba2 = isMamba2 ? 1u : 0u;
+    pc.dtSoftplus = dtSoftplus ? 1u : 0u;
+    pc.hasD = hasD ? 1u : 0u;
+    pc.hasZ = hasZ ? 1u : 0u;
+    pc.slotMappingEnabled = slotMapEnabled ? 1u : 0u;
+    pc.padSlotId = padSlotId;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    uint32_t blocks = (dim + 127u) / 128u;
+    vkCmdDispatch(cmdBuf, blocks, batchSize, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchFp4Moe(
+    void* input, void* weights, void* weightScales,
+    void* expertIds, void* expertOffsets,
+    void* bias, void* output,
+    uint32_t batchSize, uint32_t hiddenSize, uint32_t intermediateSize,
+    uint32_t topK, uint32_t padSlotId, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    if (batchSize == 0 || hiddenSize == 0 || intermediateSize == 0 || topK == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("fp4_moe");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(input),
+        reinterpret_cast<VkBuffer>(weights),
+        reinterpret_cast<VkBuffer>(weightScales),
+        reinterpret_cast<VkBuffer>(expertIds),
+        reinterpret_cast<VkBuffer>(expertOffsets),
+        reinterpret_cast<VkBuffer>(bias),
+        reinterpret_cast<VkBuffer>(output)
+    };
+
+    VkDeviceSize inRange  = static_cast<VkDeviceSize>(batchSize) * hiddenSize * sizeof(float);
+    VkDeviceSize wRange   = static_cast<VkDeviceSize>(intermediateSize) * (hiddenSize / 2u); // 2 FP4 codes per byte
+    VkDeviceSize wsRange  = static_cast<VkDeviceSize>(intermediateSize) * (hiddenSize / 32u) * sizeof(float);
+    VkDeviceSize eiRange  = static_cast<VkDeviceSize>(batchSize) * topK * sizeof(uint32_t);
+    VkDeviceSize eoRange  = 0; // variable — use VK_WHOLE_SIZE
+    VkDeviceSize biasRange= static_cast<VkDeviceSize>(intermediateSize) * sizeof(float);
+    VkDeviceSize outRange = inRange;
+
+    VkDescriptorBufferInfo bufInfos[7]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].offset = 0; bufInfos[0].range = inRange;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].offset = 0; bufInfos[1].range = wRange;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].offset = 0; bufInfos[2].range = wsRange;
+    bufInfos[3].buffer = buffers[3]; bufInfos[3].offset = 0; bufInfos[3].range = eiRange;
+    bufInfos[4].buffer = buffers[4]; bufInfos[4].offset = 0; bufInfos[4].range = VK_WHOLE_SIZE;
+    bufInfos[5].buffer = buffers[5]; bufInfos[5].offset = 0; bufInfos[5].range = bias ? biasRange : VK_WHOLE_SIZE;
+    bufInfos[6].buffer = buffers[6]; bufInfos[6].offset = 0; bufInfos[6].range = outRange;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkWriteDescriptorSet writes[7]{};
+    for (uint32_t i = 0; i < 7; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 7, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants
+    {
+        uint32_t batchSize;
+        uint32_t hiddenSize;
+        uint32_t intermediateSize;
+        uint32_t blockSize;
+        uint32_t topK;
+        uint32_t padSlotId;
+    } pc{};
+    pc.batchSize = batchSize;
+    pc.hiddenSize = hiddenSize;
+    pc.intermediateSize = intermediateSize;
+    pc.blockSize = blockSize;
+    pc.topK = topK;
+    pc.padSlotId = padSlotId;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    uint32_t blocksX = batchSize;
+    uint32_t blocksY = (intermediateSize + 255u) / 256u;
+    vkCmdDispatch(cmdBuf, blocksX, blocksY, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchAppendPagedKVCache(
+    void* append_key, void* append_value,
+    void* batch_indices, void* positions,
+    void* kv_cache_k, void* kv_cache_v,
+    void* kv_indices, void* kv_indptr, void* kv_last_page_len,
+    uint32_t page_size, uint32_t num_kv_heads, uint32_t head_dim,
+    uint32_t n_tokens, uint32_t batch_size, uint32_t max_pages,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    auto variant = mKernelRegistry->getBestVariant("append_paged_kv_cache");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(append_key),
+        reinterpret_cast<VkBuffer>(append_value),
+        reinterpret_cast<VkBuffer>(batch_indices),
+        reinterpret_cast<VkBuffer>(positions),
+        reinterpret_cast<VkBuffer>(kv_cache_k),
+        reinterpret_cast<VkBuffer>(kv_cache_v),
+        reinterpret_cast<VkBuffer>(kv_indices),
+        reinterpret_cast<VkBuffer>(kv_indptr),
+        reinterpret_cast<VkBuffer>(kv_last_page_len)
+    };
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[9]{};
+    for (int i = 0; i < 9; ++i) {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].range = VK_WHOLE_SIZE;
+        bufInfos[i].offset = 0;
+    }
+
+    VkWriteDescriptorSet writes[9]{};
+    for (uint32_t i = 0; i < 9; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 9, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants {
+        uint32_t n_tokens;
+        uint32_t num_kv_heads;
+        uint32_t head_dim;
+        uint32_t page_size;
+        uint32_t max_pages;
+        uint32_t batch_size;
+    } pc{};
+    pc.n_tokens = n_tokens;
+    pc.num_kv_heads = num_kv_heads;
+    pc.head_dim = head_dim;
+    pc.page_size = page_size;
+    pc.max_pages = max_pages;
+    pc.batch_size = batch_size;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t totalWork = n_tokens * num_kv_heads * head_dim;
+    uint32_t workGroupsX = (totalWork + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
 
     submitAndFree(cmdBuf);
     freeDescriptorSet(set);
@@ -3011,6 +3918,1016 @@ VulkanResult VulkanKernelDispatcher::dispatchIndexAdd(
     submitAndFree(cmdBuf);
     freeDescriptorSet(set);
 
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchGather(
+    void* src, void* indices, void* output,
+    uint32_t numIndices, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (numIndices == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("gather");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(src),
+                          reinterpret_cast<VkBuffer>(indices),
+                          reinterpret_cast<VkBuffer>(output)};
+    VkDeviceSize idxRange = static_cast<VkDeviceSize>(numIndices) * sizeof(uint32_t);
+    VkDeviceSize valRange = static_cast<VkDeviceSize>(numIndices) * sizeof(float);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[3]{};
+    // src: whole buffer (range = VK_WHOLE_SIZE equivalent)
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].range = VK_WHOLE_SIZE; bufInfos[0].offset = 0;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].range = idxRange; bufInfos[1].offset = 0;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].range = valRange; bufInfos[2].offset = 0;
+
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 3, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants { uint32_t N; } pc{};
+    pc.N = numIndices;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t workGroupsX = (numIndices + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchFill(
+    void* output, float value,
+    size_t elementCount, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (elementCount == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("fill");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(output)};
+    VkDeviceSize range = static_cast<VkDeviceSize>(elementCount) * sizeof(float);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfo{};
+    bufInfo.buffer = buffers[0];
+    bufInfo.range = range;
+    bufInfo.offset = 0;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &bufInfo;
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 1, &write, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants { uint32_t N; float value; } pc{};
+    pc.N = static_cast<uint32_t>(elementCount);
+    pc.value = value;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t workGroupsX = (static_cast<uint32_t>(elementCount) + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchCompareEq(
+    void* input, void* output,
+    float threshold, size_t elementCount, uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (elementCount == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("compare_eq");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {reinterpret_cast<VkBuffer>(input),
+                          reinterpret_cast<VkBuffer>(output)};
+    VkDeviceSize inRange = static_cast<VkDeviceSize>(elementCount) * sizeof(float);
+    VkDeviceSize outRange = static_cast<VkDeviceSize>(elementCount) * sizeof(uint32_t);
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[2]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].range = inRange;  bufInfos[0].offset = 0;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].range = outRange; bufInfos[1].offset = 0;
+
+    VkWriteDescriptorSet writes[2]{};
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 2, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants { uint32_t N; float threshold; } pc{};
+    pc.N = static_cast<uint32_t>(elementCount);
+    pc.threshold = threshold;
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t workGroupsX = (static_cast<uint32_t>(elementCount) + blockSize - 1u) / blockSize;
+    vkCmdDispatch(cmdBuf, workGroupsX, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchMhcFuse(
+    void* yAcc, void* rAcc, void* residual,
+    void* hcScale, void* hcBase,
+    void* postMix, void* combMix, void* layerInput, void* normW,
+    uint32_t M, uint32_t K, uint32_t hiddenSize,
+    float rmsEps, float hcPreEps, float hcSinkhornEps, float hcPostMultValue,
+    int32_t sinkhornRepeat, uint32_t numSplits, bool applyNorm, float normEps,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (M == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("mhc_fuse");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(yAcc),
+        reinterpret_cast<VkBuffer>(rAcc),
+        reinterpret_cast<VkBuffer>(residual),
+        reinterpret_cast<VkBuffer>(hcScale),
+        reinterpret_cast<VkBuffer>(hcBase),
+        reinterpret_cast<VkBuffer>(postMix),
+        reinterpret_cast<VkBuffer>(combMix),
+        reinterpret_cast<VkBuffer>(layerInput),
+        reinterpret_cast<VkBuffer>(normW)
+    };
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    // Compute ranges
+    constexpr uint32_t HC_MULT = 4;
+    uint32_t hc3 = HC_MULT * 2 + HC_MULT * HC_MULT;  // 24
+    uint32_t hc2 = HC_MULT * HC_MULT;                // 16
+    VkDeviceSize ranges[9];
+    ranges[0] = VkDeviceSize(numSplits) * M * hc3 * sizeof(float);       // y_acc
+    ranges[1] = VkDeviceSize(numSplits) * M * sizeof(float);              // r_acc
+    ranges[2] = VkDeviceSize(M) * HC_MULT * hiddenSize * sizeof(uint16_t); // residual
+    ranges[3] = HC_MULT * sizeof(float);                                   // hc_scale
+    ranges[4] = hc3 * sizeof(float);                                       // hc_base
+    ranges[5] = VkDeviceSize(M) * HC_MULT * sizeof(float);                 // post_mix
+    ranges[6] = VkDeviceSize(M) * hc2 * sizeof(float);                     // comb_mix
+    ranges[7] = VkDeviceSize(M) * hiddenSize * sizeof(uint16_t);           // layer_input
+    ranges[8] = hiddenSize * sizeof(uint16_t);                             // norm_weight
+
+    VkDescriptorBufferInfo bufInfos[9]{};
+    for (int i = 0; i < 9; i++)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].range = ranges[i];
+        bufInfos[i].offset = 0;
+    }
+
+    VkWriteDescriptorSet writes[9]{};
+    for (uint32_t i = 0; i < 9; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 9, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants {
+        uint32_t M;
+        uint32_t K;
+        uint32_t hiddenSize;
+        float rmsEps;
+        float hcPreEps;
+        float hcSinkhornEps;
+        float hcPostMultValue;
+        int32_t sinkhornRepeat;
+        uint32_t numSplits;
+        uint32_t applyNorm;
+        float normEps;
+        uint32_t padSlotId;
+    } pc{};
+    pc.M = M;
+    pc.K = K;
+    pc.hiddenSize = hiddenSize;
+    pc.rmsEps = rmsEps;
+    pc.hcPreEps = hcPreEps;
+    pc.hcSinkhornEps = hcSinkhornEps;
+    pc.hcPostMultValue = hcPostMultValue;
+    pc.sinkhornRepeat = sinkhornRepeat;
+    pc.numSplits = numSplits;
+    pc.applyNorm = applyNorm ? 1u : 0u;
+    pc.normEps = normEps;
+    pc.padSlotId = 0xFFFFFFFFu;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    vkCmdDispatch(cmdBuf, M, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchMhcGemm(
+    void* x, void* wT, void* y, void* r,
+    uint32_t M, uint32_t N, uint32_t K, uint32_t tileN,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+    if (M == 0 || N == 0 || K == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("mhc_gemm");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(x),
+        reinterpret_cast<VkBuffer>(wT),
+        reinterpret_cast<VkBuffer>(y),
+        reinterpret_cast<VkBuffer>(r)
+    };
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDeviceSize xRange = VkDeviceSize(M) * K * sizeof(uint16_t);
+    VkDeviceSize wRange = VkDeviceSize(N) * K * sizeof(float);
+    VkDeviceSize yRange = VkDeviceSize(M) * N * sizeof(float);
+    VkDeviceSize rRange = VkDeviceSize(M) * sizeof(float);
+
+    VkDescriptorBufferInfo bufInfos[4]{};
+    bufInfos[0].buffer = buffers[0]; bufInfos[0].range = xRange; bufInfos[0].offset = 0;
+    bufInfos[1].buffer = buffers[1]; bufInfos[1].range = wRange; bufInfos[1].offset = 0;
+    bufInfos[2].buffer = buffers[2]; bufInfos[2].range = yRange; bufInfos[2].offset = 0;
+    bufInfos[3].buffer = buffers[3]; bufInfos[3].range = rRange; bufInfos[3].offset = 0;
+
+    VkWriteDescriptorSet writes[4]{};
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 4, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants {
+        uint32_t M;
+        uint32_t N;
+        uint32_t K;
+        uint32_t tileN;
+        uint32_t padSlotId;
+    } pc{};
+    pc.M = M;
+    pc.N = N;
+    pc.K = K;
+    pc.tileN = tileN;
+    pc.padSlotId = 0xFFFFFFFFu;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    uint32_t workGroupsY = (N + tileN - 1u) / tileN;
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, M, workGroupsY, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+namespace
+{
+// MTP constants mirrored from mamba2MTPSSMCacheKernel.cuh to avoid CUDA dependency.
+constexpr int MTP_NUM_WARPS = 4;
+constexpr int MTP_HDIMS_PER_WARP = 2;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchMtpSSMCache(
+    void* state, void* x, void* dt, void* A,
+    void* B, void* C, void* out, void* intermediateStates,
+    void* D, void* z, void* dtBias,
+    void* ssmBatchIndices, void* interSsmBatchIndices, void* retrieveParentToken,
+    uint32_t bs, uint32_t nheads, uint32_t headDim, uint32_t ssmDim, uint32_t ngroups,
+    int cacheSteps, int padSlotId, bool disableStateUpdate,
+    bool hasD, bool hasZ, bool hasDtBias,
+    bool hasSsmBatchIndices, bool hasInterSsmBatchIndices, bool hasParentToken,
+    bool dtSoftplus,
+    uint32_t strideNheadsHdimSsmDim, uint32_t strideHdimSsmDim,
+    uint32_t strideCacheNheadsHdim, uint32_t strideNheadsHdim,
+    uint32_t strideCacheNgroupsSsmDim, uint32_t strideNgroupsSsmDim,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    if (bs == 0 || nheads == 0 || headDim == 0 || ssmDim == 0 || cacheSteps == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("ssm_cache");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    alignas(4) static float dummyFloat[1] = {0.0f};
+    alignas(4) static uint32_t dummyUint[1] = {0u};
+    alignas(4) static int32_t dummyInt[1] = {0};
+
+    void* DPtr = D ? D : reinterpret_cast<void*>(dummyFloat);
+    void* zPtr = z ? z : reinterpret_cast<void*>(dummyFloat);
+    void* dtBiasPtr = dtBias ? dtBias : reinterpret_cast<void*>(dummyFloat);
+    void* ssmIdxPtr = ssmBatchIndices ? ssmBatchIndices : reinterpret_cast<void*>(dummyUint);
+    void* interIdxPtr = interSsmBatchIndices ? interSsmBatchIndices : reinterpret_cast<void*>(dummyUint);
+    void* parentPtr = retrieveParentToken ? retrieveParentToken : reinterpret_cast<void*>(dummyInt);
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(state),
+        reinterpret_cast<VkBuffer>(x),
+        reinterpret_cast<VkBuffer>(dt),
+        reinterpret_cast<VkBuffer>(A),
+        reinterpret_cast<VkBuffer>(B),
+        reinterpret_cast<VkBuffer>(C),
+        reinterpret_cast<VkBuffer>(out),
+        reinterpret_cast<VkBuffer>(intermediateStates),
+        reinterpret_cast<VkBuffer>(DPtr),
+        reinterpret_cast<VkBuffer>(zPtr),
+        reinterpret_cast<VkBuffer>(dtBiasPtr),
+        reinterpret_cast<VkBuffer>(ssmIdxPtr),
+        reinterpret_cast<VkBuffer>(interIdxPtr),
+        reinterpret_cast<VkBuffer>(parentPtr)
+    };
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    VkDescriptorBufferInfo bufInfos[14]{};
+    for (uint32_t i = 0; i < 14; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].offset = 0;
+        // Set range to VK_WHOLE_SIZE for dummy buffers, actual size for real ones
+        bufInfos[i].range = VK_WHOLE_SIZE;
+    }
+
+    VkWriteDescriptorSet writes[14]{};
+    for (uint32_t i = 0; i < 14; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 14, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    uint32_t flags = 0;
+    if (hasD) flags |= (1u << 0u);
+    if (hasZ) flags |= (1u << 1u);
+    if (hasDtBias) flags |= (1u << 2u);
+    if (hasSsmBatchIndices) flags |= (1u << 3u);
+    if (hasInterSsmBatchIndices) flags |= (1u << 4u);
+    if (hasParentToken) flags |= (1u << 5u);
+    if (dtSoftplus) flags |= (1u << 6u);
+    if (disableStateUpdate) flags |= (1u << 7u);
+
+    uint32_t headsGroupsRatio = ngroups > 0 ? (nheads / ngroups) : 1;
+    uint32_t numHdimBlocks = (headDim + (MTP_NUM_WARPS * MTP_HDIMS_PER_WARP) - 1u) / (MTP_NUM_WARPS * MTP_HDIMS_PER_WARP);
+    if (numHdimBlocks == 0) numHdimBlocks = 1;
+
+    struct PushConstants {
+        int32_t  cacheSteps;
+        int32_t  nheads;
+        int32_t  headDim;
+        int32_t  ssmDim;
+        int32_t  ngroups;
+        int32_t  headsGroupsRatio;
+        int32_t  strideNheadsHdimSsmDim;
+        int32_t  strideHdimSsmDim;
+        int32_t  strideCacheNheadsHdim;
+        int32_t  strideNheadsHdim;
+        int32_t  strideCacheNgroupsSsmDim;
+        int32_t  strideNgroupsSsmDim;
+        uint32_t flags;
+        int32_t  padSlotId;
+    } pc{};
+
+    pc.cacheSteps = cacheSteps;
+    pc.nheads = static_cast<int32_t>(nheads);
+    pc.headDim = static_cast<int32_t>(headDim);
+    pc.ssmDim = static_cast<int32_t>(ssmDim);
+    pc.ngroups = static_cast<int32_t>(ngroups);
+    pc.headsGroupsRatio = static_cast<int32_t>(headsGroupsRatio);
+    pc.strideNheadsHdimSsmDim = static_cast<int32_t>(strideNheadsHdimSsmDim);
+    pc.strideHdimSsmDim = static_cast<int32_t>(strideHdimSsmDim);
+    pc.strideCacheNheadsHdim = static_cast<int32_t>(strideCacheNheadsHdim);
+    pc.strideNheadsHdim = static_cast<int32_t>(strideNheadsHdim);
+    pc.strideCacheNgroupsSsmDim = static_cast<int32_t>(strideCacheNgroupsSsmDim);
+    pc.strideNgroupsSsmDim = static_cast<int32_t>(strideNgroupsSsmDim);
+    pc.flags = flags;
+    pc.padSlotId = padSlotId;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, numHdimBlocks, nheads, bs);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchCompressDecode(
+    void* kvScore, void* ape, void* pagedKv, void* pagedScore,
+    void* blockTableKv, void* blockTableScore, void* output,
+    void* kvLens, void* cuSeqLens, void* cuKvComp,
+    uint32_t batchSize, uint32_t pageSize, uint32_t maxBlocks,
+    uint32_t headDim, uint32_t compressRatio, uint32_t nextN,
+    uint32_t kvScoreElemBytes, uint32_t stateElemBytes, uint32_t outElemBytes,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    if (batchSize == 0 || headDim == 0 || compressRatio == 0 || nextN == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("compress_decode");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(kvScore),
+        reinterpret_cast<VkBuffer>(ape),
+        reinterpret_cast<VkBuffer>(pagedKv),
+        reinterpret_cast<VkBuffer>(pagedScore),
+        reinterpret_cast<VkBuffer>(blockTableKv),
+        reinterpret_cast<VkBuffer>(blockTableScore),
+        reinterpret_cast<VkBuffer>(output),
+        reinterpret_cast<VkBuffer>(kvLens),
+        reinterpret_cast<VkBuffer>(cuSeqLens),
+        reinterpret_cast<VkBuffer>(cuKvComp)
+    };
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    int const elem_bytes_for_vec = std::max(int(kvScoreElemBytes), int(stateElemBytes));
+    int const max_vec_elem = 16 / elem_bytes_for_vec;
+    int const vec = (int(headDim) / max_vec_elem >= 32) ? max_vec_elem : (int(headDim) / 32);
+    int const nthrd_base = int(headDim) / vec;
+    int const head_blocks = (nthrd_base > 32) ? (nthrd_base / 32) : 1;
+    int const num_red_warps = (compressRatio == 128 && nextN <= 4) ? 4 : 1;
+    int const nthreads = (nthrd_base / head_blocks) * num_red_warps;
+
+    VkDescriptorBufferInfo bufInfos[10]{};
+    for (uint32_t i = 0; i < 10; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].offset = 0;
+        bufInfos[i].range = VK_WHOLE_SIZE;
+    }
+
+    VkWriteDescriptorSet writes[10]{};
+    for (uint32_t i = 0; i < 10; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 10, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants {
+        int32_t batch_size;
+        int32_t page_size;
+        int32_t head_dim;
+        int32_t compress_ratio;
+        int32_t next_n;
+        int32_t state_elem_bytes;
+        int32_t kv_score_elem_bytes;
+        int32_t out_elem_bytes;
+        int32_t max_blocks;
+    } pc{};
+
+    pc.batch_size = static_cast<int32_t>(batchSize);
+    pc.page_size = static_cast<int32_t>(pageSize);
+    pc.head_dim = static_cast<int32_t>(headDim);
+    pc.compress_ratio = static_cast<int32_t>(compressRatio);
+    pc.next_n = static_cast<int32_t>(nextN);
+    pc.state_elem_bytes = static_cast<int32_t>(stateElemBytes);
+    pc.kv_score_elem_bytes = static_cast<int32_t>(kvScoreElemBytes);
+    pc.out_elem_bytes = static_cast<int32_t>(outElemBytes);
+    pc.max_blocks = static_cast<int32_t>(maxBlocks);
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    vkCmdDispatch(cmdBuf, batchSize, head_blocks, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchCompressPrefill(
+    void* kvScore, void* ape, void* pagedKv, void* pagedScore,
+    void* blockTableKv, void* blockTableScore, void* output,
+    void* kvLens, void* startPos, void* cuSeqLens, void* cuKvComp,
+    uint32_t batchSize, uint32_t pageSize, uint32_t maxBlocks,
+    uint32_t headDim, uint32_t compressRatio, uint32_t maxOutputs,
+    uint32_t kvScoreElemBytes, uint32_t stateElemBytes, uint32_t outElemBytes,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    if (batchSize == 0 || headDim == 0 || compressRatio == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("compress_prefill");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(kvScore),
+        reinterpret_cast<VkBuffer>(ape),
+        reinterpret_cast<VkBuffer>(pagedKv),
+        reinterpret_cast<VkBuffer>(pagedScore),
+        reinterpret_cast<VkBuffer>(blockTableKv),
+        reinterpret_cast<VkBuffer>(blockTableScore),
+        reinterpret_cast<VkBuffer>(output),
+        reinterpret_cast<VkBuffer>(kvLens),
+        reinterpret_cast<VkBuffer>(startPos),
+        reinterpret_cast<VkBuffer>(cuSeqLens),
+        reinterpret_cast<VkBuffer>(cuKvComp)
+    };
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    int const elem_bytes_for_vec = std::max(int(kvScoreElemBytes), int(stateElemBytes));
+    int const max_vec_elem = 16 / elem_bytes_for_vec;
+    int const vec = (int(headDim) / max_vec_elem >= 32) ? max_vec_elem : (int(headDim) / 32);
+    int const nthrd_base = int(headDim) / vec;
+    bool const use_multi_warp = (compressRatio == 128);
+    int const head_blocks = (use_multi_warp && nthrd_base > 32) ? (nthrd_base / 32) : 1;
+    int const num_red_warps = use_multi_warp ? 4 : 1;
+    int const nthreads = (nthrd_base / head_blocks) * num_red_warps;
+
+    VkDescriptorBufferInfo bufInfos[11]{};
+    for (uint32_t i = 0; i < 11; ++i)
+    {
+        bufInfos[i].buffer = buffers[i];
+        bufInfos[i].offset = 0;
+        bufInfos[i].range = VK_WHOLE_SIZE;
+    }
+
+    VkWriteDescriptorSet writes[11]{};
+    for (uint32_t i = 0; i < 11; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 11, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants {
+        int32_t batch_size;
+        int32_t page_size;
+        int32_t head_dim;
+        int32_t compress_ratio;
+        int32_t max_outputs;
+        int32_t kv_score_elem_bytes;
+        int32_t state_elem_bytes;
+        int32_t out_elem_bytes;
+        int32_t max_blocks;
+    } pc{};
+
+    pc.batch_size = static_cast<int32_t>(batchSize);
+    pc.page_size = static_cast<int32_t>(pageSize);
+    pc.head_dim = static_cast<int32_t>(headDim);
+    pc.compress_ratio = static_cast<int32_t>(compressRatio);
+    pc.max_outputs = static_cast<int32_t>(maxOutputs);
+    pc.kv_score_elem_bytes = static_cast<int32_t>(kvScoreElemBytes);
+    pc.state_elem_bytes = static_cast<int32_t>(stateElemBytes);
+    pc.out_elem_bytes = static_cast<int32_t>(outElemBytes);
+    pc.max_blocks = static_cast<int32_t>(maxBlocks);
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    (void)nthreads;
+    vkCmdDispatch(cmdBuf, batchSize, maxOutputs, head_blocks);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchCompressPostproc(
+    void* kvComp, void* rmsWeight, float rmsEps,
+    void* cosSinTable, void* positionIds,
+    int32_t nopeDim, int32_t ropeDim,
+    void* kvCache,
+    void* numOutputs, void* cuKvComp, void* startPos, void* blockOffsets,
+    void* compressedMask,
+    uint32_t batchSize, uint32_t tokensPerBlock, uint32_t headDim,
+    uint32_t maxBlocksPerSeq, uint32_t elemBytes, uint32_t totalTokens,
+    int32_t cacheScaleType, bool rotateActivation,
+    void* quantOutput, void* scaleOutput,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    if (totalTokens == 0 || headDim == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("compress_postproc");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(kvComp),
+        reinterpret_cast<VkBuffer>(rmsWeight),
+        reinterpret_cast<VkBuffer>(cosSinTable),
+        reinterpret_cast<VkBuffer>(positionIds),
+        reinterpret_cast<VkBuffer>(kvCache),
+        reinterpret_cast<VkBuffer>(numOutputs),
+        reinterpret_cast<VkBuffer>(cuKvComp),
+        reinterpret_cast<VkBuffer>(startPos),
+        reinterpret_cast<VkBuffer>(blockOffsets),
+        reinterpret_cast<VkBuffer>(compressedMask),
+        quantOutput ? reinterpret_cast<VkBuffer>(quantOutput) : VK_NULL_HANDLE,
+        scaleOutput ? reinterpret_cast<VkBuffer>(scaleOutput) : VK_NULL_HANDLE
+    };
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    // ponytail: bind valid dummy buffers for optional bindings
+    alignas(4) static uint8_t dummyU8[1] = {0};
+    VkBuffer validBuffers[12];
+    for (int i = 0; i < 12; i++)
+    {
+        validBuffers[i] = buffers[i] ? buffers[i] : reinterpret_cast<VkBuffer>(dummyU8);
+    }
+
+    VkDescriptorBufferInfo bufInfos[12]{};
+    for (uint32_t i = 0; i < 12; ++i)
+    {
+        bufInfos[i].buffer = validBuffers[i];
+        bufInfos[i].offset = 0;
+        bufInfos[i].range = VK_WHOLE_SIZE;
+    }
+
+    VkWriteDescriptorSet writes[12]{};
+    for (uint32_t i = 0; i < 12; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 12, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    int const max_vec_elem = 16 / int(elemBytes);
+    int const vec = (int(headDim) / max_vec_elem >= 32) ? max_vec_elem : (int(headDim) / 32);
+    int const nthreads = int(headDim) / vec;
+
+    struct PushConstants {
+        int32_t total_tokens;
+        int32_t batch_size;
+        int32_t head_dim;
+        int32_t tokens_per_block;
+        int32_t elem_bytes;
+        int32_t cache_scale_type;
+        int32_t max_blocks;
+        int32_t nope_dim;
+        int32_t rope_dim;
+        float   rms_eps;
+        int32_t rotate_activation;
+    } pc{};
+
+    pc.total_tokens = static_cast<int32_t>(totalTokens);
+    pc.batch_size = static_cast<int32_t>(batchSize);
+    pc.head_dim = static_cast<int32_t>(headDim);
+    pc.tokens_per_block = static_cast<int32_t>(tokensPerBlock);
+    pc.elem_bytes = static_cast<int32_t>(elemBytes);
+    pc.cache_scale_type = static_cast<int32_t>(cacheScaleType);
+    pc.max_blocks = static_cast<int32_t>(maxBlocksPerSeq);
+    pc.nope_dim = nopeDim;
+    pc.rope_dim = ropeDim;
+    pc.rms_eps = rmsEps;
+    pc.rotate_activation = rotateActivation ? 1 : 0;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    (void)nthreads;
+    (void)dummyU8;
+    vkCmdDispatch(cmdBuf, totalTokens, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    return VulkanResult::SUCCESS;
+}
+
+VulkanResult VulkanKernelDispatcher::dispatchGatedDeltaRule(
+    void* aLog, void* dtBias, void* a, void* b,
+    void* q, void* k, void* v,
+    void* initialState, void* initIndices, void* output,
+    uint32_t N, uint32_t T, uint32_t H, uint32_t HV, uint32_t V, uint32_t K,
+    bool hasInitialState, bool disableStateUpdate,
+    float scale, float softplusBeta, float softplusThreshold, bool useL2Norm,
+    uint32_t blockSize)
+{
+    if (!mContext || !mKernelRegistry)
+        return VulkanResult::INITIALIZATION_FAILED;
+
+    if (N == 0 || T == 0 || HV == 0 || V == 0 || K == 0)
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    auto variant = mKernelRegistry->getBestVariant("gated_delta_rule");
+    if (!variant || !variant->isValid())
+        return VulkanResult::FEATURE_NOT_PRESENT;
+
+    VkCommandBuffer cmdBuf = acquireCommandBuffer();
+    if (cmdBuf == VK_NULL_HANDLE)
+        return VulkanResult::UNKNOWN_ERROR;
+
+    VkBuffer buffers[] = {
+        reinterpret_cast<VkBuffer>(aLog),
+        reinterpret_cast<VkBuffer>(dtBias),
+        reinterpret_cast<VkBuffer>(a),
+        reinterpret_cast<VkBuffer>(b),
+        reinterpret_cast<VkBuffer>(q),
+        reinterpret_cast<VkBuffer>(k),
+        reinterpret_cast<VkBuffer>(v),
+        reinterpret_cast<VkBuffer>(initialState),
+        reinterpret_cast<VkBuffer>(initIndices),
+        reinterpret_cast<VkBuffer>(output)
+    };
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocateDescriptorSet(variant->setLayout, &set))
+    {
+        submitAndFree(cmdBuf);
+        return VulkanResult::UNKNOWN_ERROR;
+    }
+
+    alignas(4) static uint8_t dummyU8[1] = {0};
+    VkBuffer validBuffers[10];
+    for (int i = 0; i < 10; i++)
+    {
+        validBuffers[i] = buffers[i] ? buffers[i] : reinterpret_cast<VkBuffer>(dummyU8);
+    }
+
+    VkDescriptorBufferInfo bufInfos[10]{};
+    for (uint32_t i = 0; i < 10; ++i)
+    {
+        bufInfos[i].buffer = validBuffers[i];
+        bufInfos[i].offset = 0;
+        bufInfos[i].range = VK_WHOLE_SIZE;
+    }
+
+    VkWriteDescriptorSet writes[10]{};
+    for (uint32_t i = 0; i < 10; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    vkUpdateDescriptorSets(mContext->getDevice(), 10, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            variant->pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, variant->pipeline);
+
+    struct PushConstants {
+        uint32_t N;
+        uint32_t T;
+        uint32_t H;
+        uint32_t HV;
+        uint32_t V;
+        uint32_t K;
+        uint32_t hasInitialState;
+        uint32_t disableStateUpdate;
+        float scale;
+        float softplusBeta;
+        float softplusThreshold;
+        uint32_t useL2Norm;
+    } pc{};
+
+    pc.N = N;
+    pc.T = T;
+    pc.H = H;
+    pc.HV = HV;
+    pc.V = V;
+    pc.K = K;
+    pc.hasInitialState = hasInitialState ? 1u : 0u;
+    pc.disableStateUpdate = disableStateUpdate ? 1u : 0u;
+    pc.scale = scale;
+    pc.softplusBeta = softplusBeta;
+    pc.softplusThreshold = softplusThreshold;
+    pc.useL2Norm = useL2Norm ? 1u : 0u;
+
+    vkCmdPushConstants(cmdBuf, variant->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(PushConstants), &pc);
+
+    (void)blockSize;
+    uint32_t total = N * HV * V;
+    uint32_t gridSize = (total + 255u) / 256u;
+    vkCmdDispatch(cmdBuf, gridSize, 1, 1);
+
+    submitAndFree(cmdBuf);
+    freeDescriptorSet(set);
+
+    (void)dummyU8;
     return VulkanResult::SUCCESS;
 }
 

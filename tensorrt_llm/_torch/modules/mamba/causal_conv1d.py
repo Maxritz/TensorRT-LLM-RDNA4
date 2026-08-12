@@ -18,7 +18,14 @@
 
 from typing import Optional
 
-import torch
+import os as _os
+if _os.environ.get("TLLM_VULKAN_BACKEND", "0") != "1":
+    import torch
+else:
+    import types as _types
+    torch = _types.SimpleNamespace()
+    torch.Tensor = _types.SimpleNamespace
+    torch.float32 = "float32"
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 

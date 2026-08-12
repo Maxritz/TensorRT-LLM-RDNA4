@@ -1,0 +1,70 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Standard LayerNorm with learnable gamma and beta.
+//   mean    = mean(in[token])
+//   var     = mean((in[token] - mean)^2)
+//   out[tid] = (in[tid] - mean) / sqrt(var + eps) * gamma[dim] + beta[dim]
+//
+// Push constants: matches the new tllm_vulkan_layer_norm C API.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC {
+    uint hiddenDim;
+    uint totalElements;
+    float eps;
+} pc;
+
+// binding 0: input     [tokenCount * hiddenDim]
+// binding 1: gamma     [hiddenDim]
+// binding 2: beta      [hiddenDim]
+// binding 3: output    [tokenCount * hiddenDim]
+layout(std430, binding = 0) restrict readonly  buffer BufIn   { float in_[]; };
+layout(std430, binding = 1) restrict readonly  buffer BufGamma { float gamma[]; };
+layout(std430, binding = 2) restrict readonly  buffer BufBeta  { float beta[]; };
+layout(std430, binding = 3)              writeonly buffer BufOut  { float out_[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= pc.totalElements) return;
+
+    uint hiddenDim = pc.hiddenDim;
+    uint token = tid / hiddenDim;
+    uint dim = tid % hiddenDim;
+    uint base = token * hiddenDim;
+
+    // Pass 1: mean over feature dim
+    float mean = 0.0;
+    for (uint k = 0u; k < hiddenDim; ++k) {
+        mean += in_[base + k];
+    }
+    mean /= float(hiddenDim);
+
+    // Pass 2: variance over feature dim
+    float var = 0.0;
+    for (uint k = 0u; k < hiddenDim; ++k) {
+        float d = in_[base + k] - mean;
+        var += d * d;
+    }
+    var /= float(hiddenDim);
+
+    float invStd = 1.0 / sqrt(var + pc.eps);
+    out_[tid] = (in_[tid] - mean) * invStd * gamma[dim] + beta[dim];
+}

@@ -27,13 +27,20 @@ use_fast_build=True to minimize compilation time), then calls into the
 compiled module to verify no symbol collision occurs.
 """
 
+import os
+
 import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops.torch_custom_ops as trt_ops  # noqa: F401
 
+_SKIP_CUDA_FUSED_MOE = os.environ.get("TLLM_VULKAN_BACKEND", "0") == "1"
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or _SKIP_CUDA_FUSED_MOE,
+    reason="CUDA is required",
+)
 def test_flashinfer_cutlass_fused_moe_jit_no_collision():
     """
     JIT-compiling and calling FlashInfer CUTLASS fused-MOE must not crash.

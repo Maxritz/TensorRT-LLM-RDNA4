@@ -23,14 +23,15 @@ from ._bootstrap import _init, _prepare_environment
 # precedence. Must run before torch and before any TensorRT-LLM shared object.
 _prepare_environment()
 
-# Need to import torch before tensorrt_llm library, otherwise some shared binary files
-# cannot be found for the public PyTorch, raising errors like:
-# ImportError: libc10.so: cannot open shared object file: No such file or directory
-import torch  # noqa
-
 _platform = platform.system()
 _on_windows_stub = (_platform == "Windows"
                     and os.environ.get("TLLM_VULKAN_BACKEND", "0") == "1")
+
+if not _on_windows_stub:
+    # Need to import torch before tensorrt_llm library, otherwise some shared
+    # binary files cannot be found for the public PyTorch, raising errors like:
+    # ImportError: libc10.so: cannot open shared object file: No such file or directory
+    import torch  # noqa
 
 if _on_windows_stub:
     # Windows + Vulkan path: C++ bindings and GPU libraries are not available.

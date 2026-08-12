@@ -1,0 +1,335 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Mamba2 MTP SSM Cache Update — Vulkan port of mamba2MTPSSMCacheKernel (mamba2MTPSSMCacheKernel.cuh).
+//
+// Multi-token prediction state-space update over cache_steps timesteps.
+// For each (batch, head, hdim_pair):
+//   - Optionally retrieve parent token state from intermediate_states
+//   - For each cache step t:
+//     1. Compute dt (with optional dt_bias + softplus)
+//     2. Compute dA = exp(A * dt)  (A is scalar per head)
+//     3. Update: state = state * dA + B * (x * dt)
+//     4. Save state to intermediate_states
+//     5. Compute output: out = sum(state * C) + [D*x] + [z*sigmoid(z)*out]
+//
+// Thread model: 128 threads/block (4 warps x 32). Each warp handles 2 hdim positions.
+// VEC_SIZE=4 (float4 per thread, covers 128 ssm_dim elements per warp).
+//
+// GLSL has no __shfl_* — emulated with shared memory + barriers.
+// See dispatchMtpSSMCache in vulkanKernelRegistry.cpp for push constant layout.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+#define MTP_NUM_WARPS 4
+#define MTP_WARP_SIZE 32
+#define MTP_BLOCK_THREADS 128
+#define MTP_HDIMS_PER_WARP 2
+#define VEC_SIZE 4
+
+layout(local_size_x = MTP_BLOCK_THREADS) in;
+
+layout(push_constant, scalar) uniform PC {
+    int  cacheSteps;
+    int  nheads;
+    int  headDim;
+    int  ssmDim;
+    int  ngroups;
+    int  headsGroupsRatio;
+    int  strideNheadsHdimSsmDim;
+    int  strideHdimSsmDim;
+    int  strideCacheNheadsHdim;
+    int  strideNheadsHdim;
+    int  strideCacheNgroupsSsmDim;
+    int  strideNgroupsSsmDim;
+    uint flags;
+    int  padSlotId;
+} pc;
+
+// binding 0: state            [batch, nheads, head_dim, ssm_dim]          (float, rw)
+// binding 1: x               [bs, cache_steps, nheads, head_dim]          (float, r)
+// binding 2: dt              [bs, cache_steps, nheads]                    (float, r)
+// binding 3: A               [nheads]                                     (float, r)
+// binding 4: B               [bs, cache_steps, ngroups, ssm_dim]          (float, r)
+// binding 5: C               [bs, cache_steps, ngroups, ssm_dim]          (float, r)
+// binding 6: out             [bs, cache_steps, nheads, head_dim]          (float, rw)
+// binding 7: intermediate_states [batch, cache_steps, nheads, head_dim, ssm_dim] (float, rw)
+// binding 8: D               [nheads]                                      (float, r, optional)
+// binding 9: z               [bs, cache_steps, nheads, head_dim]          (float, r, optional)
+// binding 10: dt_bias        [nheads]                                      (float, r, optional)
+// binding 11: ssm_batch_indices           [bs]                            (uint, r, optional)
+// binding 12: intermediate_ssm_batch_indices [bs]                         (uint, r, optional)
+// binding 13: retrieve_parent_token       [bs, cache_steps]                (int, r, optional)
+layout(std430, binding = 0)  buffer BufState    { float state[]; };
+layout(std430, binding = 1)  uniform  BufX       { float x[]; };
+layout(std430, binding = 2)  uniform  BufDt      { float dt[]; };
+layout(std430, binding = 3)  uniform  BufA       { float A[]; };
+layout(std430, binding = 4)  uniform  BufB       { float B[]; };
+layout(std430, binding = 5)  uniform  BufC       { float C[]; };
+layout(std430, binding = 6)  buffer BufOut      { float out_[]; };
+layout(std430, binding = 7)  buffer BufInter    { float interStates[]; };
+layout(std430, binding = 8)  uniform  BufD       { float D[]; };
+layout(std430, binding = 9)  uniform  BufZ       { float z[]; };
+layout(std430, binding = 10) uniform  BufDtBias  { float dtBias[]; };
+layout(std430, binding = 11) uniform  BufSsmIdx  { uint ssmBatchIdx[]; };
+layout(std430, binding = 12) uniform  BufInterIdx { uint interSsmBatchIdx[]; };
+layout(std430, binding = 13) uniform  BufParent  { int  parentToken[]; };
+
+#define FLAG_HAS_D               (1u << 0u)
+#define FLAG_HAS_Z               (1u << 1u)
+#define FLAG_HAS_DT_BIAS         (1u << 2u)
+#define FLAG_HAS_SSM_BATCH_IDX   (1u << 3u)
+#define FLAG_HAS_INTER_SSM_IDX   (1u << 4u)
+#define FLAG_HAS_PARENT_TOKEN    (1u << 5u)
+#define FLAG_DT_SOFTPLUS         (1u << 6u)
+#define FLAG_DISABLE_STATE_UPDATE (1u << 7u)
+
+// Shared memory for warp-level broadcast (lane 0 -> all 32 lanes in warp)
+// slot 0 = dtVal (after bias/softplus), slot 1 = xdtA, slot 2 = xdtB
+shared float s_bcast[4][3];
+
+// Shared memory for warp reduction (sum across 32 lanes)
+shared float s_reduce_a[4][32];
+shared float s_reduce_b[4][32];
+
+float thresholdedSoftplus(float v)
+{
+    return (v <= 20.0) ? log(1.0 + exp(v)) : v;
+}
+
+void main()
+{
+    uint tid       = gl_LocalInvocationID.x;
+    uint lane      = tid & 31u;
+    uint warpId    = tid >> 5;
+    uint hdimBlock = gl_WorkGroupID.x;
+    uint headId    = gl_WorkGroupID.y;
+    uint bsId      = gl_WorkGroupID.z;
+
+    uint hdimIdA   = hdimBlock * uint(MTP_NUM_WARPS * MTP_HDIMS_PER_WARP) + warpId * uint(MTP_HDIMS_PER_WARP);
+    uint hdimIdB   = hdimIdA + 1u;
+    uint nhHdimA   = headId * uint(pc.headDim) + hdimIdA;
+    uint nhHdimB   = nhHdimA + 1u;
+
+    // Resolve actual state batch index
+    int stateIdx = (pc.flags & FLAG_HAS_SSM_BATCH_IDX) != 0u
+        ? int(ssmBatchIdx[bsId])
+        : int(bsId);
+
+    if (stateIdx == pc.padSlotId)
+        return;
+
+    int interStateIdx = (pc.flags & FLAG_HAS_INTER_SSM_IDX) != 0u
+        ? int(interSsmBatchIdx[bsId])
+        : stateIdx;
+
+    // Compute base offsets for state
+    uint sBaseA = uint(stateIdx) * uint(pc.strideNheadsHdimSsmDim)
+               + headId * uint(pc.strideHdimSsmDim)
+               + hdimIdA * uint(pc.ssmDim) + lane * uint(VEC_SIZE);
+    uint sBaseB = uint(stateIdx) * uint(pc.strideNheadsHdimSsmDim)
+               + headId * uint(pc.strideHdimSsmDim)
+               + hdimIdB * uint(pc.ssmDim) + lane * uint(VEC_SIZE);
+
+    // Load initial state vectors
+    float stateA[4], stateB[4];
+    for (uint i = 0u; i < uint(VEC_SIZE); i++)
+    {
+        stateA[i] = state[sBaseA + i];
+        stateB[i] = state[sBaseB + i];
+    }
+
+    // Load head-level scalars: A, dt_bias, D (lane 0 only, broadcast via shared)
+    float aVal = 1.0, dtBiasVal = 0.0, dVal = 1.0;
+    if (lane == 0u)
+    {
+        aVal = A[headId];
+        if ((pc.flags & FLAG_HAS_DT_BIAS) != 0u)
+            dtBiasVal = dtBias[headId];
+        if ((pc.flags & FLAG_HAS_D) != 0u)
+            dVal = D[headId];
+    }
+    s_bcast[0][warpId] = aVal;
+    s_bcast[1][warpId] = dtBiasVal;
+    s_bcast[2][warpId] = dVal;
+    barrier();
+    aVal = s_bcast[0][warpId];
+    dtBiasVal = s_bcast[1][warpId];
+    dVal = s_bcast[2][warpId];
+    barrier();
+
+    uint groupIdx = headId / uint(pc.headsGroupsRatio);
+
+    // B and C base (per step offset: + t * strideNgroupsSsmDim)
+    uint bBase = uint(bsId) * uint(pc.strideCacheNgroupsSsmDim)
+               + groupIdx * uint(pc.ssmDim) + lane * uint(VEC_SIZE);
+    uint cBase = uint(bsId) * uint(pc.strideCacheNgroupsSsmDim)
+               + groupIdx * uint(pc.ssmDim) + lane * uint(VEC_SIZE);
+
+    // Intermediate states base
+    uint interBaseA = uint(interStateIdx) * uint(pc.cacheSteps) * uint(pc.strideNheadsHdimSsmDim)
+                    + headId * uint(pc.strideHdimSsmDim)
+                    + hdimIdA * uint(pc.ssmDim) + lane * uint(VEC_SIZE);
+    uint interBaseB = uint(interStateIdx) * uint(pc.cacheSteps) * uint(pc.strideNheadsHdimSsmDim)
+                    + headId * uint(pc.strideHdimSsmDim)
+                    + hdimIdB * uint(pc.ssmDim) + lane * uint(VEC_SIZE);
+
+    // xValA/B are per-thread (only lane 0 writes/reads, matching CUDA registers)
+    float xValA = 0.0, xValB = 0.0;
+
+    // Main cache_steps loop
+    for (int t = 0; t < pc.cacheSteps; t++)
+    {
+        uint tU = uint(t);
+
+        // Retrieve parent token state (from intermediate_states buffer)
+        if ((pc.flags & FLAG_HAS_PARENT_TOKEN) != 0u && t != 0)
+        {
+            int parentStep = parentToken[int(bsId) * pc.cacheSteps + t];
+            if (parentStep >= 0 && parentStep < pc.cacheSteps)
+            {
+                uint pU = uint(parentStep);
+                uint offA = interBaseA + pU * uint(pc.strideNheadsHdimSsmDim);
+                uint offB = interBaseB + pU * uint(pc.strideNheadsHdimSsmDim);
+                for (uint i = 0u; i < uint(VEC_SIZE); i++)
+                {
+                    stateA[i] = interStates[offA + i];
+                    stateB[i] = interStates[offB + i];
+                }
+            }
+        }
+
+        // Load B and C for this step
+        float bVec[4], cVec[4];
+        uint bOff = bBase + tU * uint(pc.strideNgroupsSsmDim);
+        uint cOff = cBase + tU * uint(pc.strideNgroupsSsmDim);
+        for (uint i = 0u; i < uint(VEC_SIZE); i++)
+        {
+            bVec[i] = B[bOff + i];
+            cVec[i] = C[cOff + i];
+        }
+
+        // --- Lane 0 loads dt, x, applies dt_bias + softplus, computes dA and xdt ---
+        {
+            uint xBase = bsId * uint(pc.strideCacheNheadsHdim) + tU * uint(pc.strideNheadsHdim);
+            float dtVal = dt[bsId * uint(pc.cacheSteps) * uint(pc.nheads)
+                              + tU * uint(pc.nheads) + headId];
+
+            if (lane == 0u)
+            {
+                xValA = x[xBase + nhHdimA];
+                xValB = x[xBase + nhHdimB];
+                if ((pc.flags & FLAG_HAS_DT_BIAS) != 0u)
+                    dtVal += dtBiasVal;
+                if ((pc.flags & FLAG_DT_SOFTPLUS) != 0u)
+                    dtVal = thresholdedSoftplus(dtVal);
+            }
+            s_bcast[0][warpId] = dtVal;
+            barrier();
+            dtVal = s_bcast[0][warpId];
+            barrier();
+
+            // Compute xdt and dA — lane 0 computes, broadcasts to warp
+            if (lane == 0u)
+            {
+                s_bcast[1][warpId] = xValA * dtVal;  // xdt_a
+                s_bcast[2][warpId] = xValB * dtVal;  // xdt_b
+            }
+            barrier();
+            float xdtA = s_bcast[1][warpId];
+            float xdtB = s_bcast[2][warpId];
+            barrier();
+
+            float dA = exp(aVal * dtVal);
+
+            // Update state: state = state * dA + B * (x * dt)
+            for (uint i = 0u; i < uint(VEC_SIZE); i++)
+            {
+                stateA[i] = stateA[i] * dA + bVec[i] * xdtA;
+                stateB[i] = stateB[i] * dA + bVec[i] * xdtB;
+            }
+        }
+
+        // Save intermediate states
+        uint interOffA = interBaseA + tU * uint(pc.strideNheadsHdimSsmDim);
+        uint interOffB = interBaseB + tU * uint(pc.strideNheadsHdimSsmDim);
+        for (uint i = 0u; i < uint(VEC_SIZE); i++)
+        {
+            interStates[interOffA + i] = stateA[i];
+            interStates[interOffB + i] = stateB[i];
+        }
+
+        // Compute output: out_val = sum(state * C) per lane -> warp reduce
+        float outA = 0.0, outB = 0.0;
+        for (uint i = 0u; i < uint(VEC_SIZE); i++)
+        {
+            outA += stateA[i] * cVec[i];
+            outB += stateB[i] * cVec[i];
+        }
+
+        // Warp reduction via shared memory (GLSL has no __shfl_down_sync)
+        s_reduce_a[warpId][lane] = outA;
+        s_reduce_b[warpId][lane] = outB;
+        barrier();
+
+        for (uint offset = 16u; offset > 0u; offset >>= 1u)
+        {
+            if (lane < offset)
+            {
+                s_reduce_a[warpId][lane] += s_reduce_a[warpId][lane + offset];
+                s_reduce_b[warpId][lane] += s_reduce_b[warpId][lane + offset];
+            }
+            barrier();
+        }
+
+        // Lane 0 writes output (xValA/B available from above scope)
+        if (lane == 0u)
+        {
+            outA = s_reduce_a[warpId][0];
+            outB = s_reduce_b[warpId][0];
+
+            if ((pc.flags & FLAG_HAS_D) != 0u)
+            {
+                outA += xValA * dVal;
+                outB += xValB * dVal;
+            }
+            if ((pc.flags & FLAG_HAS_Z) != 0u)
+            {
+                uint xBase = bsId * uint(pc.strideCacheNheadsHdim) + tU * uint(pc.strideNheadsHdim);
+                float zValA = z[xBase + nhHdimA];
+                float zValB = z[xBase + nhHdimB];
+                outA *= zValA * (1.0 / (1.0 + exp(0.0 - zValA)));
+                outB *= zValB * (1.0 / (1.0 + exp(0.0 - zValB)));
+            }
+
+            uint outBase = bsId * uint(pc.strideCacheNheadsHdim) + tU * uint(pc.strideNheadsHdim);
+            out_[outBase + nhHdimA] = outA;
+            out_[outBase + nhHdimB] = outB;
+        }
+        barrier();
+    }
+
+    // Write final state back (if not disabled)
+    if ((pc.flags & FLAG_DISABLE_STATE_UPDATE) == 0u)
+    {
+        for (uint i = 0u; i < uint(VEC_SIZE); i++)
+        {
+            state[sBaseA + i] = stateA[i];
+            state[sBaseB + i] = stateB[i];
+        }
+    }
+}

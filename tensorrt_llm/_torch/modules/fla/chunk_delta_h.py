@@ -4,314 +4,128 @@
 
 from typing import Optional, Tuple
 
-import torch
-import triton
-import triton.language as tl
+import numpy as np
 
-from tensorrt_llm._torch.modules.fla.index import (prepare_chunk_indices,
-                                                   prepare_chunk_offsets)
+from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices, prepare_chunk_offsets
 from tensorrt_llm._torch.modules.fla.op import exp, safe_exp
-from tensorrt_llm._torch.modules.fla.utils import is_nvidia_hopper
-
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
-
-
-@triton.heuristics({
-    "USE_G": lambda args: args["g"] is not None,
-    "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-    "USE_INDEXED_STATE": lambda args: args["h0_i"] is not None,
-    "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-    "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
-    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-})
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=nw, num_stages=ns)
-        for nw in NUM_WARPS for ns in [2, 3, 4] for BV in [32, 64]
-    ],
-    key=["H", "K", "V", "BT", "USE_G"],
-)
-@triton.jit(do_not_specialize=["T"])
-def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
-    k,
-    v,
-    w,
-    v_new,
-    g,
-    h,
-    h0,
-    h0_i,
-    ht,
-    cu_seqlens,
-    chunk_offsets,
-    T,
-    stride_h0,
-    H: tl.constexpr,
-    Hg: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    USE_INDEXED_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
-    SAVE_NEW_VALUE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
-    i_n, i_h = i_nh // H, i_nh % H
-    if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(
-            tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-        NT = tl.cdiv(T, BT)
-        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
-    else:
-        bos, eos = i_n * T, i_n * T + T
-        NT = tl.cdiv(T, BT)
-        boh = i_n * NT
-
-    # [BK, BV]
-    b_h1 = tl.zeros([64, BV], dtype=tl.float32)
-    if K > 64:
-        b_h2 = tl.zeros([64, BV], dtype=tl.float32)
-    if K > 128:
-        b_h3 = tl.zeros([64, BV], dtype=tl.float32)
-    if K > 192:
-        b_h4 = tl.zeros([64, BV], dtype=tl.float32)
-
-    # calculate offset
-    h += (boh * H + i_h) * K * V
-    v += (bos * H + i_h) * V
-    k += (bos * Hg + i_h // (H // Hg)) * K
-    w += (bos * H + i_h) * K
-    if SAVE_NEW_VALUE:
-        v_new += (bos * H + i_h) * V
-    stride_v = H * V
-    stride_h = H * K * V
-    stride_k = Hg * K
-    stride_w = H * K
-    if USE_INDEXED_STATE:
-        state_index = tl.load(h0_i + i_n).to(tl.int64)
-        h0 = h0 + state_index * stride_h0
-        ht = h0
-    if USE_INITIAL_STATE:
-        h0 = h0 + ((i_h if USE_INDEXED_STATE else i_nh) * K * V)
-    if STORE_FINAL_STATE:
-        ht = ht + i_nh * K * V
-    elif USE_INDEXED_STATE:
-        ht = ht + i_h * K * V
-
-    # load initial state
-    # Pool layout [slots, HV, V, K], K innermost: logical block (K, V) but K has
-    # stride 1, V has stride K, order=(0, 1) so Triton treats K as innermost.
-    if USE_INITIAL_STATE:
-        p_h0_1 = tl.make_block_ptr(h0, (K, V), (1, K), (0, i_v * BV), (64, BV),
-                                   (0, 1))
-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
-        if K > 64:
-            p_h0_2 = tl.make_block_ptr(h0, (K, V), (1, K), (64, i_v * BV),
-                                       (64, BV), (0, 1))
-            b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
-        if K > 128:
-            p_h0_3 = tl.make_block_ptr(h0, (K, V), (1, K), (128, i_v * BV),
-                                       (64, BV), (0, 1))
-            b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
-        if K > 192:
-            p_h0_4 = tl.make_block_ptr(h0, (K, V), (1, K), (192, i_v * BV),
-                                       (64, BV), (0, 1))
-            b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
-
-    # main recurrence
-    for i_t in range(NT):
-        p_h1 = tl.make_block_ptr(h + i_t * stride_h, (K, V), (V, 1),
-                                 (0, i_v * BV), (64, BV), (1, 0))
-        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_h2 = tl.make_block_ptr(h + i_t * stride_h, (K, V), (V, 1),
-                                     (64, i_v * BV), (64, BV), (1, 0))
-            tl.store(p_h2,
-                     b_h2.to(p_h2.dtype.element_ty),
-                     boundary_check=(0, 1))
-        if K > 128:
-            p_h3 = tl.make_block_ptr(h + i_t * stride_h, (K, V), (V, 1),
-                                     (128, i_v * BV), (64, BV), (1, 0))
-            tl.store(p_h3,
-                     b_h3.to(p_h3.dtype.element_ty),
-                     boundary_check=(0, 1))
-        if K > 192:
-            p_h4 = tl.make_block_ptr(h + i_t * stride_h, (K, V), (V, 1),
-                                     (192, i_v * BV), (64, BV), (1, 0))
-            tl.store(p_h4,
-                     b_h4.to(p_h4.dtype.element_ty),
-                     boundary_check=(0, 1))
-
-        p_v = tl.make_block_ptr(v, (T, V), (stride_v, 1), (i_t * BT, i_v * BV),
-                                (BT, BV), (1, 0))
-        p_v_new = (tl.make_block_ptr(v_new, (T, V), (stride_v, 1),
-                                     (i_t * BT, i_v * BV), (BT, BV),
-                                     (1, 0)) if SAVE_NEW_VALUE else None)
-        b_v_new = tl.zeros([BT, BV], dtype=tl.float32)
-        p_w = tl.make_block_ptr(w, (T, K), (stride_w, 1), (i_t * BT, 0),
-                                (BT, 64), (1, 0))
-        b_w = tl.load(p_w, boundary_check=(0, 1))
-        b_v_new += tl.dot(b_w, b_h1.to(b_w.dtype))
-        if K > 64:
-            p_w = tl.make_block_ptr(w, (T, K), (stride_w, 1), (i_t * BT, 64),
-                                    (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v_new += tl.dot(b_w, b_h2.to(b_w.dtype))
-        if K > 128:
-            p_w = tl.make_block_ptr(w, (T, K), (stride_w, 1), (i_t * BT, 128),
-                                    (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v_new += tl.dot(b_w, b_h3.to(b_w.dtype))
-        if K > 192:
-            p_w = tl.make_block_ptr(w, (T, K), (stride_w, 1), (i_t * BT, 192),
-                                    (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v_new += tl.dot(b_w, b_h4.to(b_w.dtype))
-        b_v_new = -b_v_new + tl.load(p_v, boundary_check=(0, 1))
-
-        if SAVE_NEW_VALUE:
-            p_v_new = tl.make_block_ptr(v_new, (T, V), (stride_v, 1),
-                                        (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            tl.store(p_v_new,
-                     b_v_new.to(p_v_new.dtype.element_ty),
-                     boundary_check=(0, 1))
-
-        if USE_G:
-            last_idx = min((i_t + 1) * BT, T) - 1
-            b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
-            p_g = tl.make_block_ptr(g + bos * H + i_h, (T, ), (H, ),
-                                    (i_t * BT, ), (BT, ), (0, ))
-            b_g = tl.load(p_g, boundary_check=(0, ))
-            b_v_new = b_v_new * safe_exp(b_g_last - b_g)[:, None]
-            b_g_last = exp(b_g_last)
-            b_h1 = b_h1 * b_g_last
-            if K > 64:
-                b_h2 = b_h2 * b_g_last
-            if K > 128:
-                b_h3 = b_h3 * b_g_last
-            if K > 192:
-                b_h4 = b_h4 * b_g_last
-        b_v_new = b_v_new.to(k.dtype.element_ty)
-        p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (0, i_t * BT),
-                                (64, BT), (0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h1 += tl.dot(b_k, b_v_new)
-        if K > 64:
-            p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (64, i_t * BT),
-                                    (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h2 += tl.dot(b_k, b_v_new)
-        if K > 128:
-            p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (128, i_t * BT),
-                                    (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h3 += tl.dot(b_k, b_v_new)
-        if K > 192:
-            p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (192, i_t * BT),
-                                    (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h4 += tl.dot(b_k, b_v_new)
-
-    # epilogue — write final state back to pool-layout [slots, HV, V, K].
-    if STORE_FINAL_STATE or USE_INDEXED_STATE:
-        p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (0, i_v * BV), (64, BV),
-                                 (0, 1))
-        tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (64, i_v * BV),
-                                     (64, BV), (0, 1))
-            tl.store(p_ht,
-                     b_h2.to(p_ht.dtype.element_ty),
-                     boundary_check=(0, 1))
-        if K > 128:
-            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (128, i_v * BV),
-                                     (64, BV), (0, 1))
-            tl.store(p_ht,
-                     b_h3.to(p_ht.dtype.element_ty),
-                     boundary_check=(0, 1))
-        if K > 192:
-            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (192, i_v * BV),
-                                     (64, BV), (0, 1))
-            tl.store(p_ht,
-                     b_h4.to(p_ht.dtype.element_ty),
-                     boundary_check=(0, 1))
 
 
 def chunk_gated_delta_rule_fwd_h(
-    k: torch.Tensor,
-    w: torch.Tensor,
-    u: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    initial_state: Optional[torch.Tensor] = None,
-    initial_state_indices: Optional[torch.Tensor] = None,
+    k: np.ndarray,
+    w: np.ndarray,
+    u: np.ndarray,
+    g: Optional[np.ndarray] = None,
+    initial_state: Optional[np.ndarray] = None,
+    initial_state_indices: Optional[np.ndarray] = None,
     output_final_state: bool = False,
     inplace_indexed_state_update: bool = False,
-    chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
+    chunk_size: int = 64,
     save_new_value: bool = True,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, T, Hg, K, V = *k.shape, u.shape[-1]
+    cu_seqlens: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Forward pass of the chunk-wise gated linear attention recurrence.
+    
+    Computes:
+      - h[b, t, h, k, v]: intermediate state matrix
+      - v_new: updated values
+      - final_state: final state if output_final_state=True
+    """
+    B, T, Hg, K = k.shape
     H = u.shape[-2]
+    V = u.shape[-1]
     BT = chunk_size
 
     chunk_indices = (prepare_chunk_indices(cu_seqlens, chunk_size)
                      if cu_seqlens is not None else None)
-    # N: the actual number of sequences in the batch with either equal or variable lengths
     if cu_seqlens is None:
-        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
+        N, NT, chunk_offsets = B, (T + BT - 1) // BT, None
     else:
         N, NT, chunk_offsets = (
             len(cu_seqlens) - 1,
             len(chunk_indices),
             prepare_chunk_offsets(cu_seqlens, BT),
         )
-    assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, K, V)
+    h = np.zeros((B, NT, H, K, V), dtype=np.float32)
     use_indexed_state = initial_state is not None and initial_state_indices is not None
     if use_indexed_state and not inplace_indexed_state_update:
         raise ValueError(
             "Indexed chunk state updates require inplace_indexed_state_update=True."
         )
     store_final_state_in_kernel = output_final_state and not use_indexed_state
-    # Kernel writes final state in [V, K] layout (K innermost) to match the
-    # pool layout. Allocate accordingly so the tensor's shape reflects memory.
-    final_state = (k.new_empty(N, H, V, K, dtype=torch.float32)
+    final_state = (np.zeros((N, H, V, K), dtype=np.float32)
                    if store_final_state_in_kernel else None)
 
-    v_new = torch.empty_like(u) if save_new_value else None
+    v_new = np.empty_like(u, dtype=np.float32) if save_new_value else None
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), N * H)
+    # Process each sequence and chunk
+    for b in range(B if cu_seqlens is None else 1):
+        seq_b = b if cu_seqlens is None else 0
+        T_seq = T if cu_seqlens is None else cu_seqlens[b + 1] - cu_seqlens[b] if cu_seqlens is not None else T
+        bos = 0 if cu_seqlens is None else cu_seqlens[b]
+        eos = T_seq if cu_seqlens is None else cu_seqlens[b + 1]
+        
+        if cu_seqlens is not None:
+            nt_seq = (T_seq + BT - 1) // BT
+        else:
+            nt_seq = NT
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
-        k=k,
-        v=u,
-        w=w,
-        v_new=v_new,
-        g=g,
-        h=h,
-        h0=initial_state,
-        h0_i=initial_state_indices,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_offsets=chunk_offsets,
-        T=T,
-        stride_h0=initial_state.stride(0) if initial_state is not None else 0,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-    )
+        for i_h in range(H):
+            hg = i_h // (H // Hg) if H > Hg else i_h
+            
+            # Initial state
+            b_h = np.zeros((K, V), dtype=np.float32)
+            if initial_state is not None:
+                if use_indexed_state:
+                    slot = initial_state_indices[seq_b]
+                    if store_final_state_in_kernel:
+                        b_h = initial_state[slot, i_h].astype(np.float32)
+                    else:
+                        b_h = initial_state[seq_b, i_h].astype(np.float32)
+                else:
+                    b_h = initial_state[seq_b, i_h].astype(np.float32)
+
+            for i_t in range(nt_seq):
+                ts = i_t * BT
+                te = min(ts + BT, T_seq) if cu_seqlens is None else min(bos + ts + BT, eos)
+                cur_T = te - ts if cu_seqlens is None else min(ts + BT, T_seq)
+                
+                # Store current h
+                h[seq_b, i_t, i_h] = b_h
+
+                # Load v, w, k for this chunk
+                v_chunk = u[seq_b, ts:ts + cur_T if cu_seqlens is None else bos + ts:bos + te, i_h, :].astype(np.float32)
+                w_chunk = w[seq_b, ts:ts + cur_T if cu_seqlens is None else bos + ts:bos + te, i_h, :].astype(np.float32)
+                k_chunk = k[seq_b, ts:ts + cur_T if cu_seqlens is None else bos + ts:bos + te, hg, :].astype(np.float32)
+                if g is not None:
+                    g_chunk = g[seq_b, ts:ts + cur_T if cu_seqlens is None else bos + ts:bos + te, i_h].astype(np.float32)
+
+                # Compute v_new
+                b_v_new = v_chunk - w_chunk @ b_h  # (cur_T, V) - (cur_T, K) @ (K, V)
+                
+                if save_new_value:
+                    # v_new shape: (B, T, H, V)
+                    v_new[seq_b, ts if cu_seqlens is None else bos + ts:ts if cu_seqlens is None else bos + te, i_h, :] = b_v_new
+
+                # Compute new h
+                beta_chunk = 1.0  # beta is absorbed into w already
+                
+                # h_new = b_h + k^T @ v_new
+                b_h = b_h + k_chunk.T @ b_v_new
+
+                if g is not None:
+                    g_last = g_chunk[-1]
+                    g_last_exp = exp(g_last)
+                    b_h = b_h * g_last_exp
+                    
+                    # v_new also gets scaled
+                    g_decay = np.exp(g_chunk[-1] - g_chunk)
+                    b_v_new = b_v_new * g_decay[:, None]
+
     if output_final_state and use_indexed_state:
-        # The indexed kernel path updates h0 in-place, so returning
-        # the final state means gathering those updated slots back out.
-        final_state = initial_state.index_select(
-            0, initial_state_indices.to(torch.long))
+        final_state = np.zeros((N, H, V, K), dtype=np.float32)
+        for i in range(N):
+            slot = initial_state_indices[i]
+            final_state[i] = initial_state[slot].astype(np.float32)
+    
     return h, v_new, final_state

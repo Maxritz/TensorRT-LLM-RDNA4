@@ -13,10 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import List
+import os as _os
 
-import torch
-from strenum import StrEnum
-from torch.distributed import ProcessGroup
+if _os.environ.get("TLLM_VULKAN_BACKEND", "0") != "1":
+    import torch
+    from torch.distributed import ProcessGroup
+    from strenum import StrEnum
+else:
+    torch = None  # type: ignore[assignment]
+    ProcessGroup = None  # type: ignore[assignment]
+    from enum import StrEnum  # fallback for non-torch path
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._utils import mpi_disabled

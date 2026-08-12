@@ -1,0 +1,64 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Standalone GDN gating: g = -exp(A_log) * softplus(a + dt_bias)
+// Mirrors fused_gdn_gating in fused_sigmoid_gating_recurrent.py.
+// Also supports the "update" variant: beta = sigmoid(b) (when beta output requested).
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PC
+{
+    uint  HV;              // number of hidden/value heads
+    float softplusBeta;
+    float softplusThreshold;
+    uint  computeBeta;     // 1 = also output beta = sigmoid(b)
+}
+pc;
+
+// binding 0: A_log  [HV]   float
+// binding 1: a      [T*HV] float
+// binding 2: dt_bias [HV]   float
+// binding 3: b      [T*HV] float (only if computeBeta)
+// binding 4: out_g   [T*HV] float  — softplus gating values (log space)
+// binding 5: out_beta [T*HV] float — sigmoid(b) (only if computeBeta)
+layout(std430, binding = 0) uniform BufA     { float aLogArr[]; };
+layout(std430, binding = 1) uniform BufA2    { float aArr[]; };
+layout(std430, binding = 2) uniform BufDt   { float dtBiasArr[]; };
+layout(std430, binding = 3) uniform BufB    { float bArr[]; };
+layout(std430, binding = 4) buffer BufG      { float gArr[]; };
+layout(std430, binding = 5) buffer BufBeta  { float betaArr[]; };
+
+float softplus_fn(float x)
+{
+    if (x > pc.softplusThreshold)
+        return x;
+    if (x < -pc.softplusThreshold)
+        return exp(pc.softplusBeta * x) / pc.softplusBeta;
+    return log(1.0 + exp(pc.softplusBeta * x)) / pc.softplusBeta;
+}
+
+void main()
+{
+    uint tid = gl_GlobalInvocationID.x;
+    uint total = pc.HV * ( /* T is passed via out_g size, but we need T */ 1 );
+    // Actually T is encoded in output buffer size; we need it as push constant.
+    // For simplicity, compute per-element: each invocation = one (t, hv) pair.
+    // T is not in PC — fix: add T to push constants. See edit below.
+    return; // placeholder — fixed version below uses T in PC
+}

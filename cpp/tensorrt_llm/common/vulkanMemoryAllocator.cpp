@@ -244,6 +244,12 @@ bool VulkanMemoryManager::initialize()
         0xFFFFFFFF,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
+    // Find memory type that is BOTH device-local and host-visible (ReBAR / unified)
+    mHostVisibleDeviceLocalType = findMemoryType(
+        memProperties,
+        0xFFFFFFFF,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
     // Create memory pools
     if (deviceLocalType != UINT32_MAX)
     {
@@ -317,8 +323,22 @@ VulkanResult VulkanMemoryManager::malloc(size_t byteCount, void** pPtr, bool dev
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = byteCount;
 
-        uint32_t memType = deviceLocal ? findMemoryType(0xFFFFFFFF, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-                                       : findMemoryType(0xFFFFFFFF, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        uint32_t memType;
+        bool useHostVisibleDeviceLocal = false;
+
+        if (deviceLocal && mHostVisibleDeviceLocalType != UINT32_MAX)
+        {
+            // Prefer DEVICE_LOCAL + HOST_VISIBLE (ReBAR) — enables direct
+            // memcpy without staging buffer + GPU copy, avoiding timeouts on
+            // large transfers (e.g. 544 MB lm_head weights on AMD RX 9070 XT).
+            memType = mHostVisibleDeviceLocalType;
+            useHostVisibleDeviceLocal = true;
+        }
+        else
+        {
+            memType = deviceLocal ? findMemoryType(0xFFFFFFFF, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                                  : findMemoryType(0xFFFFFFFF, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        }
 
         if (memType == UINT32_MAX)
         {
@@ -337,6 +357,19 @@ VulkanResult VulkanMemoryManager::malloc(size_t byteCount, void** pPtr, bool dev
         allocation.size = byteCount;
         allocation.memoryTypeIndex = memType;
         allocation.alignment = alignment;
+
+        // Persistently map host-visible device-local memory so memcpyHtoD
+        // can bypass the staging buffer entirely.
+        if (useHostVisibleDeviceLocal)
+        {
+            vkRes = vkMapMemory(mContext->getDevice(), allocation.memory, 0, byteCount, 0, &allocation.mappedPtr);
+            if (vkRes != VK_SUCCESS)
+            {
+                vkFreeMemory(mContext->getDevice(), allocation.memory, nullptr);
+                return VulkanRuntime::translateVkResult(vkRes);
+            }
+            allocation.isPersistentMapped = true;
+        }
     }
 
     // Create a buffer object for this memory
@@ -411,6 +444,10 @@ VulkanResult VulkanMemoryManager::free(void* ptr)
     }
     else
     {
+        if (info.allocation.isPersistentMapped && info.allocation.mappedPtr != nullptr)
+        {
+            vkUnmapMemory(mContext->getDevice(), info.allocation.memory);
+        }
         vkFreeMemory(mContext->getDevice(), info.allocation.memory, nullptr);
     }
 

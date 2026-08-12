@@ -1,17 +1,34 @@
 from functools import wraps
 from typing import TYPE_CHECKING, List
 
-import torch
-import torch.distributed as dist
-from torch.distributed import ProcessGroup
-try:
-    from torch.distributed import get_process_group_ranks
-except ImportError:
-    def get_process_group_ranks(pg):
-        return list(range(dist.get_world_size(pg) if pg is not None else 1))
-try:
-    from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
-except ImportError:
+import os as _os
+_VK_BACKEND = _os.environ.get("TLLM_VULKAN_BACKEND", "0") == "1"
+if not _VK_BACKEND:
+    import torch
+    import torch.distributed as dist
+    from torch.distributed import ProcessGroup
+    try:
+        from torch.distributed import get_process_group_ranks
+    except ImportError:
+        def get_process_group_ranks(pg):
+            return list(range(dist.get_world_size(pg) if pg is not None else 1))
+    try:
+        from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
+    except ImportError:
+        init_device_mesh = None
+        DeviceMesh = type("DeviceMesh", (), {})
+else:
+    import types as _types
+    torch = _types.SimpleNamespace()
+    torch.compiler = _types.SimpleNamespace()
+    torch.compiler.disable = lambda *a, **kw: (lambda f: f) if not a or not callable(a[0]) else a[0]
+    torch.library = _types.SimpleNamespace()
+    torch.library.custom_op = lambda name, *a, **kw: (lambda f: f)
+    dist = _types.SimpleNamespace()
+    dist.DeviceMesh = type("DeviceMesh", (), {})
+    dist.get_rank = lambda: 0
+    ProcessGroup = None
+    get_process_group_ranks = None
     init_device_mesh = None
     DeviceMesh = type("DeviceMesh", (), {})
 

@@ -2,31 +2,25 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/index.py
 # -*- coding: utf-8 -*-
 
-import torch
-import triton
+from typing import Optional
 
-from tensorrt_llm._torch.modules.fla.utils import tensor_cache
+import numpy as np
 
 
-@tensor_cache
-def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
+def prepare_lens(cu_seqlens: np.ndarray) -> np.ndarray:
     return cu_seqlens[1:] - cu_seqlens[:-1]
 
 
-@tensor_cache
-def prepare_chunk_indices(cu_seqlens: torch.LongTensor,
-                          chunk_size: int) -> torch.LongTensor:
-    indices = torch.cat([
-        torch.arange(n)
-        for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
-    ])
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+def prepare_chunk_indices(cu_seqlens: np.ndarray,
+                      chunk_size: int) -> np.ndarray:
+    lens = prepare_lens(cu_seqlens)
+    nt = (lens + chunk_size - 1) // chunk_size
+    indices = np.concatenate([np.arange(n) for n in nt.tolist()])
+    return np.stack([np.cumsum(indices == 0) - 1, indices], axis=1).astype(cu_seqlens.dtype)
 
 
-@tensor_cache
-def prepare_chunk_offsets(cu_seqlens: torch.LongTensor,
-                          chunk_size: int) -> torch.LongTensor:
-    return torch.cat([
-        cu_seqlens.new_tensor([0]),
-        triton.cdiv(prepare_lens(cu_seqlens), chunk_size)
-    ]).cumsum(-1)
+def prepare_chunk_offsets(cu_seqlens: np.ndarray,
+                      chunk_size: int) -> np.ndarray:
+    lens = prepare_lens(cu_seqlens)
+    nt = (lens + chunk_size - 1) // chunk_size
+    return np.concatenate([np.array([0], dtype=cu_seqlens.dtype), nt]).cumsum(-1)

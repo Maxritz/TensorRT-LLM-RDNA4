@@ -4,163 +4,132 @@
 
 from typing import Optional
 
-import torch
-import triton
-import triton.language as tl
+import numpy as np
 
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
 from tensorrt_llm._torch.modules.fla.op import exp, safe_exp
-from tensorrt_llm._torch.modules.fla.utils import (check_shared_mem,
-                                                   is_nvidia_hopper)
-
-BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
-
-
-@triton.heuristics({
-    "USE_G": lambda args: args["g"] is not None,
-    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-})
-@triton.autotune(
-    configs=[
-        triton.Config({
-            "BK": BK,
-            "BV": BV
-        }, num_warps=nw, num_stages=ns) for BK in BKV_LIST for BV in BKV_LIST
-        for nw in NUM_WARPS for ns in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT"],
-)
-@triton.jit(do_not_specialize=["T"])
-def chunk_fwd_kernel_o(
-    q,
-    k,
-    v,
-    h,
-    g,
-    o,
-    cu_seqlens,
-    chunk_indices,
-    scale,
-    T,
-    H: tl.constexpr,
-    Hg: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
-
-    if IS_VARLEN:
-        i_tg = i_t
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(
-            tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(
-            tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-        NT = tl.cdiv(T, BT)
-    else:
-        NT = tl.cdiv(T, BT)
-        i_tg = i_b * NT + i_t
-        bos, eos = i_b * T, i_b * T + T
-
-    # offset calculation
-    q += (bos * Hg + i_h // (H // Hg)) * K
-    k += (bos * Hg + i_h // (H // Hg)) * K
-    v += (bos * H + i_h) * V
-    o += (bos * H + i_h) * V
-    h += (i_tg * H + i_h).to(tl.int64) * K * V
-
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
-
-    for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK),
-                                (BT, BK), (1, 0))
-        p_k = tl.make_block_ptr(k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT),
-                                (BK, BT), (0, 1))
-        p_h = tl.make_block_ptr(h, (K, V), (V, 1), (i_k * BK, i_v * BV),
-                                (BK, BV), (1, 0))
-        # [BT, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        # [BK, BT]
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BK, BV]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
-
-        # [BT, BK] @ [BK, BV] -> [BT, BV]
-        b_o += tl.dot(b_q, b_h)
-        # [BT, BK] @ [BK, BT] -> [BT, BT]
-        b_A += tl.dot(b_q, b_k)
-
-    if USE_G:
-        g += bos * H + i_h
-        p_g = tl.make_block_ptr(g, (T, ), (H, ), (i_t * BT, ), (BT, ), (0, ))
-        b_g = tl.load(p_g, boundary_check=(0, ))
-        b_o = b_o * exp(b_g)[:, None]
-        b_A = b_A * safe_exp(b_g[:, None] - b_g[None, :])
-
-    o_i = tl.arange(0, BT)
-    m_A = o_i[:, None] >= o_i[None, :]
-    b_A = tl.where(m_A, b_A, 0)
-
-    p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_t * BT, i_v * BV),
-                            (BT, BV), (1, 0))
-    p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (i_t * BT, i_v * BV),
-                            (BT, BV), (1, 0))
-    b_v = tl.load(p_v, boundary_check=(0, 1))
-
-    # to fix mma -> mma layout conversion
-    # already solved by triton v3.2 or higher
-    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_fwd_o(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    h: torch.Tensor,
-    g: Optional[torch.Tensor] = None,  # cumsum of log decay
+    q: np.ndarray,
+    k: np.ndarray,
+    v: np.ndarray,
+    h: np.ndarray,
+    g: Optional[np.ndarray] = None,
     scale: Optional[float] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens: Optional[np.ndarray] = None,
     chunk_size: int = 64,
-    output: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    B, T, Hg, K, V = *q.shape, v.shape[-1]
+    output: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Compute chunk-wise output: o = scale * q @ h + scale * (triangular_mask * (q @ k^T)) @ v
+    
+    q: [B, T, H_q, K]
+    k: [B, T, H_q, K]
+    v: [B, T, H_v, V]
+    h: [B, NT, H, K, V] — intermediate state
+    g: [B, T, H] — cumulative log decay
+    """
+    B, T, Hg, K = q.shape
     H = v.shape[-2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    V = v.shape[-1]
+    
+    BT = min(chunk_size, max(16, 2 ** ((T - 1).bit_length() if T > 0 else 1)))
+    if T > 0:
+        BT_actual = min(chunk_size, T)
+    else:
+        BT_actual = chunk_size
+    BT = min(chunk_size, 2 ** ((T - 1).bit_length() if T > 0 else 0)) if T > 0 else chunk_size
+    BT = min(chunk_size, 2 ** max(4, (T - 1).bit_length())) if T > 0 else chunk_size
+    # Simpler: just use chunk_size
+    BT = chunk_size
+    
     chunk_indices = (prepare_chunk_indices(cu_seqlens, BT)
                      if cu_seqlens is not None else None)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    NT = (T + BT - 1) // BT if cu_seqlens is None else len(chunk_indices)
+    
     if scale is None:
-        scale = k.shape[-1]**-0.5
+        scale = K ** -0.5
 
-    o = output if output is not None else torch.empty_like(v)
+    o = output if output is not None else np.empty_like(v, dtype=np.float32)
+    o = o.astype(np.float32)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
-
-    chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-    )
+    if cu_seqlens is None:
+        for i_t in range(NT):
+            ts = i_t * BT
+            te = min(ts + BT, T)
+            cur_BT = te - ts
+            
+            for b in range(B):
+                for hv in range(H):
+                    h_idx = i_t  # chunk index for this sequence
+                    h_block = h[b, h_idx, hv].astype(np.float32)  # (K, V)
+                    
+                    q_chunk = q[b, ts:te, hv if Hg <= H else 0, :].astype(np.float32)  # (cur_BT, K)
+                    k_chunk = k[b, ts:te, hv if Hg <= H else 0, :].astype(np.float32)  # (cur_BT, K)
+                    v_chunk = v[b, ts:te, hv, :].astype(np.float32)  # (cur_BT, V)
+                    
+                    # First term: q @ h -> (cur_BT, V)
+                    o_term1 = q_chunk @ h_block  # (cur_BT, K) @ (K, V) = (cur_BT, V)
+                    
+                    # Second term: (triu(q @ k^T) * scale) @ v
+                    A = q_chunk @ k_chunk.T  # (cur_BT, cur_BT)
+                    mask = np.arange(cur_BT)[:, None] >= np.arange(cur_BT)[None, :]
+                    A = np.where(mask, A, 0.0)
+                    
+                    if g is not None:
+                        g_chunk = g[b, ts:te, hv].astype(np.float32)
+                        g_diff = g_chunk[:, None] - g_chunk[None, :]
+                        exp_diff = safe_exp(g_diff)
+                        A = A * exp_diff
+                    
+                    o_term2 = A @ v_chunk  # (cur_BT, V)
+                    
+                    # b_g scaling
+                    if g is not None:
+                        g_chunk = g[b, ts:te, hv].astype(np.float32)
+                        g_exp = exp(g_chunk)
+                        o_term1 = o_term1 * g_exp[:, None]
+                    
+                    o[b, ts:te, hv, :] = (o_term1 + o_term2) * scale
+    else:
+        for i_n in range(len(cu_seqlens) - 1):
+            bos = cu_seqlens[i_n]
+            eos = cu_seqlens[i_n + 1]
+            T_seq = eos - bos
+            
+            nt = (T_seq + BT - 1) // BT
+            for i_t in range(nt):
+                ts = i_t * BT
+                te = min(ts + BT, T_seq)
+                cur_BT = te - ts
+                
+                for hv in range(H):
+                    h_idx = i_t
+                    h_block = h[0, h_idx, hv].astype(np.float32)
+                    
+                    q_chunk = q[0, bos + ts:bos + te, hv if Hg <= H else 0, :].astype(np.float32)
+                    k_chunk = k[0, bos + ts:bos + te, hv if Hg <= H else 0, :].astype(np.float32)
+                    v_chunk = v[0, bos + ts:bos + te, hv, :].astype(np.float32)
+                    
+                    o_term1 = q_chunk @ h_block
+                    A = q_chunk @ k_chunk.T
+                    mask = np.arange(cur_BT)[:, None] >= np.arange(cur_BT)[None, :]
+                    A = np.where(mask, A, 0.0)
+                    
+                    if g is not None:
+                        g_chunk = g[0, bos + ts:bos + te, hv].astype(np.float32)
+                        g_diff = g_chunk[:, None] - g_chunk[None, :]
+                        exp_diff = safe_exp(g_diff)
+                        A = A * exp_diff
+                        g_chunk = g[0, bos + ts:bos + te, hv].astype(np.float32)
+                        g_exp = exp(g_chunk)
+                        o_term1 = o_term1 * g_exp[:, None]
+                    
+                    o_term2 = A @ v_chunk
+                    o[0, bos + ts:bos + te, hv, :] = (o_term1 + o_term2) * scale
+    
+    if output is not None:
+        np.copyto(output.astype(np.float32), o)
+        return output
     return o

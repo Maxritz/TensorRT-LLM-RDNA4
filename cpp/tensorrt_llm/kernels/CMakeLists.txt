@@ -15,29 +15,30 @@
 # the License.
 #
 
-add_subdirectory(cutlass_kernels)
-add_subdirectory(cuteDslKernels)
-add_subdirectory(flashMLA)
-add_subdirectory(contextFusedMultiHeadAttention)
-add_subdirectory(decoderMaskedMultiheadAttention)
-add_subdirectory(selectiveScan)
-add_subdirectory(userbuffers)
-add_subdirectory(trtllmGenKernels)
-add_subdirectory(fusedLayernormKernels)
-add_subdirectory(groupRmsNormKernels)
-add_subdirectory(llama4MinLatencyKernels)
-add_subdirectory(dsv3MinLatencyKernels)
-add_subdirectory(causalConv1d)
-add_subdirectory(fusedGatedRMSNormQuant)
-add_subdirectory(mamba2MTPSSMCache)
-add_subdirectory(kdaDecode)
-add_subdirectory(kimiK3AttnRes)
-add_subdirectory(mhcKernels)
-add_subdirectory(compressorKernels)
-
-if(ENABLE_VULKAN)
-  add_subdirectory(vulkan)
+if(CUDA_FOUND AND CMAKE_CUDA_COMPILER)
+  add_subdirectory(cutlass_kernels)
+  add_subdirectory(cuteDslKernels)
+  add_subdirectory(flashMLA)
+  add_subdirectory(contextFusedMultiHeadAttention)
+  add_subdirectory(decoderMaskedMultiHeadAttention)
+  add_subdirectory(selectiveScan)
+  add_subdirectory(userbuffers)
+  add_subdirectory(trtllmGenKernels)
+  add_subdirectory(fusedLayernormKernels)
+  add_subdirectory(groupRmsNormKernels)
+  add_subdirectory(llama4MinLatencyKernels)
+  add_subdirectory(dsv3MinLatencyKernels)
+  add_subdirectory(causalConv1d)
+  add_subdirectory(fusedGatedRMSNormQuant)
+  add_subdirectory(mamba2MTPSSMCache)
+  add_subdirectory(kdaDecode)
+  add_subdirectory(kimiK3AttnRes)
+  add_subdirectory(mhcKernels)
+  add_subdirectory(compressorKernels)
+  add_subdirectory(xqa)
 endif()
+
+add_subdirectory(vulkan)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
@@ -111,19 +112,26 @@ if(MARLIN_SRC)
   set_cuda_architectures(marlin_src 89 90)
 endif()
 
-add_library(
-  kernels_src STATIC
-  ${SRC_CPP} ${SRC_CU}
-  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>)
+if(CUDA_FOUND AND CMAKE_CUDA_COMPILER)
+  set(KERNELS_SRC ${SRC_CPP} ${SRC_CU}
+      $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>)
+  set(KERNELS_CUDA_INCLUDES
+      $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>)
+  set(KERNELS_CUDA_LIBS trtllm_gen_fmha_interface)
+else()
+  set(KERNELS_SRC ${SRC_CPP})
+  set(KERNELS_CUDA_INCLUDES "")
+  set(KERNELS_CUDA_LIBS "")
+endif()
+
+add_library(kernels_src STATIC ${KERNELS_SRC})
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_include_directories(
-  kernels_src
-  PUBLIC
-    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
-)
-target_link_libraries(kernels_src PUBLIC trtllm_gen_fmha_interface)
-add_cuda_architectures(kernels_src 89)
+if(CUDA_FOUND AND CMAKE_CUDA_COMPILER)
+  set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_include_directories(kernels_src PUBLIC ${KERNELS_CUDA_INCLUDES})
+  target_link_libraries(kernels_src PUBLIC ${KERNELS_CUDA_LIBS})
+  add_cuda_architectures(kernels_src 89)
+endif()
 
 # Link Vulkan kernels when enabled
 if(ENABLE_VULKAN)

@@ -243,15 +243,18 @@ macro(setup_cuda_compiler)
       endif()
     endif()
   else()
-    message(FATAL_ERROR "No CUDA compiler found")
+    # CUDA not found - allow caller to handle (Vulkan-only builds)
+    message(STATUS "CUDA compiler not found")
   endif()
 
-  set(CUDA_REQUIRED_VERSION "11.2")
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS CUDA_REQUIRED_VERSION)
-    message(
-      FATAL_ERROR
-        "CUDA version ${CMAKE_CUDA_COMPILER_VERSION} must be at least ${CUDA_REQUIRED_VERSION}"
-    )
+  if(CMAKE_CUDA_COMPILER)
+    set(CUDA_REQUIRED_VERSION "11.2")
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS CUDA_REQUIRED_VERSION)
+      message(
+        FATAL_ERROR
+          "CUDA version ${CMAKE_CUDA_COMPILER_VERSION} must be at least ${CUDA_REQUIRED_VERSION}"
+      )
+    endif()
   endif()
 endmacro()
 
@@ -633,7 +636,7 @@ function(filter_source_cuda_architectures)
       endif()
     else()
       # IMPLICIT_FAMILY is set - ARCH shall not be suffixed by 'f'
-      if(${ARCH} GREATER_EQUAL ${CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY})
+      if(DEFINED CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY AND "${ARCH}" GREATER_EQUAL "${CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY}")
         # ARCH >= CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY
         if(NOT "${ARCH}f" IN_LIST CMAKE_CUDA_ARCHITECTURES_FAMILIES)
           set(SHOULD_FILTER TRUE)
